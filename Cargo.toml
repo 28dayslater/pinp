@@ -1,0 +1,8 @@
+[package]
+name = "pinp"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+indoc = "2.0.7"
+logos = "0.16.1"
