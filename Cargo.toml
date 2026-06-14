@@ -2,7 +2,9 @@
 name = "pinp"
 version = "0.1.0"
 edition = "2021"
+license = "MIT"
 
 [dependencies]
 indoc = "2.0.7"
 logos = "0.16.1"
+rustc-hash = "2.1.2"
