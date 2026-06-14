@@ -127,6 +127,12 @@ pub enum Token {
 
     #[token(",")]
     Comma,
+
+    #[token("::")]
+    GlobalRef,
+
+    #[token("../")]
+    ParentScopeRef,
 }
 
 #[cfg(test)]
