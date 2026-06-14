@@ -120,10 +120,10 @@ Unit tests assert parsed AST shape **and inferred types**:
 - type errors: `2.0 div 1`, use of an unassigned symbol;
 - assignment then reference: `a = 2 + 3` then `a * a`.
 
-## Open questions (need sign-off)
+## Resolved
 
-None for iteration 1. (`mod` resolved: multiplicative level, same BP as `* / div`,
-left-associative — matches C and Python.)
+- `mod` sits at the multiplicative level (same BP as `* / div`, left-associative — matches C and
+  Python).
 
 ## Forward-looking operator framework (NOT in iteration 1)
 
