@@ -1024,6 +1024,24 @@ mod tests {
     }
 
     #[test]
+    fn block_body_calls_earlier_single_line_function() {
+        let ast = parse_ok(indoc! {"
+            fu(a: int): int is a + 2
+            bar(b: int): int is
+                b + fu(b)
+        "});
+        let bar = func(&ast, 1);
+        assert_eq!(ast.names[bar.name.0 as usize], "bar");
+        assert_eq!(bar.return_type, PinpType::Int);
+        // The trailing expression `b + fu(b)` is an Int-typed `Bin` whose rhs calls `fu`.
+        let Node::Bin { rhs, .. } = *ast.node(bar.body.result) else {
+            panic!("Expected the body to end in a binary expression.");
+        };
+        assert!(matches!(ast.node(rhs), Node::Call { .. }));
+        assert_eq!(ast.type_of(bar.body.result), PinpType::Int);
+    }
+
+    #[test]
     fn global_access_and_compound_assign() {
         let ast = parse_ok(indoc! {"
             g = 10
