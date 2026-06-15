@@ -4,7 +4,13 @@ version = "0.1.0"
 edition = "2021"
 license = "MIT"
 
+[features]
+# The LLVM backend is optional so the lexer/parser still build and test without a
+# system LLVM. Enable with `cargo build --features llvm` (needs LLVM 22 installed).
+llvm = ["dep:inkwell"]
+
 [dependencies]
 indoc = "2.0.7"
 logos = "0.16.1"
 rustc-hash = "2.1.2"
+inkwell = { version = "0.9", features = ["llvm22-1"], optional = true }
