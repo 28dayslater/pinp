@@ -29,9 +29,8 @@ use inkwell::values::{
 };
 use rustc_hash::FxHashMap;
 
-use crate::parser::{
-    parse, Ast, BinOp, ExprId, Node, PinpType, Place, Stmt, SymId, TopLevel, UnOp,
-};
+use crate::parser::{parse, Ast, BinOp, ExprId, Node, PinpType, Place, Stmt, SymId, TopLevel, UnOp};
+use crate::sema::analyze;
 
 /// Name of the synthetic entry function [`CodeGen`] emits for the top-level program.
 const ENTRY: &str = "__pinp_main";
@@ -567,7 +566,8 @@ pub struct PinpJit {
 impl PinpJit {
     /// Parses, type-checks, and JIT-compiles `src`, ready to [`run`](Self::run).
     pub fn new(src: &str) -> Result<Self, String> {
-        let ast = parse(src).map_err(|e| format!("{e:?}"))?;
+        let mut ast = parse(src).map_err(|e| format!("{e:?}"))?;
+        analyze(&mut ast).map_err(|e| format!("{e:?}"))?;
         let context = Context::create();
 
         let mut codegen = CodeGen::new(&context, &ast);

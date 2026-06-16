@@ -2,8 +2,7 @@
 
 use logos::Logos;
 
-// Raw lexemes straight from logos. The numeric/identifier regexes carry `_`-separated
-// 3-digit grouping for decimals and arbitrary grouping for hex/binary.
+// Raw lexemes straight from logos.
 #[derive(Logos, Debug, PartialEq)]
 #[logos(skip r"[ \t]+")]
 enum Lexeme {

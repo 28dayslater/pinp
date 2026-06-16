@@ -16,17 +16,14 @@
 //! - **Interner** — identifiers map to [`SymId`] via `Ast::syms`, backed by `&'src str`
 //!   slices borrowed straight from the source (no string copies).
 //!
-//! **Scoping.** Binding/type resolution uses a scope stack: `scopes[0]` is global, and a
-//! function pushes a frame seeded with its parameters. A bare identifier resolves against the
-//! innermost frame only — inside a function it never reaches globals; a global is reached
-//! explicitly via `::name` ([`Node::Global`]). Functions are registered in a signature table
-//! *after* their body is parsed, giving define-before-use with no recursion.
-//!
-//! Type inference runs *inline* during parsing: every node gets its `PinpType` as it is built,
-//! and type errors surface immediately as [`PinpError`].
+//! Parsing is **purely syntactic**: it builds the structural AST and reports only lexical/layout
+//! errors ([`ParseError`]). The `types` arena is left unpopulated — name resolution, scoping, and
+//! type inference belong to the [`crate::sema`] pass, which fills the types and reports
+//! [`crate::sema::SemaError`]. Type annotations (`int`/`float`/`void`) are the one exception: they
+//! are resolved here while building the signature, since that is a fixed lexical mapping.
 
 use crate::lexer::{lex, Token, TokenKind};
-use rustc_hash::FxHashMap;
+use rustc_hash::{FxHashMap, FxHashSet};
 
 /// The type of every expression and binding. `Void` is the type of a function with no declared
 /// return type (and of a call to one); a value-typed expression is never `Void`.
@@ -128,18 +125,15 @@ pub enum TopLevel {
     Stmt(Stmt),
 }
 
-/// A failure from lexing, parsing, or type checking. pinp is fail-fast: the first error returned
-/// stops the pass — there is no error recovery or multi-error collection.
+/// A syntactic failure from lexing or parsing. pinp is fail-fast: the first error returned stops
+/// the pass. Semantic errors live in [`crate::sema::SemaError`].
 #[derive(Debug, Clone, PartialEq)]
-pub enum PinpError {
+pub enum ParseError {
     /// A lexing failure (carries the [`crate::lexer::LexError`] message).
     Lex(String),
-    /// A syntax error: an unexpected or missing token.
+    /// A syntax error: an unexpected/missing token, or a malformed declaration (a duplicate
+    /// parameter, an unknown type name, a single-line body without a return type, ...).
     Unexpected(String),
-    /// A name used but not bound: unknown variable, global, or function.
-    UnknownSymbol(String),
-    /// A type error: a mismatch, a bad promotion, or an operation on `Void`.
-    Type(String),
     /// An indentation or parameter-alignment error.
     Layout(String),
 }
@@ -147,7 +141,8 @@ pub enum PinpError {
 /// A parsed program. Borrows the source for the lifetime `'src` (identifiers are slices into it).
 ///
 /// Layout: `nodes` and `types` are parallel arenas indexed by [`ExprId`]; `top_level` is the
-/// program in source order; `names` maps a [`SymId`] back to its text. Returned by [`parse`].
+/// program in source order; `names` maps a [`SymId`] back to its text. Returned by [`parse`] with
+/// `types` unpopulated; [`crate::sema::analyze`] fills `types` in.
 #[derive(Default)]
 pub struct Ast<'src> {
     pub nodes: Vec<Node>,
@@ -163,15 +158,21 @@ impl<'src> Ast<'src> {
         &self.nodes[e.0 as usize]
     }
 
-    /// The inferred type of the node at `e`.
+    /// The type of the node at `e` — valid only after [`crate::sema::analyze`] has run.
     pub fn type_of(&self, e: ExprId) -> PinpType {
         self.types[e.0 as usize]
     }
 
-    fn push(&mut self, node: Node, ty: PinpType) -> ExprId {
+    /// Records the inferred type of `e`. Called by the sema pass.
+    pub fn set_type(&mut self, e: ExprId, ty: PinpType) {
+        self.types[e.0 as usize] = ty;
+    }
+
+    /// Pushes a node, returning its id. The type is left as a placeholder for sema to fill.
+    fn push(&mut self, node: Node) -> ExprId {
         let id = ExprId(self.nodes.len() as u32);
         self.nodes.push(node);
-        self.types.push(ty);
+        self.types.push(PinpType::Void);
         id
     }
 
@@ -186,33 +187,23 @@ impl<'src> Ast<'src> {
     }
 }
 
-/// Lexes and parses `src` into an [`Ast`], inferring every node's type inline. The returned AST
-/// borrows `src`. Stops at and returns the first [`PinpError`].
-pub fn parse(src: &str) -> Result<Ast<'_>, PinpError> {
-    let toks = lex(src).map_err(|e| PinpError::Lex(e.message))?;
+/// Lexes and parses `src` into a structural [`Ast`] (its `types` left for [`crate::sema::analyze`]
+/// to fill). The returned AST borrows `src`. Stops at and returns the first [`ParseError`].
+pub fn parse(src: &str) -> Result<Ast<'_>, ParseError> {
+    let toks = lex(src).map_err(|e| ParseError::Lex(e.message))?;
     let mut p = Parser {
         toks,
         pos: 0,
         ast: Ast::default(),
-        scopes: vec![FxHashMap::default()], // global frame
-        funcs: FxHashMap::default(),
     };
     p.parse_program()?;
     Ok(p.ast)
-}
-
-#[derive(Clone)]
-struct Signature {
-    params: Vec<PinpType>,
-    return_type: PinpType,
 }
 
 struct Parser<'src> {
     toks: Vec<Token<'src>>,
     pos: usize,
     ast: Ast<'src>,
-    scopes: Vec<FxHashMap<SymId, PinpType>>,
-    funcs: FxHashMap<SymId, Signature>,
 }
 
 // Binding-power "table". See articles on Pratt parsing.
@@ -257,11 +248,6 @@ fn assign_op(kind: TokenKind) -> Option<AssignKind> {
     })
 }
 
-/// `from` is assignable to `to` if identical, or via the one allowed promotion `Int -> Float`.
-fn assignable(from: PinpType, to: PinpType) -> bool {
-    from == to || (from == PinpType::Int && to == PinpType::Float)
-}
-
 /// The expression that *reads* a [`Place`]: `x` -> `Var`, `::g` -> `Global`. Used to build the
 /// `place` operand when desugaring `place <op>= e` into `place = place <op> e`.
 impl From<Place> for Node {
@@ -288,11 +274,11 @@ impl<'src> Parser<'src> {
         t
     }
 
-    fn expect(&mut self, kind: TokenKind) -> Result<Token<'src>, PinpError> {
+    fn expect(&mut self, kind: TokenKind) -> Result<Token<'src>, ParseError> {
         if self.peek().kind == kind {
             Ok(self.advance())
         } else {
-            Err(PinpError::Unexpected(format!(
+            Err(ParseError::Unexpected(format!(
                 "Expected {kind:?}, found {:?}.",
                 self.peek().kind
             )))
@@ -308,7 +294,7 @@ impl<'src> Parser<'src> {
         }
     }
 
-    fn parse_program(&mut self) -> Result<(), PinpError> {
+    fn parse_program(&mut self) -> Result<(), ParseError> {
         loop {
             self.skip_separators();
             if self.peek().kind == TokenKind::Eof {
@@ -321,7 +307,7 @@ impl<'src> Parser<'src> {
                 self.ast.top_level.push(TopLevel::Stmt(stmt));
                 match self.peek().kind {
                     TokenKind::Newline | TokenKind::Eof => {}
-                    other => return Err(PinpError::Unexpected(format!("Unexpected token {other:?}."))),
+                    other => return Err(ParseError::Unexpected(format!("Unexpected token {other:?}."))),
                 }
             }
         }
@@ -368,7 +354,7 @@ impl<'src> Parser<'src> {
         None
     }
 
-    fn parse_func_def(&mut self) -> Result<(), PinpError> {
+    fn parse_func_def(&mut self) -> Result<(), ParseError> {
         let name_tok = self.advance(); // Identifier
         let name = self.ast.intern(name_tok.text);
         self.expect(TokenKind::LParen)?;
@@ -384,37 +370,18 @@ impl<'src> Parser<'src> {
         };
         self.expect(TokenKind::KwIs)?;
 
-        // Seed a fresh local frame with the parameters.
-        let mut frame: FxHashMap<SymId, PinpType> = FxHashMap::default();
+        // Reject duplicate parameter names — a structural check (no types needed).
+        let mut seen = FxHashSet::default();
         for p in &params {
-            if frame.insert(p.name, p.param_type).is_some() {
-                return Err(PinpError::Type(format!(
+            if !seen.insert(p.name) {
+                return Err(ParseError::Unexpected(format!(
                     "Duplicate parameter `{}`.",
                     self.ast.names[p.name.0 as usize]
                 )));
             }
         }
-        self.scopes.push(frame);
+
         let body = self.parse_func_body(has_return_type)?;
-        self.scopes.pop();
-
-        let result_type = self.ast.type_of(body.result);
-        if !assignable(result_type, return_type) {
-            return Err(PinpError::Type(format!(
-                "Function `{}` body yields {result_type:?} but is declared {return_type:?}.",
-                name_tok.text
-            )));
-        }
-
-        // Register only now: a call can reach a function only after its definition (so no
-        // forward references and no recursion).
-        self.funcs.insert(
-            name,
-            Signature {
-                params: params.iter().map(|p| p.param_type).collect(),
-                return_type,
-            },
-        );
         self.ast.top_level.push(TopLevel::Func(FuncDef {
             name,
             params,
@@ -424,7 +391,7 @@ impl<'src> Parser<'src> {
         Ok(())
     }
 
-    fn parse_params(&mut self) -> Result<Vec<Param>, PinpError> {
+    fn parse_params(&mut self) -> Result<Vec<Param>, ParseError> {
         let mut params = Vec::new();
         if self.peek().kind == TokenKind::RParen {
             return Ok(params);
@@ -437,7 +404,7 @@ impl<'src> Parser<'src> {
                 (t.line, t.col)
             };
             if line != first.line && col != first.col {
-                return Err(PinpError::Layout(format!(
+                return Err(ParseError::Layout(format!(
                     "Parameter at line {line} col {col} must align to the first parameter's column {}.",
                     first.col
                 )));
@@ -456,17 +423,17 @@ impl<'src> Parser<'src> {
         Ok(params)
     }
 
-    fn parse_type(&mut self) -> Result<PinpType, PinpError> {
+    fn parse_type(&mut self) -> Result<PinpType, ParseError> {
         let tok = self.expect(TokenKind::Identifier)?;
         match tok.text {
             "int" => Ok(PinpType::Int),
             "float" => Ok(PinpType::Float),
             "void" => Ok(PinpType::Void),
-            other => Err(PinpError::Type(format!("Unknown type `{other}`."))),
+            other => Err(ParseError::Unexpected(format!("Unknown type `{other}`."))),
         }
     }
 
-    fn parse_func_body(&mut self, has_return_type: bool) -> Result<Block, PinpError> {
+    fn parse_func_body(&mut self, has_return_type: bool) -> Result<Block, ParseError> {
         if self.peek().kind == TokenKind::Newline {
             // Block form: a run of statements ending in a result expression.
             self.expect(TokenKind::Newline)?;
@@ -482,7 +449,7 @@ impl<'src> Parser<'src> {
                         break;
                     }
                     TokenKind::Eof => break,
-                    other => return Err(PinpError::Unexpected(format!("Unexpected token {other:?}."))),
+                    other => return Err(ParseError::Unexpected(format!("Unexpected token {other:?}."))),
                 }
                 if self.peek().kind == TokenKind::Dedent {
                     self.pos += 1;
@@ -495,11 +462,11 @@ impl<'src> Parser<'src> {
             let result = match lines.pop() {
                 Some(Stmt::Expr(e)) => e,
                 Some(Stmt::Assign { .. }) => {
-                    return Err(PinpError::Type(
+                    return Err(ParseError::Unexpected(
                         "Function body must end with an expression.".into(),
                     ))
                 }
-                None => return Err(PinpError::Unexpected("Empty function body.".into())),
+                None => return Err(ParseError::Unexpected("Empty function body.".into())),
             };
             Ok(Block {
                 stmts: lines,
@@ -508,14 +475,14 @@ impl<'src> Parser<'src> {
         } else {
             // Single-line form: `is` then an expression — which must declare a return type.
             if !has_return_type {
-                return Err(PinpError::Type(
+                return Err(ParseError::Unexpected(
                     "Single-line function must declare a return type.".into(),
                 ));
             }
             let result = self.parse_expr(0)?;
             match self.peek().kind {
                 TokenKind::Newline | TokenKind::Eof => {}
-                other => return Err(PinpError::Unexpected(format!("Unexpected token {other:?}."))),
+                other => return Err(ParseError::Unexpected(format!("Unexpected token {other:?}."))),
             }
             Ok(Block {
                 stmts: Vec::new(),
@@ -524,7 +491,7 @@ impl<'src> Parser<'src> {
         }
     }
 
-    fn parse_stmt(&mut self) -> Result<Stmt, PinpError> {
+    fn parse_stmt(&mut self) -> Result<Stmt, ParseError> {
         // An assignment is a `place` (bare name or `::name`) immediately followed by an
         // assignment operator; anything else is an expression statement.
         let is_global = if self.peek().kind == TokenKind::Identifier
@@ -553,74 +520,34 @@ impl<'src> Parser<'src> {
             } else {
                 Place::Local(sym)
             };
-            self.finish_assign(place, op, rhs, name)
+            Ok(self.finish_assign(place, op, rhs))
         } else {
             let e = self.parse_expr(0)?;
             Ok(Stmt::Expr(e))
         }
     }
 
-    fn finish_assign(
-        &mut self,
-        place: Place,
-        op: AssignKind,
-        rhs: ExprId,
-        name: &str,
-    ) -> Result<Stmt, PinpError> {
-        let existing = self.lookup_place(place);
+    // Desugar `place <op>= e` into `place = place <op> e`. Purely structural — the binding and
+    // type checks happen later in sema.
+    fn finish_assign(&mut self, place: Place, op: AssignKind, rhs: ExprId) -> Stmt {
         match op {
-            AssignKind::Plain => {
-                // Globals are created at top level via a bare name; `::name` only refers to an
-                // existing global.
-                if matches!(place, Place::Global(_)) && existing.is_none() {
-                    return Err(PinpError::UnknownSymbol(format!("Unknown global `::{name}`.")));
-                }
-                let rhs_type = self.ast.type_of(rhs);
-                if rhs_type == PinpType::Void {
-                    return Err(PinpError::Type("Cannot assign a void value.".into()));
-                }
-                self.bind_place(place, rhs_type);
-                Ok(Stmt::Assign { target: place, rhs })
-            }
+            AssignKind::Plain => Stmt::Assign { target: place, rhs },
             AssignKind::Compound(binop) => {
-                let place_type = existing.ok_or_else(|| {
-                    PinpError::UnknownSymbol(format!("Compound assignment to unbound `{name}`."))
-                })?;
-                let read = self.ast.push(Node::from(place), place_type);
-                let combined = self.make_bin(binop, read, rhs)?;
-                let result_type = self.ast.type_of(combined);
-                if !assignable(result_type, place_type) {
-                    return Err(PinpError::Type(format!(
-                        "Compound assignment yields {result_type:?}, not assignable to {place_type:?}."
-                    )));
-                }
-                Ok(Stmt::Assign {
+                let read = self.ast.push(Node::from(place));
+                let combined = self.ast.push(Node::Bin {
+                    op: binop,
+                    lhs: read,
+                    rhs,
+                });
+                Stmt::Assign {
                     target: place,
                     rhs: combined,
-                })
+                }
             }
         }
     }
 
-    fn lookup_place(&self, place: Place) -> Option<PinpType> {
-        match place {
-            Place::Local(s) => self.scopes.last().unwrap().get(&s).copied(),
-            Place::Global(s) => self.scopes[0].get(&s).copied(),
-        }
-    }
-
-    fn bind_place(&mut self, place: Place, ty: PinpType) {
-        match place {
-            Place::Local(s) => {
-                self.scopes.last_mut().unwrap().insert(s, ty);
-            }
-            Place::Global(s) => {
-                self.scopes[0].insert(s, ty);
-            }
-        }
-    }
-
-    fn parse_expr(&mut self, min_bp: u8) -> Result<ExprId, PinpError> {
+    fn parse_expr(&mut self, min_bp: u8) -> Result<ExprId, ParseError> {
         let mut lhs = self.parse_prefix()?;
         while let Some((lbp, rbp, op)) = infix(self.peek().kind) {
             if lbp < min_bp {
@@ -628,65 +555,43 @@ impl<'src> Parser<'src> {
             }
             self.advance();
             let rhs = self.parse_expr(rbp)?;
-            lhs = self.make_bin(op, lhs, rhs)?;
+            lhs = self.ast.push(Node::Bin { op, lhs, rhs });
         }
         Ok(lhs)
     }
 
-    fn parse_prefix(&mut self) -> Result<ExprId, PinpError> {
+    fn parse_prefix(&mut self) -> Result<ExprId, ParseError> {
         if self.peek().kind == TokenKind::Minus {
             self.advance();
             let operand = self.parse_expr(UNARY_MINUS_BP)?;
-            let operand_type = self.ast.type_of(operand);
-            if operand_type == PinpType::Void {
-                return Err(PinpError::Type("Unary minus on a void value.".into()));
-            }
-            return Ok(self
-                .ast
-                .push(Node::Unary { op: UnOp::Neg, operand }, operand_type));
+            return Ok(self.ast.push(Node::Unary { op: UnOp::Neg, operand }));
         }
         self.parse_primary()
     }
 
-    fn parse_primary(&mut self) -> Result<ExprId, PinpError> {
+    fn parse_primary(&mut self) -> Result<ExprId, ParseError> {
         match self.peek().kind {
             TokenKind::Int => {
                 let v = parse_int(self.advance().text);
-                Ok(self.ast.push(Node::Int(v), PinpType::Int))
+                Ok(self.ast.push(Node::Int(v)))
             }
             TokenKind::Float => {
                 let v = parse_float(self.advance().text);
-                Ok(self.ast.push(Node::Float(v), PinpType::Float))
+                Ok(self.ast.push(Node::Float(v)))
             }
             TokenKind::Identifier => {
                 if self.at(1) == TokenKind::LParen {
                     return self.parse_call();
                 }
                 let name = self.advance().text;
-                let resolved = self
-                    .ast
-                    .syms
-                    .get(name)
-                    .copied()
-                    .and_then(|s| self.lookup_local(s).map(|t| (s, t)));
-                match resolved {
-                    Some((s, t)) => Ok(self.ast.push(Node::Var(s), t)),
-                    None => Err(PinpError::UnknownSymbol(format!("Unknown symbol `{name}`."))),
-                }
+                let sym = self.ast.intern(name);
+                Ok(self.ast.push(Node::Var(sym)))
             }
             TokenKind::ColonColon => {
                 self.advance(); // '::'
                 let name = self.expect(TokenKind::Identifier)?.text;
-                let resolved = self
-                    .ast
-                    .syms
-                    .get(name)
-                    .copied()
-                    .and_then(|s| self.lookup_global(s).map(|t| (s, t)));
-                match resolved {
-                    Some((s, t)) => Ok(self.ast.push(Node::Global(s), t)),
-                    None => Err(PinpError::UnknownSymbol(format!("Unknown global `::{name}`."))),
-                }
+                let sym = self.ast.intern(name);
+                Ok(self.ast.push(Node::Global(sym)))
             }
             TokenKind::LParen => {
                 self.advance();
@@ -694,12 +599,13 @@ impl<'src> Parser<'src> {
                 self.expect(TokenKind::RParen)?;
                 Ok(e)
             }
-            other => Err(PinpError::Unexpected(format!("Unexpected token {other:?}."))),
+            other => Err(ParseError::Unexpected(format!("Unexpected token {other:?}."))),
         }
     }
 
-    fn parse_call(&mut self) -> Result<ExprId, PinpError> {
+    fn parse_call(&mut self) -> Result<ExprId, ParseError> {
         let name = self.advance().text; // Identifier
+        let callee = self.ast.intern(name);
         self.expect(TokenKind::LParen)?;
         let mut args = Vec::new();
         if self.peek().kind != TokenKind::RParen {
@@ -710,73 +616,12 @@ impl<'src> Parser<'src> {
                         self.advance();
                     }
                     TokenKind::RParen => break,
-                    other => return Err(PinpError::Unexpected(format!("Unexpected token {other:?}."))),
+                    other => return Err(ParseError::Unexpected(format!("Unexpected token {other:?}."))),
                 }
             }
         }
         self.expect(TokenKind::RParen)?;
-
-        let sym = self.ast.syms.get(name).copied();
-        let sig = match sym.and_then(|s| self.funcs.get(&s).cloned()) {
-            Some(sig) => sig,
-            None => {
-                return Err(PinpError::UnknownSymbol(format!(
-                    "Call to undefined function `{name}`."
-                )))
-            }
-        };
-        if args.len() != sig.params.len() {
-            return Err(PinpError::Type(format!(
-                "Function `{name}` expects {} argument(s), got {}.",
-                sig.params.len(),
-                args.len()
-            )));
-        }
-        for (i, (&arg, &pt)) in args.iter().zip(sig.params.iter()).enumerate() {
-            let at = self.ast.type_of(arg);
-            if !assignable(at, pt) {
-                return Err(PinpError::Type(format!(
-                    "Argument {} of `{name}`: {at:?} not assignable to {pt:?}.",
-                    i + 1
-                )));
-            }
-        }
-        let callee = sym.unwrap();
-        Ok(self.ast.push(Node::Call { callee, args }, sig.return_type))
-    }
-
-    fn lookup_local(&self, s: SymId) -> Option<PinpType> {
-        self.scopes.last().unwrap().get(&s).copied()
-    }
-
-    fn lookup_global(&self, s: SymId) -> Option<PinpType> {
-        self.scopes[0].get(&s).copied()
-    }
-
-    fn make_bin(&mut self, op: BinOp, lhs: ExprId, rhs: ExprId) -> Result<ExprId, PinpError> {
-        use PinpType::*;
-        let (left_type, right_type) = (self.ast.type_of(lhs), self.ast.type_of(rhs));
-        if left_type == Void || right_type == Void {
-            return Err(PinpError::Type("Arithmetic on a void value.".into()));
-        }
-        let both_int = left_type == Int && right_type == Int;
-        let result_type = match op {
-            BinOp::Add | BinOp::Sub | BinOp::Mul | BinOp::Pow => {
-                if both_int {
-                    Int
-                } else {
-                    Float
-                }
-            }
-            BinOp::Div => Float,
-            BinOp::IntDiv | BinOp::Mod => {
-                if !both_int {
-                    return Err(PinpError::Type(format!("{op:?} requires Int operands.")));
-                }
-                Int
-            }
-        };
-        Ok(self.ast.push(Node::Bin { op, lhs, rhs }, result_type))
+        Ok(self.ast.push(Node::Call { callee, args }))
     }
 }
 
@@ -825,23 +670,16 @@ mod tests {
         }
     }
 
-    fn ast_type(src: &str) -> PinpType {
-        let ast = parse_ok(src);
-        ast.type_of(root(&ast))
-    }
-
-    // --- iteration 1 (expressions) -------------------------------------------------------
+    // --- expression structure ------------------------------------------------------------
 
     #[test]
     fn precedence_mul_over_add() {
         let ast = parse_ok("2 + 3 * 4");
-        let r = root(&ast);
-        let Node::Bin { op: BinOp::Add, lhs, rhs } = *ast.node(r) else {
+        let Node::Bin { op: BinOp::Add, lhs, rhs } = *ast.node(root(&ast)) else {
             panic!("Expected an Add node at the root.");
         };
         assert_eq!(*ast.node(lhs), Node::Int(2));
         assert!(matches!(ast.node(rhs), Node::Bin { op: BinOp::Mul, .. }));
-        assert_eq!(ast.type_of(r), PinpType::Int);
     }
 
     #[test]
@@ -873,47 +711,27 @@ mod tests {
     }
 
     #[test]
-    fn type_inference_rules() {
-        assert_eq!(ast_type("2 + 3"), PinpType::Int);
-        assert_eq!(ast_type("10 / 4"), PinpType::Float);
-        assert_eq!(ast_type("10 div 4"), PinpType::Int);
-        assert_eq!(ast_type("7 mod 3"), PinpType::Int);
-        assert_eq!(ast_type("2 ^ 10"), PinpType::Int);
-        assert_eq!(ast_type("2.0 ^ 10"), PinpType::Float);
-        assert_eq!(ast_type("-3.14"), PinpType::Float);
-    }
-
-    #[test]
     fn grouped_int_literal_value() {
         let ast = parse_ok("12_000_321");
         assert_eq!(*ast.node(root(&ast)), Node::Int(12_000_321));
     }
 
     #[test]
-    fn int_promotes_to_float() {
-        let ast = parse_ok("a = 2\n2.0 * a");
-        assert_eq!(ast.type_of(root(&ast)), PinpType::Float);
+    fn compound_assign_desugars_to_read_and_op() {
+        // `b += 1` becomes `b = (b + 1)`: an Assign whose rhs is a Bin reading the target.
+        let ast = parse_ok("b = 1\nb += 1");
+        let TopLevel::Stmt(Stmt::Assign { target: Place::Local(_), rhs }) =
+            ast.top_level.last().unwrap()
+        else {
+            panic!("Expected a desugared local assignment.");
+        };
+        let Node::Bin { op: BinOp::Add, lhs, .. } = *ast.node(*rhs) else {
+            panic!("Expected the rhs to be an Add.");
+        };
+        assert!(matches!(ast.node(lhs), Node::Var(_)));
     }
 
-    #[test]
-    fn assignment_then_reference() {
-        let ast = parse_ok("a = 2 + 3\na * a");
-        let r = root(&ast);
-        assert_eq!(ast.type_of(r), PinpType::Int);
-        assert!(matches!(ast.node(r), Node::Bin { op: BinOp::Mul, .. }));
-    }
-
-    #[test]
-    fn float_div_is_type_error() {
-        assert!(matches!(parse("2.0 div 1"), Err(PinpError::Type(_))));
-    }
-
-    #[test]
-    fn unassigned_symbol_is_error() {
-        assert!(matches!(parse("x + 1"), Err(PinpError::UnknownSymbol(_))));
-    }
-
-    // --- iteration 2 (functions) ---------------------------------------------------------
+    // --- function & program structure ----------------------------------------------------
 
     #[test]
     fn single_line_function() {
@@ -924,7 +742,6 @@ mod tests {
         assert!(f.params.iter().all(|p| p.param_type == PinpType::Float));
         assert_eq!(f.return_type, PinpType::Float);
         assert!(f.body.stmts.is_empty());
-        assert_eq!(ast.type_of(f.body.result), PinpType::Float);
 
         // Omitting the return type on the single-line form is an explicit, specific error —
         // it must name the missing return type, not fall back to a generic syntax message.
@@ -932,7 +749,7 @@ mod tests {
             panic!("Expected a missing-return-type error, but parsing succeeded.");
         };
         assert!(
-            matches!(&err, PinpError::Type(msg) if msg.contains("return type")),
+            matches!(&err, ParseError::Unexpected(msg) if msg.contains("return type")),
             "Expected an explicit missing-return-type error, got {err:?}."
         );
     }
@@ -949,194 +766,52 @@ mod tests {
         assert_eq!(f.return_type, PinpType::Int);
         assert_eq!(f.body.stmts.len(), 1);
         assert!(matches!(f.body.stmts[0], Stmt::Assign { .. }));
-        assert_eq!(ast.type_of(f.body.result), PinpType::Int);
     }
 
     #[test]
     fn multiline_params_aligned() {
         // `bb` aligns under `aa` (both column 3).
         let ast = parse_ok("f(aa: float,\n  bb: float): float is aa^2 + bb^2");
-        let f = func(&ast, 0);
-        assert_eq!(f.params.len(), 2);
-        assert_eq!(ast.type_of(f.body.result), PinpType::Float);
+        assert_eq!(func(&ast, 0).params.len(), 2);
     }
 
     #[test]
-    fn misaligned_param_is_error() {
-        // `bb` is one column past `aa`.
-        assert!(matches!(
-            parse("f(aa: int,\n   bb: int): int is aa+bb"),
-            Err(PinpError::Layout(_))
-        ));
-    }
-
-    #[test]
-    fn call_typechecks() {
-        let ast = parse_ok(indoc! {"
-            sq(x: int): int is x*x
-            sq(5)
-        "});
-        let r = root(&ast);
-        assert_eq!(ast.type_of(r), PinpType::Int);
-        assert!(matches!(ast.node(r), Node::Call { .. }));
-    }
-
-    #[test]
-    fn call_arg_promotes_int_to_float() {
-        let ast = parse_ok(indoc! {"
-            f(x: float): float is x
-            f(3)
-        "});
-        assert_eq!(ast.type_of(root(&ast)), PinpType::Float);
-    }
-
-    #[test]
-    fn call_arity_mismatch_is_error() {
-        assert!(matches!(
-            parse(indoc! {"
-                sq(x: int): int is x*x
-                sq(1, 2)
-            "}),
-            Err(PinpError::Type(_))
-        ));
-    }
-
-    #[test]
-    fn call_arg_type_mismatch_is_error() {
-        assert!(matches!(
-            parse(indoc! {"
-                sq(x: int): int is x*x
-                sq(1.5)
-            "}),
-            Err(PinpError::Type(_))
-        ));
-    }
-
-    #[test]
-    fn call_before_definition_is_error() {
-        assert!(matches!(
-            parse(indoc! {"
-                foo(1)
-                foo(x: int): int is x
-            "}),
-            Err(PinpError::UnknownSymbol(_))
-        ));
-    }
-
-    #[test]
-    fn block_body_calls_earlier_single_line_function() {
+    fn block_body_trailing_call_shape() {
+        // A block body's trailing expression `b + fu(b)` is a `Bin` whose rhs is a call.
         let ast = parse_ok(indoc! {"
             fu(a: int): int is a + 2
             bar(b: int): int is
                 b + fu(b)
         "});
         let bar = func(&ast, 1);
-        assert_eq!(ast.names[bar.name.0 as usize], "bar");
-        assert_eq!(bar.return_type, PinpType::Int);
-        // The trailing expression `b + fu(b)` is an Int-typed `Bin` whose rhs calls `fu`.
         let Node::Bin { rhs, .. } = *ast.node(bar.body.result) else {
             panic!("Expected the body to end in a binary expression.");
         };
         assert!(matches!(ast.node(rhs), Node::Call { .. }));
-        assert_eq!(ast.type_of(bar.body.result), PinpType::Int);
     }
 
     #[test]
-    fn global_access_and_compound_assign() {
+    fn global_compound_assign_desugars_to_global_target() {
         let ast = parse_ok(indoc! {"
             g = 10
             bump(a: int): int is
                 ::g += 1
                 a + ::g
         "});
-        let f = func(&ast, 1);
         assert!(matches!(
-            f.body.stmts[0],
+            func(&ast, 1).body.stmts[0],
             Stmt::Assign { target: Place::Global(_), .. }
         ));
-        assert_eq!(ast.type_of(f.body.result), PinpType::Int);
     }
 
     #[test]
-    fn bare_name_does_not_see_global() {
-        assert!(matches!(
-            parse(indoc! {"
-                g = 10
-                f(a: int): int is a + g
-            "}),
-            Err(PinpError::UnknownSymbol(_))
-        ));
-    }
-
-    #[test]
-    fn compound_assign_local() {
-        let ast = parse_ok(indoc! {"
-            f(a: int): int is
-                b = a
-                b += 1
-                b
-        "});
-        assert_eq!(ast.type_of(func(&ast, 0).body.result), PinpType::Int);
-    }
-
-    #[test]
-    fn compound_div_breaks_int_place() {
-        // `b` is Int; `b /= 2` yields Float, which is not assignable back to Int.
-        assert!(matches!(
-            parse(indoc! {"
-                f(a: int): int is
-                    b = a
-                    b /= 2
-                    b
-            "}),
-            Err(PinpError::Type(_))
-        ));
-    }
-
-    #[test]
-    fn void_function_with_value_body_is_error() {
-        assert!(matches!(
-            parse(indoc! {"
-                f(a: int) is
-                    a + 1
-            "}),
-            Err(PinpError::Type(_))
-        ));
-    }
-
-    #[test]
-    fn return_type_promotes_int_to_float() {
+    fn return_type_annotation_resolved() {
         let ast = parse_ok("f(a: int): float is a");
         assert_eq!(func(&ast, 0).return_type, PinpType::Float);
     }
 
     #[test]
-    fn return_float_to_int_is_error() {
-        assert!(matches!(
-            parse("f(a: float): int is a"),
-            Err(PinpError::Type(_))
-        ));
-    }
-
-    #[test]
-    fn duplicate_param_is_error() {
-        assert!(matches!(
-            parse("f(a: int, a: int): int is a"),
-            Err(PinpError::Type(_))
-        ));
-    }
-
-    #[test]
-    fn unknown_type_name_is_error() {
-        assert!(matches!(
-            parse("f(a: blah): int is a"),
-            Err(PinpError::Type(_))
-        ));
-    }
-
-    #[test]
-    fn program_with_several_top_level() {
-        // global, two functions (bump calls the earlier sq), then a top-level call
+    fn program_shape_with_several_top_level() {
         let ast = parse_ok(indoc! {"
             g = 100
             sq(x: int): int is x*x
@@ -1149,6 +824,33 @@ mod tests {
         assert!(matches!(ast.top_level[0], TopLevel::Stmt(_)));
         assert!(matches!(ast.top_level[1], TopLevel::Func(_)));
         assert!(matches!(ast.top_level[2], TopLevel::Func(_)));
-        assert_eq!(ast.type_of(root(&ast)), PinpType::Int);
+        assert!(matches!(ast.top_level[3], TopLevel::Stmt(_)));
+    }
+
+    // --- syntactic / structural errors ---------------------------------------------------
+
+    #[test]
+    fn misaligned_param_is_error() {
+        // `bb` is one column past `aa`.
+        assert!(matches!(
+            parse("f(aa: int,\n   bb: int): int is aa+bb"),
+            Err(ParseError::Layout(_))
+        ));
+    }
+
+    #[test]
+    fn duplicate_param_is_error() {
+        assert!(matches!(
+            parse("f(a: int, a: int): int is a"),
+            Err(ParseError::Unexpected(_))
+        ));
+    }
+
+    #[test]
+    fn unknown_type_name_is_error() {
+        assert!(matches!(
+            parse("f(a: blah): int is a"),
+            Err(ParseError::Unexpected(_))
+        ));
     }
 }
