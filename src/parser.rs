@@ -567,7 +567,7 @@ impl<'src> Parser<'src> {
     fn parse_primary(&mut self) -> Result<ExprId, ParseError> {
         match self.peek().kind {
             TokenKind::Int => {
-                let v = parse_int(self.advance().text);
+                let v = parse_int(self.advance().text)?;
                 Ok(self.ast.push(Node::Int(v)))
             }
             TokenKind::Float => {
@@ -620,19 +620,28 @@ impl<'src> Parser<'src> {
     }
 }
 
-fn parse_int(text: &str) -> i64 {
+// Convert a lexically-valid integer literal to its value, rejecting anything that does not fit in
+// an `i64` (a too-large decimal, an over-long hex/binary string, or an overflowing `mantissa*10^exp`)
+// rather than panicking.
+fn parse_int(text: &str) -> Result<i64, ParseError> {
+    let out_of_range =
+        || ParseError::Unexpected(format!("Integer literal `{text}` is out of range."));
     let s: String = text.chars().filter(|&c| c != '_').collect();
     if let Some(h) = s.strip_prefix("0x").or_else(|| s.strip_prefix("0X")) {
-        return i64::from_str_radix(h, 16).unwrap();
+        return i64::from_str_radix(h, 16).map_err(|_| out_of_range());
     }
     if let Some(b) = s.strip_prefix("0b").or_else(|| s.strip_prefix("0B")) {
-        return i64::from_str_radix(b, 2).unwrap();
+        return i64::from_str_radix(b, 2).map_err(|_| out_of_range());
     }
     if let Some(pos) = s.find(['e', 'E']) {
-        let exp: u32 = s[pos + 1..].parse().unwrap();
-        return s[..pos].parse::<i64>().unwrap() * 10i64.pow(exp);
+        let mantissa: i64 = s[..pos].parse().map_err(|_| out_of_range())?;
+        let exp: u32 = s[pos + 1..].parse().map_err(|_| out_of_range())?;
+        return 10i64
+            .checked_pow(exp)
+            .and_then(|factor| mantissa.checked_mul(factor))
+            .ok_or_else(out_of_range);
     }
-    s.parse().unwrap()
+    s.parse().map_err(|_| out_of_range())
 }
 
 fn parse_float(text: &str) -> f64 {
@@ -847,5 +856,30 @@ mod tests {
             parse("f(a: blah): int is a"),
             Err(ParseError::Unexpected(_))
         ));
+    }
+
+    #[test]
+    fn integer_literal_overflow_is_error() {
+        // Lexically valid but out of i64 range, in every base — rejected, not panicked.
+        assert!(matches!(
+            parse("99999999999999999999"),
+            Err(ParseError::Unexpected(_))
+        )); // decimal > i64::MAX
+        assert!(matches!(
+            parse("0xFFFF_FFFF_FFFF_FFFF_F"),
+            Err(ParseError::Unexpected(_))
+        )); // 68-bit hex
+        assert!(matches!(parse("9E99"), Err(ParseError::Unexpected(_)))); // mantissa*10^exp overflows
+        let wide_binary = format!("0b{}", "1".repeat(65));
+        assert!(matches!(
+            parse(&wide_binary),
+            Err(ParseError::Unexpected(_))
+        )); // 65-bit binary
+    }
+
+    #[test]
+    fn max_int_literal_is_accepted() {
+        let ast = parse_ok("9223372036854775807"); // i64::MAX
+        assert_eq!(*ast.node(root(&ast)), Node::Int(i64::MAX));
     }
 }
