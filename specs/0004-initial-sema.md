@@ -67,20 +67,16 @@ something to smuggle into a behaviour-preserving refactor.
    parser keeps (duplicate parameter, unknown type name, single-line-needs-return-type,
    body-must-end-with-expression) become `ParseError::Unexpected` (messages unchanged); no extra
    variant is added.
-4. **Assignment checking is uniform (no plain/compound distinction).** The parser desugars
-   `x <op>= e` to `x = (x <op> e)` and sema does not track which it was; both require the result type
-   be assignable to the target's existing type. This slightly tightens plain re-assignment to an
-   incompatible type (no test exercises it) in exchange for a simpler sema.
 2. **Define-before-use / no recursion is retained** this iteration; relaxing recursion is a separate
    future decision.
 3. **Type-annotation resolution stays in the parser.** Mapping a `int`/`float`/`void` annotation to a
    `PinpType` is a fixed lexical lookup needed to build the structural AST (`Param.param_type`,
    `FuncDef.return_type`), so it — and the `unknown_type_name_is_error` test — stay on the parser
    side rather than forcing the AST to carry unresolved type names.
-
-## Open (need a ruling)
-
-None — ready to implement.
+4. **Assignment checking is uniform (no plain/compound distinction).** The parser desugars
+   `x <op>= e` to `x = (x <op> e)` and sema does not track which it was; both require the result type
+   be assignable to the target's existing type. This slightly tightens plain re-assignment to an
+   incompatible type (no test exercises it) in exchange for a simpler sema.
 
 ---
 

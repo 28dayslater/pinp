@@ -163,11 +163,6 @@ impl<'src> Ast<'src> {
         self.types[e.0 as usize]
     }
 
-    /// Records the inferred type of `e`. Called by the sema pass.
-    pub fn set_type(&mut self, e: ExprId, ty: PinpType) {
-        self.types[e.0 as usize] = ty;
-    }
-
     /// Pushes a node, returning its id. The type is left as a placeholder for sema to fill.
     fn push(&mut self, node: Node) -> ExprId {
         let id = ExprId(self.nodes.len() as u32);

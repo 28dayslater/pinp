@@ -293,11 +293,24 @@ mod tests {
     #[test]
     fn assignment_then_reference() {
         let ast = analyzed("a = 2 + 3\na * a");
-        assert_eq!(root_type("a = 2 + 3\na * a"), PinpType::Int);
         let TopLevel::Stmt(Stmt::Expr(e)) = ast.top_level.last().unwrap() else {
             panic!("expected an expression statement");
         };
         assert!(matches!(ast.node(*e), Node::Bin { op: BinOp::Mul, .. }));
+        assert_eq!(ast.type_of(*e), PinpType::Int);
+    }
+
+    #[test]
+    fn reassignment_to_incompatible_type_is_error() {
+        // Decision (0004): assignment is checked uniformly — re-binding to a non-assignable
+        // type is an error, just like a compound assignment. `Float` is not assignable to `Int`.
+        assert!(matches!(sema_error("a = 1\na = 2.0"), SemaError::Type(_)));
+    }
+
+    #[test]
+    fn reassignment_promotes_into_float_slot() {
+        // `a` is Float; re-assigning an Int value is fine (Int promotes), and `a` stays Float.
+        assert_eq!(root_type("a = 1.0\na = 2\na"), PinpType::Float);
     }
 
     // --- error cases ---------------------------------------------------------------------
@@ -421,6 +434,37 @@ mod tests {
     fn return_float_to_int_is_error() {
         assert!(matches!(
             sema_error("f(a: float): int is a"),
+            SemaError::Type(_)
+        ));
+    }
+
+    // A `void` parameter is the only way to bring a `Void` value into an expression, so these
+    // exercise the otherwise-guarded `Void`-operand checks.
+
+    #[test]
+    fn arithmetic_on_void_is_error() {
+        assert!(matches!(
+            sema_error("f(a: void): int is a + 1"),
+            SemaError::Type(_)
+        ));
+    }
+
+    #[test]
+    fn unary_minus_on_void_is_error() {
+        assert!(matches!(
+            sema_error("f(a: void): int is -a"),
+            SemaError::Type(_)
+        ));
+    }
+
+    #[test]
+    fn assign_void_is_error() {
+        assert!(matches!(
+            sema_error(indoc! {"
+                f(a: void): int is
+                    x = a
+                    1
+            "}),
             SemaError::Type(_)
         ));
     }
