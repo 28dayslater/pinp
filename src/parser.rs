@@ -29,6 +29,7 @@ use rustc_hash::{FxHashMap, FxHashSet};
 /// return type (and of a call to one); a value-typed expression is never `Void`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum PinpType {
+    Bool,
     Int,
     Float,
     Void,
@@ -45,7 +46,8 @@ pub struct SymId(pub u32);
 pub struct ExprId(pub u32);
 
 /// A binary operator. `IntDiv` and `Mod` are the `div`/`mod` keyword operators (integer-only);
-/// `Pow` is `^` (right-associative). `Div` (`/`) always yields `Float`.
+/// `Pow` is `^` (right-associative). `Div` (`/`) always yields `Float`. The comparisons
+/// (`Eq`..`Ge`) yield `Bool`; the logicals (`And`/`Or`/`Xor`) take and yield `Bool`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum BinOp {
     Add,
@@ -55,12 +57,22 @@ pub enum BinOp {
     IntDiv,
     Mod,
     Pow,
+    Eq,
+    Ne,
+    Lt,
+    Gt,
+    Le,
+    Ge,
+    And,
+    Or,
+    Xor,
 }
 
-/// A unary (prefix) operator. Negation is the only one so far.
+/// A unary (prefix) operator: arithmetic negation (`-`) or logical `not`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum UnOp {
     Neg,
+    Not,
 }
 
 /// An expression in the AST arena. Child expressions are referenced by [`ExprId`] index rather
@@ -69,6 +81,7 @@ pub enum UnOp {
 pub enum Node {
     Int(i64),
     Float(f64),
+    Bool(bool),
     Var(SymId),    // bare name: a parameter/local, or a top-level global
     Global(SymId), // `::name`
     Unary { op: UnOp, operand: ExprId },
@@ -208,6 +221,9 @@ fn infix(kind: TokenKind) -> Option<(u8, u8, BinOp)> {
     use BinOp::*;
     use TokenKind::*;
     Some(match kind {
+        KwOr => (20, 21, Or),
+        KwXor => (25, 26, Xor),
+        KwAnd => (30, 31, And),
         Plus => (60, 61, Add),
         Minus => (60, 61, Sub),
         Star => (70, 71, Mul),
@@ -219,9 +235,61 @@ fn infix(kind: TokenKind) -> Option<(u8, u8, BinOp)> {
     })
 }
 
-// Right binding power of prefix `-`: above `*`/`/` (70), below `^` (80), so `-a*b` is `(-a)*b`
-// and `-a^b` is `-(a^b)`.
+// The comparison operators (`< > <= >= == !=`) form a single non-associative band that *chains*
+// (see `parse_comparison_chain`) rather than left-folding, so they live here, not in `infix`.
+fn comparison_op(kind: TokenKind) -> Option<BinOp> {
+    use TokenKind::*;
+    Some(match kind {
+        EqEq => BinOp::Eq,
+        Ne => BinOp::Ne,
+        Lt => BinOp::Lt,
+        Gt => BinOp::Gt,
+        Le => BinOp::Le,
+        Ge => BinOp::Ge,
+        _ => return None,
+    })
+}
+
+// Binding power of the comparison band. Looser than additive (60), tighter than the logicals
+// (`and`=30); chain operands are parsed just above it so a comparison never swallows another.
+const COMPARISON_BP: u8 = 45;
+
+// Right binding power of the prefix operators `-` and `not`: above `*`/`/` (70), below `^` (80),
+// so `-a*b` is `(-a)*b` and `-a^b` is `-(a^b)`. `not` shares this level to match C's unary-tight
+// `!`, so `not a == b` is `(not a) == b`.
 const UNARY_MINUS_BP: u8 = 75;
+
+// The "direction" of a comparison operator. A chain of more than one comparison must keep a single
+// direction so the relation is transitive and reads across the chain (`a < b <= c`), as in maths.
+// `!=` is non-transitive (`a != b != c` is not "all distinct"), so it has no direction and never
+// chains.
+#[derive(PartialEq)]
+enum ChainDir {
+    Ascending,  // < <=
+    Descending, // > >=
+    Equality,   // ==
+}
+
+fn chain_dir(op: BinOp) -> Option<ChainDir> {
+    Some(match op {
+        BinOp::Lt | BinOp::Le => ChainDir::Ascending,
+        BinOp::Gt | BinOp::Ge => ChainDir::Descending,
+        BinOp::Eq => ChainDir::Equality,
+        _ => return None,
+    })
+}
+
+fn cmp_symbol(op: BinOp) -> &'static str {
+    match op {
+        BinOp::Eq => "==",
+        BinOp::Ne => "!=",
+        BinOp::Lt => "<",
+        BinOp::Gt => ">",
+        BinOp::Le => "<=",
+        BinOp::Ge => ">=",
+        _ => unreachable!("not a comparison operator"),
+    }
+}
 
 enum AssignKind {
     Plain,
@@ -302,7 +370,11 @@ impl<'src> Parser<'src> {
                 self.ast.top_level.push(TopLevel::Stmt(stmt));
                 match self.peek().kind {
                     TokenKind::Newline | TokenKind::Eof => {}
-                    other => return Err(ParseError::Unexpected(format!("Unexpected token {other:?}."))),
+                    other => {
+                        return Err(ParseError::Unexpected(format!(
+                            "Unexpected token {other:?}."
+                        )))
+                    }
                 }
             }
         }
@@ -421,6 +493,7 @@ impl<'src> Parser<'src> {
     fn parse_type(&mut self) -> Result<PinpType, ParseError> {
         let tok = self.expect(TokenKind::Identifier)?;
         match tok.text {
+            "bool" => Ok(PinpType::Bool),
             "int" => Ok(PinpType::Int),
             "float" => Ok(PinpType::Float),
             "void" => Ok(PinpType::Void),
@@ -444,7 +517,11 @@ impl<'src> Parser<'src> {
                         break;
                     }
                     TokenKind::Eof => break,
-                    other => return Err(ParseError::Unexpected(format!("Unexpected token {other:?}."))),
+                    other => {
+                        return Err(ParseError::Unexpected(format!(
+                            "Unexpected token {other:?}."
+                        )))
+                    }
                 }
                 if self.peek().kind == TokenKind::Dedent {
                     self.pos += 1;
@@ -477,7 +554,11 @@ impl<'src> Parser<'src> {
             let result = self.parse_expr(0)?;
             match self.peek().kind {
                 TokenKind::Newline | TokenKind::Eof => {}
-                other => return Err(ParseError::Unexpected(format!("Unexpected token {other:?}."))),
+                other => {
+                    return Err(ParseError::Unexpected(format!(
+                        "Unexpected token {other:?}."
+                    )))
+                }
             }
             Ok(Block {
                 stmts: Vec::new(),
@@ -489,18 +570,17 @@ impl<'src> Parser<'src> {
     fn parse_stmt(&mut self) -> Result<Stmt, ParseError> {
         // An assignment is a `place` (bare name or `::name`) immediately followed by an
         // assignment operator; anything else is an expression statement.
-        let is_global = if self.peek().kind == TokenKind::Identifier
-            && assign_op(self.at(1)).is_some()
-        {
-            Some(false)
-        } else if self.peek().kind == TokenKind::ColonColon
-            && self.at(1) == TokenKind::Identifier
-            && assign_op(self.at(2)).is_some()
-        {
-            Some(true)
-        } else {
-            None
-        };
+        let is_global =
+            if self.peek().kind == TokenKind::Identifier && assign_op(self.at(1)).is_some() {
+                Some(false)
+            } else if self.peek().kind == TokenKind::ColonColon
+                && self.at(1) == TokenKind::Identifier
+                && assign_op(self.at(2)).is_some()
+            {
+                Some(true)
+            } else {
+                None
+            };
 
         if let Some(global) = is_global {
             if global {
@@ -544,7 +624,16 @@ impl<'src> Parser<'src> {
 
     fn parse_expr(&mut self, min_bp: u8) -> Result<ExprId, ParseError> {
         let mut lhs = self.parse_prefix()?;
-        while let Some((lbp, rbp, op)) = infix(self.peek().kind) {
+        loop {
+            // The comparison band chains rather than left-folds, so it is handled apart from the
+            // `infix` binding-power loop.
+            if comparison_op(self.peek().kind).is_some() && COMPARISON_BP >= min_bp {
+                lhs = self.parse_comparison_chain(lhs)?;
+                continue;
+            }
+            let Some((lbp, rbp, op)) = infix(self.peek().kind) else {
+                break;
+            };
             if lbp < min_bp {
                 break;
             }
@@ -555,13 +644,47 @@ impl<'src> Parser<'src> {
         Ok(lhs)
     }
 
-    fn parse_prefix(&mut self) -> Result<ExprId, ParseError> {
-        if self.peek().kind == TokenKind::Minus {
+    // Parse `first op1 e1 op2 e2 …` (`first` already parsed) and desugar it to the `and` of its
+    // adjacent comparisons: `a < b < c` becomes `(a < b) and (b < c)`, with the middle operand
+    // shared. A chain of one comparison is just that comparison — no `and` is introduced.
+    fn parse_comparison_chain(&mut self, first: ExprId) -> Result<ExprId, ParseError> {
+        let mut prev = first;
+        let mut ops: Vec<BinOp> = Vec::new();
+        let mut result: Option<ExprId> = None;
+        while let Some(op) = comparison_op(self.peek().kind) {
             self.advance();
-            let operand = self.parse_expr(UNARY_MINUS_BP)?;
-            return Ok(self.ast.push(Node::Unary { op: UnOp::Neg, operand }));
+            // Operands bind just above the band so a following comparison starts a new link
+            // rather than nesting inside this one.
+            let next = self.parse_expr(COMPARISON_BP + 1)?;
+            let cmp = self.ast.push(Node::Bin {
+                op,
+                lhs: prev,
+                rhs: next,
+            });
+            result = Some(match result {
+                None => cmp,
+                Some(acc) => self.ast.push(Node::Bin {
+                    op: BinOp::And,
+                    lhs: acc,
+                    rhs: cmp,
+                }),
+            });
+            ops.push(op);
+            prev = next;
         }
-        self.parse_primary()
+        check_monotonic(&ops)?;
+        Ok(result.expect("a chain is only started when a comparison operator is next"))
+    }
+
+    fn parse_prefix(&mut self) -> Result<ExprId, ParseError> {
+        let op = match self.peek().kind {
+            TokenKind::Minus => UnOp::Neg,
+            TokenKind::KwNot => UnOp::Not,
+            _ => return self.parse_primary(),
+        };
+        self.advance();
+        let operand = self.parse_expr(UNARY_MINUS_BP)?;
+        Ok(self.ast.push(Node::Unary { op, operand }))
     }
 
     fn parse_primary(&mut self) -> Result<ExprId, ParseError> {
@@ -573,6 +696,14 @@ impl<'src> Parser<'src> {
             TokenKind::Float => {
                 let v = parse_float(self.advance().text);
                 Ok(self.ast.push(Node::Float(v)))
+            }
+            TokenKind::KwTrue => {
+                self.advance();
+                Ok(self.ast.push(Node::Bool(true)))
+            }
+            TokenKind::KwFalse => {
+                self.advance();
+                Ok(self.ast.push(Node::Bool(false)))
             }
             TokenKind::Identifier => {
                 if self.at(1) == TokenKind::LParen {
@@ -594,7 +725,9 @@ impl<'src> Parser<'src> {
                 self.expect(TokenKind::RParen)?;
                 Ok(e)
             }
-            other => Err(ParseError::Unexpected(format!("Unexpected token {other:?}."))),
+            other => Err(ParseError::Unexpected(format!(
+                "Unexpected token {other:?}."
+            ))),
         }
     }
 
@@ -611,7 +744,11 @@ impl<'src> Parser<'src> {
                         self.advance();
                     }
                     TokenKind::RParen => break,
-                    other => return Err(ParseError::Unexpected(format!("Unexpected token {other:?}."))),
+                    other => {
+                        return Err(ParseError::Unexpected(format!(
+                            "Unexpected token {other:?}."
+                        )))
+                    }
                 }
             }
         }
@@ -649,6 +786,41 @@ fn parse_float(text: &str) -> f64 {
     s.parse().unwrap()
 }
 
+// A chain of more than one comparison must be monotonic: every operator shares one direction
+// (all ascending `< <=`, all descending `> >=`, or all `==`), and `!=` never chains. A lone
+// comparison is always fine — including `!=`.
+fn check_monotonic(ops: &[BinOp]) -> Result<(), ParseError> {
+    if ops.len() < 2 {
+        return Ok(());
+    }
+    let first = ops[0];
+    let dir = chain_dir(first).ok_or_else(|| {
+        ParseError::Unexpected(format!(
+            "Cannot chain `{}`; it is not transitive.",
+            cmp_symbol(first)
+        ))
+    })?;
+    for &op in &ops[1..] {
+        match chain_dir(op) {
+            None => {
+                return Err(ParseError::Unexpected(format!(
+                    "Cannot chain `{}`; it is not transitive.",
+                    cmp_symbol(op)
+                )))
+            }
+            Some(d) if d != dir => {
+                return Err(ParseError::Unexpected(format!(
+                    "Cannot chain `{}` with `{}`.",
+                    cmp_symbol(first),
+                    cmp_symbol(op)
+                )))
+            }
+            Some(_) => {}
+        }
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -670,7 +842,9 @@ mod tests {
         match ast.top_level.last().unwrap() {
             TopLevel::Stmt(Stmt::Expr(e)) => *e,
             TopLevel::Stmt(Stmt::Assign { rhs, .. }) => *rhs,
-            TopLevel::Func(_) => panic!("Program ends in a function definition, not an expression."),
+            TopLevel::Func(_) => {
+                panic!("Program ends in a function definition, not an expression.")
+            }
         }
     }
 
@@ -679,7 +853,12 @@ mod tests {
     #[test]
     fn precedence_mul_over_add() {
         let ast = parse_ok("2 + 3 * 4");
-        let Node::Bin { op: BinOp::Add, lhs, rhs } = *ast.node(root(&ast)) else {
+        let Node::Bin {
+            op: BinOp::Add,
+            lhs,
+            rhs,
+        } = *ast.node(root(&ast))
+        else {
             panic!("Expected an Add node at the root.");
         };
         assert_eq!(*ast.node(lhs), Node::Int(2));
@@ -689,7 +868,12 @@ mod tests {
     #[test]
     fn power_is_right_assoc() {
         let ast = parse_ok("2 ^ 2 ^ 3");
-        let Node::Bin { op: BinOp::Pow, lhs, rhs } = *ast.node(root(&ast)) else {
+        let Node::Bin {
+            op: BinOp::Pow,
+            lhs,
+            rhs,
+        } = *ast.node(root(&ast))
+        else {
             panic!("Expected a Pow node at the root.");
         };
         assert_eq!(*ast.node(lhs), Node::Int(2));
@@ -699,16 +883,28 @@ mod tests {
     #[test]
     fn unary_minus_binds_below_power() {
         let ast = parse_ok("-2 ^ 2");
-        let Node::Unary { op: UnOp::Neg, operand } = *ast.node(root(&ast)) else {
+        let Node::Unary {
+            op: UnOp::Neg,
+            operand,
+        } = *ast.node(root(&ast))
+        else {
             panic!("Expected a unary Neg node at the root.");
         };
-        assert!(matches!(ast.node(operand), Node::Bin { op: BinOp::Pow, .. }));
+        assert!(matches!(
+            ast.node(operand),
+            Node::Bin { op: BinOp::Pow, .. }
+        ));
     }
 
     #[test]
     fn paren_grouping() {
         let ast = parse_ok("(2 + 3) * 4");
-        let Node::Bin { op: BinOp::Mul, lhs, .. } = *ast.node(root(&ast)) else {
+        let Node::Bin {
+            op: BinOp::Mul,
+            lhs,
+            ..
+        } = *ast.node(root(&ast))
+        else {
             panic!("Expected a Mul node at the root.");
         };
         assert!(matches!(ast.node(lhs), Node::Bin { op: BinOp::Add, .. }));
@@ -724,15 +920,160 @@ mod tests {
     fn compound_assign_desugars_to_read_and_op() {
         // `b += 1` becomes `b = (b + 1)`: an Assign whose rhs is a Bin reading the target.
         let ast = parse_ok("b = 1\nb += 1");
-        let TopLevel::Stmt(Stmt::Assign { target: Place::Local(_), rhs }) =
-            ast.top_level.last().unwrap()
+        let TopLevel::Stmt(Stmt::Assign {
+            target: Place::Local(_),
+            rhs,
+        }) = ast.top_level.last().unwrap()
         else {
             panic!("Expected a desugared local assignment.");
         };
-        let Node::Bin { op: BinOp::Add, lhs, .. } = *ast.node(*rhs) else {
+        let Node::Bin {
+            op: BinOp::Add,
+            lhs,
+            ..
+        } = *ast.node(*rhs)
+        else {
             panic!("Expected the rhs to be an Add.");
         };
         assert!(matches!(ast.node(lhs), Node::Var(_)));
+    }
+
+    // --- bool literals, logical & comparison operators -----------------------------------
+
+    #[test]
+    fn bool_literals() {
+        let t = parse_ok("true");
+        assert_eq!(*t.node(root(&t)), Node::Bool(true));
+        let f = parse_ok("false");
+        assert_eq!(*f.node(root(&f)), Node::Bool(false));
+    }
+
+    #[test]
+    fn logical_precedence_and_xor_or() {
+        // `and` (30) > `xor` (25) > `or` (20): `a and b or a xor b` = `(a and b) or (a xor b)`.
+        let ast = parse_ok("a and b or a xor b");
+        let Node::Bin {
+            op: BinOp::Or,
+            lhs,
+            rhs,
+        } = *ast.node(root(&ast))
+        else {
+            panic!("Expected an Or at the root.");
+        };
+        assert!(matches!(ast.node(lhs), Node::Bin { op: BinOp::And, .. }));
+        assert!(matches!(ast.node(rhs), Node::Bin { op: BinOp::Xor, .. }));
+    }
+
+    #[test]
+    fn not_is_unary_tight() {
+        // C precedence: `not` binds tighter than every infix op, so `not a == b` = `(not a) == b`.
+        let ast = parse_ok("not a == b");
+        let Node::Bin {
+            op: BinOp::Eq, lhs, ..
+        } = *ast.node(root(&ast))
+        else {
+            panic!("Expected an Eq at the root.");
+        };
+        assert!(matches!(ast.node(lhs), Node::Unary { op: UnOp::Not, .. }));
+    }
+
+    #[test]
+    fn not_chains() {
+        let ast = parse_ok("not not a");
+        let Node::Unary {
+            op: UnOp::Not,
+            operand,
+        } = *ast.node(root(&ast))
+        else {
+            panic!("Expected a Not at the root.");
+        };
+        assert!(matches!(
+            ast.node(operand),
+            Node::Unary { op: UnOp::Not, .. }
+        ));
+    }
+
+    #[test]
+    fn comparison_binds_looser_than_arithmetic() {
+        // `a + b < c` = `(a + b) < c`.
+        let ast = parse_ok("a + b < c");
+        let Node::Bin {
+            op: BinOp::Lt, lhs, ..
+        } = *ast.node(root(&ast))
+        else {
+            panic!("Expected a Lt at the root.");
+        };
+        assert!(matches!(ast.node(lhs), Node::Bin { op: BinOp::Add, .. }));
+    }
+
+    #[test]
+    fn lone_comparison_has_no_and() {
+        let ast = parse_ok("a > b");
+        assert!(matches!(
+            ast.node(root(&ast)),
+            Node::Bin { op: BinOp::Gt, .. }
+        ));
+    }
+
+    #[test]
+    fn chained_comparison_desugars_with_shared_operand() {
+        // `a < b < c` => `(a < b) and (b < c)`, with the middle `b` shared (same ExprId).
+        let ast = parse_ok("a < b < c");
+        let Node::Bin {
+            op: BinOp::And,
+            lhs,
+            rhs,
+        } = *ast.node(root(&ast))
+        else {
+            panic!("Expected an And at the root.");
+        };
+        let Node::Bin {
+            op: BinOp::Lt,
+            rhs: left_b,
+            ..
+        } = *ast.node(lhs)
+        else {
+            panic!("Expected the first comparison to be a Lt.");
+        };
+        let Node::Bin {
+            op: BinOp::Lt,
+            lhs: right_b,
+            ..
+        } = *ast.node(rhs)
+        else {
+            panic!("Expected the second comparison to be a Lt.");
+        };
+        assert_eq!(
+            left_b, right_b,
+            "the shared middle operand must reuse one ExprId"
+        );
+    }
+
+    #[test]
+    fn monotonic_chains_parse() {
+        parse_ok("a <= b < c");
+        parse_ok("d >= e >= f > g");
+        parse_ok("a == b == c");
+    }
+
+    #[test]
+    fn non_monotonic_chains_are_errors() {
+        assert!(matches!(parse("a < b > c"), Err(ParseError::Unexpected(_))));
+        assert!(matches!(
+            parse("a <= b == c"),
+            Err(ParseError::Unexpected(_))
+        ));
+        assert!(matches!(
+            parse("a != b != c"),
+            Err(ParseError::Unexpected(_))
+        ));
+    }
+
+    #[test]
+    fn bool_type_annotation() {
+        let ast = parse_ok("f(a: bool): bool is a");
+        assert_eq!(func(&ast, 0).params[0].param_type, PinpType::Bool);
+        assert_eq!(func(&ast, 0).return_type, PinpType::Bool);
     }
 
     // --- function & program structure ----------------------------------------------------
@@ -804,7 +1145,10 @@ mod tests {
         "});
         assert!(matches!(
             func(&ast, 1).body.stmts[0],
-            Stmt::Assign { target: Place::Global(_), .. }
+            Stmt::Assign {
+                target: Place::Global(_),
+                ..
+            }
         ));
     }
 

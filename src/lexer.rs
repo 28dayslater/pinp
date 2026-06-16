@@ -56,6 +56,21 @@ enum Lexeme {
     #[token("mod=")]
     ModEq,
 
+    // Comparison operators. The two-character forms are longest-match winners over the bare
+    // `=`/`<`/`>` (and `!=` is the only use of `!`).
+    #[token("==")]
+    EqEq,
+    #[token("!=")]
+    Ne,
+    #[token("<=")]
+    Le,
+    #[token(">=")]
+    Ge,
+    #[token("<")]
+    Lt,
+    #[token(">")]
+    Gt,
+
     #[token("+")]
     Plus,
     #[token("-")]
@@ -94,6 +109,12 @@ pub enum TokenKind {
     Slash,
     Caret,
     Equal,
+    EqEq,
+    Ne,
+    Lt,
+    Gt,
+    Le,
+    Ge,
     PlusEq,
     MinusEq,
     StarEq,
@@ -109,6 +130,12 @@ pub enum TokenKind {
     KwDiv,
     KwMod,
     KwIs,
+    KwTrue,
+    KwFalse,
+    KwAnd,
+    KwOr,
+    KwXor,
+    KwNot,
     Newline,
     Indent,
     Dedent,
@@ -180,6 +207,12 @@ pub fn lex(src: &str) -> Result<Vec<Token<'_>>, LexError> {
                 "div" => TokenKind::KwDiv,
                 "mod" => TokenKind::KwMod,
                 "is" => TokenKind::KwIs,
+                "true" => TokenKind::KwTrue,
+                "false" => TokenKind::KwFalse,
+                "and" => TokenKind::KwAnd,
+                "or" => TokenKind::KwOr,
+                "xor" => TokenKind::KwXor,
+                "not" => TokenKind::KwNot,
                 _ => TokenKind::Identifier,
             },
             Lexeme::PlusEq => TokenKind::PlusEq,
@@ -195,6 +228,12 @@ pub fn lex(src: &str) -> Result<Vec<Token<'_>>, LexError> {
             Lexeme::Slash => TokenKind::Slash,
             Lexeme::Caret => TokenKind::Caret,
             Lexeme::Equal => TokenKind::Equal,
+            Lexeme::EqEq => TokenKind::EqEq,
+            Lexeme::Ne => TokenKind::Ne,
+            Lexeme::Lt => TokenKind::Lt,
+            Lexeme::Gt => TokenKind::Gt,
+            Lexeme::Le => TokenKind::Le,
+            Lexeme::Ge => TokenKind::Ge,
             Lexeme::LParen => {
                 paren_depth += 1;
                 TokenKind::LParen
@@ -312,6 +351,30 @@ mod tests {
     }
 
     #[test]
+    fn comparison_and_logical_tokens() {
+        use TokenKind::*;
+        assert_eq!(
+            kinds("== != < > <= >="),
+            vec![EqEq, Ne, Lt, Gt, Le, Ge, Eof]
+        );
+        // Logical/value words become keywords; `bool` stays an ordinary identifier (resolved
+        // only in type-annotation position, like `int`/`float`/`void`).
+        assert_eq!(
+            kinds("true false and or xor not bool"),
+            vec![KwTrue, KwFalse, KwAnd, KwOr, KwXor, KwNot, Identifier, Eof]
+        );
+    }
+
+    #[test]
+    fn multichar_comparisons_beat_bare_operators() {
+        use TokenKind::*;
+        // Longest-match: `==` over `= =`, `<=`/`>=` over `<`/`>` then `=`.
+        assert_eq!(kinds("a == b"), vec![Identifier, EqEq, Identifier, Eof]);
+        assert_eq!(kinds("a <= b"), vec![Identifier, Le, Identifier, Eof]);
+        assert_eq!(kinds("a = b"), vec![Identifier, Equal, Identifier, Eof]);
+    }
+
+    #[test]
     fn punctuation_and_compound_assign() {
         use TokenKind::*;
         assert_eq!(
@@ -390,7 +453,8 @@ mod tests {
             kinds(src),
             vec![
                 Identifier, LParen, Identifier, Colon, Identifier, Comma, // f(a: float,
-                Identifier, Colon, Identifier, RParen, Colon, Identifier, KwIs, // b: float): float is
+                Identifier, Colon, Identifier, RParen, Colon, Identifier,
+                KwIs, // b: float): float is
                 Newline, Indent, Identifier, Newline, Dedent, // body `x`
                 Eof
             ]

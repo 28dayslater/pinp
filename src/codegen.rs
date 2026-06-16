@@ -29,7 +29,9 @@ use inkwell::values::{
 };
 use rustc_hash::FxHashMap;
 
-use crate::parser::{parse, Ast, BinOp, ExprId, Node, PinpType, Place, Stmt, SymId, TopLevel, UnOp};
+use crate::parser::{
+    parse, Ast, BinOp, ExprId, Node, PinpType, Place, Stmt, SymId, TopLevel, UnOp,
+};
 use crate::sema::analyze;
 
 /// Name of the synthetic entry function [`CodeGen`] emits for the top-level program.
@@ -98,7 +100,9 @@ impl Jit {
         let mut address: LLVMOrcExecutorAddress = 0;
         check_error(LLVMOrcLLJITLookup(self.jit, &mut address, symbol.as_ptr()))?;
         // `address` is the symbol's runtime address; reinterpret it as `F`.
-        Ok(std::mem::transmute_copy::<LLVMOrcExecutorAddress, F>(&address))
+        Ok(std::mem::transmute_copy::<LLVMOrcExecutorAddress, F>(
+            &address,
+        ))
     }
 }
 
@@ -164,8 +168,13 @@ impl<'ctx, 'ast> CodeGen<'ctx, 'ast> {
         self.context.f64_type()
     }
 
+    fn bool_type(&self) -> IntType<'ctx> {
+        self.context.bool_type() // i1
+    }
+
     fn basic_type(&self, ty: PinpType) -> BasicTypeEnum<'ctx> {
         match ty {
+            PinpType::Bool => self.bool_type().into(),
             PinpType::Int => self.int_type().into(),
             PinpType::Float => self.float_type().into(),
             PinpType::Void => unreachable!("Void is not a storable value type."),
@@ -197,8 +206,7 @@ impl<'ctx, 'ast> CodeGen<'ctx, 'ast> {
                 let global = self.module.add_global(self.basic_type(ty), None, name);
                 global.set_linkage(Linkage::Internal);
                 global.set_initializer(&self.zero(ty));
-                self.globals
-                    .insert(sym, (global.as_pointer_value(), ty));
+                self.globals.insert(sym, (global.as_pointer_value(), ty));
             }
         }
     }
@@ -342,12 +350,20 @@ impl<'ctx, 'ast> CodeGen<'ctx, 'ast> {
         let value = match node {
             Node::Int(n) => self.int_type().const_int(*n as u64, true).into(),
             Node::Float(f) => self.float_type().const_float(*f).into(),
+            Node::Bool(b) => self.bool_type().const_int(*b as u64, false).into(),
             Node::Var(sym) => self.load_var(*sym, false)?,
             Node::Global(sym) => self.load_var(*sym, true)?,
-            Node::Unary { op: UnOp::Neg, operand } => {
+            Node::Unary {
+                op: UnOp::Neg,
+                operand,
+            } => {
                 let operand = *operand;
+                // The result type is `Int` for a bool/int operand, `Float` for a float one; promote
+                // the operand up to it (a `Bool` operand widens to `Int`) before negating.
+                let result_type = self.ast.type_of(e);
                 let value = self.expect_value(operand)?;
-                if self.ast.type_of(operand) == PinpType::Int {
+                let value = self.promote(value, self.ast.type_of(operand), result_type);
+                if result_type == PinpType::Int {
                     self.builder
                         .build_int_neg(value.into_int_value(), "neg")
                         .map_err(err)?
@@ -358,6 +374,13 @@ impl<'ctx, 'ast> CodeGen<'ctx, 'ast> {
                         .map_err(err)?
                         .into()
                 }
+            }
+            Node::Unary {
+                op: UnOp::Not,
+                operand,
+            } => {
+                let value = self.expect_value(*operand)?.into_int_value(); // i1
+                self.builder.build_not(value, "not").map_err(err)?.into()
             }
             Node::Bin { op, lhs, rhs } => self.gen_bin(e, *op, *lhs, *rhs)?,
             Node::Call { callee, args } => return self.gen_call(*callee, args),
@@ -388,7 +411,10 @@ impl<'ctx, 'ast> CodeGen<'ctx, 'ast> {
             let value = self.promote(value, self.ast.type_of(*arg), *param_type);
             argv.push(value.into());
         }
-        let call = self.builder.build_call(function, &argv, "call").map_err(err)?;
+        let call = self
+            .builder
+            .build_call(function, &argv, "call")
+            .map_err(err)?;
         Ok(match return_type {
             PinpType::Void => None,
             _ => Some(basic_value(call.try_as_basic_value())),
@@ -429,17 +455,26 @@ impl<'ctx, 'ast> CodeGen<'ctx, 'ast> {
             BinOp::Div => {
                 let l = self.as_float(lhs)?;
                 let r = self.as_float(rhs)?;
-                self.builder.build_float_div(l, r, "fdiv").map_err(err)?.into()
+                self.builder
+                    .build_float_div(l, r, "fdiv")
+                    .map_err(err)?
+                    .into()
             }
             BinOp::IntDiv => {
                 let l = self.as_int(lhs)?;
                 let r = self.as_int(rhs)?;
-                self.builder.build_int_signed_div(l, r, "sdiv").map_err(err)?.into()
+                self.builder
+                    .build_int_signed_div(l, r, "sdiv")
+                    .map_err(err)?
+                    .into()
             }
             BinOp::Mod => {
                 let l = self.as_int(lhs)?;
                 let r = self.as_int(rhs)?;
-                self.builder.build_int_signed_rem(l, r, "srem").map_err(err)?.into()
+                self.builder
+                    .build_int_signed_rem(l, r, "srem")
+                    .map_err(err)?
+                    .into()
             }
             BinOp::Pow => {
                 let l = self.as_float(lhs)?;
@@ -459,8 +494,109 @@ impl<'ctx, 'ast> CodeGen<'ctx, 'ast> {
                     result.into()
                 }
             }
+            BinOp::Eq | BinOp::Ne | BinOp::Lt | BinOp::Gt | BinOp::Le | BinOp::Ge => {
+                self.gen_compare(op, lhs, rhs)?
+            }
+            // `xor` is eager — both operands always decide the result.
+            BinOp::Xor => {
+                let l = self.expect_value(lhs)?.into_int_value(); // i1
+                let r = self.expect_value(rhs)?.into_int_value();
+                self.builder.build_xor(l, r, "xor").map_err(err)?.into()
+            }
+            BinOp::And | BinOp::Or => self.gen_short_circuit(op, lhs, rhs)?,
         };
         Ok(value)
+    }
+
+    // A comparison yields `i1`. Operands compare at their common type: float (with an ordered
+    // predicate) if either side is float, otherwise int (signed predicate) — `Bool` operands
+    // widen to int via `as_int`/`as_float`.
+    fn gen_compare(
+        &mut self,
+        op: BinOp,
+        lhs: ExprId,
+        rhs: ExprId,
+    ) -> Result<BasicValueEnum<'ctx>, String> {
+        use inkwell::{FloatPredicate as F, IntPredicate as I};
+        let float =
+            self.ast.type_of(lhs) == PinpType::Float || self.ast.type_of(rhs) == PinpType::Float;
+        let value = if float {
+            let l = self.as_float(lhs)?;
+            let r = self.as_float(rhs)?;
+            let pred = match op {
+                BinOp::Eq => F::OEQ,
+                BinOp::Ne => F::ONE,
+                BinOp::Lt => F::OLT,
+                BinOp::Gt => F::OGT,
+                BinOp::Le => F::OLE,
+                _ => F::OGE,
+            };
+            self.builder
+                .build_float_compare(pred, l, r, "fcmp")
+                .map_err(err)?
+        } else {
+            let l = self.as_int(lhs)?;
+            let r = self.as_int(rhs)?;
+            let pred = match op {
+                BinOp::Eq => I::EQ,
+                BinOp::Ne => I::NE,
+                BinOp::Lt => I::SLT,
+                BinOp::Gt => I::SGT,
+                BinOp::Le => I::SLE,
+                _ => I::SGE,
+            };
+            self.builder
+                .build_int_compare(pred, l, r, "icmp")
+                .map_err(err)?
+        };
+        Ok(value.into())
+    }
+
+    // Short-circuit `and`/`or` over `i1` operands — the codebase's first intra-expression
+    // branching. Evaluate the left operand; for `and` skip the right when it is false, for `or`
+    // skip it when it is true; a `phi` in the merge block selects the short-circuit constant or
+    // the right operand's value.
+    fn gen_short_circuit(
+        &mut self,
+        op: BinOp,
+        lhs: ExprId,
+        rhs: ExprId,
+    ) -> Result<BasicValueEnum<'ctx>, String> {
+        let lhs_val = self.expect_value(lhs)?.into_int_value(); // i1
+        let entry_bb = self.builder.get_insert_block().expect("an active block");
+        let function = entry_bb
+            .get_parent()
+            .expect("a block has a parent function");
+        let rhs_bb = self.context.append_basic_block(function, "sc_rhs");
+        let merge_bb = self.context.append_basic_block(function, "sc_merge");
+
+        // `and`: branch to rhs when lhs is true; `or`: branch to rhs when lhs is false.
+        let (then_bb, else_bb) = match op {
+            BinOp::And => (rhs_bb, merge_bb),
+            _ => (merge_bb, rhs_bb),
+        };
+        self.builder
+            .build_conditional_branch(lhs_val, then_bb, else_bb)
+            .map_err(err)?;
+
+        self.builder.position_at_end(rhs_bb);
+        let rhs_val = self.expect_value(rhs)?.into_int_value();
+        // The right operand may itself have opened blocks; the phi's incoming edge is wherever we
+        // ended up, not necessarily `rhs_bb`.
+        let rhs_end_bb = self.builder.get_insert_block().expect("an active block");
+        self.builder
+            .build_unconditional_branch(merge_bb)
+            .map_err(err)?;
+
+        self.builder.position_at_end(merge_bb);
+        let phi = self
+            .builder
+            .build_phi(self.bool_type(), "sc")
+            .map_err(err)?;
+        // On the short-circuit edge the result is `false` for `and`, `true` for `or`.
+        let short = self.bool_type().const_int((op == BinOp::Or) as u64, false);
+        phi.add_incoming(&[(&short, entry_bb), (&rhs_val, rhs_end_bb)]);
+        Ok(phi.as_basic_value())
     }
 
     /// `llvm.pow.f64`, declared lazily on first use.
@@ -479,41 +615,64 @@ impl<'ctx, 'ast> CodeGen<'ctx, 'ast> {
             .ok_or_else(|| "Expected a value but the expression is void.".to_string())
     }
 
+    /// Evaluates `e` as an `i64`, widening a `Bool` (`i1`) operand with a zero-extend.
     fn as_int(&mut self, e: ExprId) -> Result<inkwell::values::IntValue<'ctx>, String> {
-        Ok(self.expect_value(e)?.into_int_value())
-    }
-
-    /// Evaluates `e` as a float, inserting an `Int -> Float` promotion if needed.
-    fn as_float(&mut self, e: ExprId) -> Result<inkwell::values::FloatValue<'ctx>, String> {
-        let value = self.expect_value(e)?;
-        if self.ast.type_of(e) == PinpType::Int {
+        let value = self.expect_value(e)?.into_int_value();
+        if self.ast.type_of(e) == PinpType::Bool {
             self.builder
-                .build_signed_int_to_float(value.into_int_value(), self.float_type(), "promote")
+                .build_int_z_extend(value, self.int_type(), "bwiden")
                 .map_err(err)
         } else {
-            Ok(value.into_float_value())
+            Ok(value)
         }
     }
 
-    /// Promotes an `Int` value to `Float` when the target type requires it.
+    /// Evaluates `e` as a float, inserting a widening conversion (`Bool`/`Int -> Float`) if needed.
+    fn as_float(&mut self, e: ExprId) -> Result<inkwell::values::FloatValue<'ctx>, String> {
+        let value = self.expect_value(e)?;
+        match self.ast.type_of(e) {
+            PinpType::Int => self
+                .builder
+                .build_signed_int_to_float(value.into_int_value(), self.float_type(), "promote")
+                .map_err(err),
+            PinpType::Bool => self
+                .builder
+                .build_unsigned_int_to_float(value.into_int_value(), self.float_type(), "promote")
+                .map_err(err),
+            _ => Ok(value.into_float_value()),
+        }
+    }
+
+    /// Widens a value up the `Bool -> Int -> Float` lattice when the target type requires it.
     fn promote(
         &self,
         value: BasicValueEnum<'ctx>,
         from: PinpType,
         to: PinpType,
     ) -> BasicValueEnum<'ctx> {
-        if from == PinpType::Int && to == PinpType::Float {
-            self.builder
+        match (from, to) {
+            (PinpType::Bool, PinpType::Int) => self
+                .builder
+                .build_int_z_extend(value.into_int_value(), self.int_type(), "bwiden")
+                .expect("bool-to-int widening")
+                .into(),
+            (PinpType::Bool, PinpType::Float) => self
+                .builder
+                .build_unsigned_int_to_float(value.into_int_value(), self.float_type(), "promote")
+                .expect("bool-to-float promotion")
+                .into(),
+            (PinpType::Int, PinpType::Float) => self
+                .builder
                 .build_signed_int_to_float(value.into_int_value(), self.float_type(), "promote")
                 .expect("int-to-float promotion")
-                .into()
-        } else {
-            value
+                .into(),
+            _ => value,
         }
     }
 
     fn zero(&self, ty: PinpType) -> BasicValueEnum<'ctx> {
         match ty {
+            PinpType::Bool => self.bool_type().const_zero().into(),
             PinpType::Int => self.int_type().const_zero().into(),
             PinpType::Float => self.float_type().const_zero().into(),
             PinpType::Void => unreachable!("Void has no zero value."),
@@ -550,6 +709,7 @@ fn err(e: inkwell::builder::BuilderError) -> String {
 /// The value a pinp program evaluates to.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub enum PinpValue {
+    Bool(bool),
     Int(i64),
     Float(f64),
     Void,
@@ -589,6 +749,12 @@ impl PinpJit {
         // from the program's statically inferred result type.
         unsafe {
             Ok(match self.result_type {
+                PinpType::Bool => {
+                    // The entry returns `i1`; read it through `u8` and mask the low bit, since an
+                    // `i1` return is not guaranteed to zero-extend its upper bits.
+                    let f: extern "C" fn() -> u8 = self.jit.lookup(ENTRY)?;
+                    PinpValue::Bool(f() & 1 != 0)
+                }
                 PinpType::Int => {
                     let f: extern "C" fn() -> i64 = self.jit.lookup(ENTRY)?;
                     PinpValue::Int(f())
@@ -658,6 +824,26 @@ mod tests {
         "})
         .unwrap();
         assert_eq!(result, PinpValue::Int(11));
+    }
+
+    #[test]
+    fn and_or_short_circuit() {
+        // The right operand traps (integer division by zero) if evaluated. Correct short-circuit
+        // means a deciding left operand skips it, so these must not crash and must return the
+        // left-determined value.
+        assert_eq!(
+            PinpJit::eval("false and (1 div 0 == 0)").unwrap(),
+            PinpValue::Bool(false)
+        );
+        assert_eq!(
+            PinpJit::eval("true or (1 div 0 == 0)").unwrap(),
+            PinpValue::Bool(true)
+        );
+        // And the live path is still taken when the left operand does not decide.
+        assert_eq!(
+            PinpJit::eval("true and 2 > 1").unwrap(),
+            PinpValue::Bool(true)
+        );
     }
 
     #[test]

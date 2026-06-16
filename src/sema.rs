@@ -14,7 +14,9 @@
 
 use rustc_hash::FxHashMap;
 
-use crate::parser::{Ast, BinOp, ExprId, FuncDef, Node, PinpType, Place, Stmt, SymId, TopLevel};
+use crate::parser::{
+    Ast, BinOp, ExprId, FuncDef, Node, PinpType, Place, Stmt, SymId, TopLevel, UnOp,
+};
 
 /// A semantic failure. pinp is fail-fast: the first error stops the pass.
 #[derive(Debug, Clone, PartialEq)]
@@ -25,9 +27,21 @@ pub enum SemaError {
     Type(String),
 }
 
-/// `from` is assignable to `to` if identical, or via the one allowed promotion `Int -> Float`.
+/// `from` is assignable to `to` if identical, or by widening up the promotion lattice
+/// `Bool -> Int -> Float`. Narrowing (e.g. `Float -> Int`, anything `-> Bool`) is never implicit.
 fn assignable(from: PinpType, to: PinpType) -> bool {
-    from == to || (from == PinpType::Int && to == PinpType::Float)
+    use PinpType::*;
+    from == to || matches!((from, to), (Bool, Int) | (Bool, Float) | (Int, Float))
+}
+
+/// Whether `t` participates in arithmetic/comparison, i.e. is not `Void`.
+fn numeric(t: PinpType) -> bool {
+    t != PinpType::Void
+}
+
+/// Whether `t` promotes to `Int` (rather than forcing a `Float` result): `Bool` or `Int`.
+fn int_like(t: PinpType) -> bool {
+    matches!(t, PinpType::Bool | PinpType::Int)
 }
 
 #[derive(Clone)]
@@ -165,14 +179,12 @@ impl Analyzer<'_, '_> {
         let ty = match self.nodes[e.0 as usize].clone() {
             Node::Int(_) => PinpType::Int,
             Node::Float(_) => PinpType::Float,
+            Node::Bool(_) => PinpType::Bool,
             Node::Var(s) => self.lookup_local(s)?,
             Node::Global(s) => self.lookup_global(s)?,
-            Node::Unary { operand, .. } => {
+            Node::Unary { op, operand } => {
                 let t = self.analyze_expr(operand)?;
-                if t == PinpType::Void {
-                    return Err(SemaError::Type("Unary minus on a void value.".into()));
-                }
-                t
+                self.unary_type(op, t)?
             }
             Node::Bin { op, lhs, rhs } => {
                 let lt = self.analyze_expr(lhs)?;
@@ -195,39 +207,75 @@ impl Analyzer<'_, '_> {
     }
 
     fn lookup_global(&self, s: SymId) -> Result<PinpType, SemaError> {
-        self.scopes[0]
-            .get(&s)
-            .copied()
-            .ok_or_else(|| SemaError::UnknownSymbol(format!("Unknown global `::{}`.", self.name(s))))
+        self.scopes[0].get(&s).copied().ok_or_else(|| {
+            SemaError::UnknownSymbol(format!("Unknown global `::{}`.", self.name(s)))
+        })
+    }
+
+    fn unary_type(&self, op: UnOp, t: PinpType) -> Result<PinpType, SemaError> {
+        match op {
+            // Arithmetic negation: `Bool` promotes to `Int` (like any arithmetic use of a bool).
+            UnOp::Neg => match t {
+                PinpType::Void => Err(SemaError::Type("Unary minus on a void value.".into())),
+                PinpType::Bool => Ok(PinpType::Int),
+                other => Ok(other),
+            },
+            UnOp::Not => {
+                if t == PinpType::Bool {
+                    Ok(PinpType::Bool)
+                } else {
+                    Err(SemaError::Type(format!(
+                        "`not` requires a Bool operand, got {t:?}."
+                    )))
+                }
+            }
+        }
     }
 
     fn bin_type(&self, op: BinOp, lt: PinpType, rt: PinpType) -> Result<PinpType, SemaError> {
+        use BinOp::*;
         use PinpType::*;
-        if lt == Void || rt == Void {
-            return Err(SemaError::Type("Arithmetic on a void value.".into()));
+        // Logicals take and yield Bool only — no truthiness.
+        if matches!(op, And | Or | Xor) {
+            return if lt == Bool && rt == Bool {
+                Ok(Bool)
+            } else {
+                Err(SemaError::Type(format!(
+                    "`{op:?}` requires Bool operands, got {lt:?} and {rt:?}."
+                )))
+            };
         }
-        let both_int = lt == Int && rt == Int;
+        // Arithmetic and comparison both require numeric (non-void) operands.
+        if !numeric(lt) || !numeric(rt) {
+            return Err(SemaError::Type("Operation on a void value.".into()));
+        }
         Ok(match op {
-            BinOp::Add | BinOp::Sub | BinOp::Mul | BinOp::Pow => {
-                if both_int {
+            Eq | Ne | Lt | Gt | Le | Ge => Bool,
+            Add | Sub | Mul | Pow => {
+                if int_like(lt) && int_like(rt) {
                     Int
                 } else {
                     Float
                 }
             }
-            BinOp::Div => Float,
-            BinOp::IntDiv | BinOp::Mod => {
-                if !both_int {
+            Div => Float,
+            IntDiv | Mod => {
+                if int_like(lt) && int_like(rt) {
+                    Int
+                } else {
                     return Err(SemaError::Type(format!("{op:?} requires Int operands.")));
                 }
-                Int
             }
+            And | Or | Xor => unreachable!("handled above"),
         })
     }
 
     fn call_type(&mut self, callee: SymId, args: &[ExprId]) -> Result<PinpType, SemaError> {
         let sig = self.funcs.get(&callee).cloned().ok_or_else(|| {
-            SemaError::UnknownSymbol(format!("Call to undefined function `{}`.", self.name(callee)))
+            SemaError::UnknownSymbol(format!(
+                "Call to undefined function `{}`.",
+                self.name(callee)
+            ))
         })?;
         if args.len() != sig.params.len() {
             return Err(SemaError::Type(format!(
@@ -319,6 +367,65 @@ mod tests {
     fn reassignment_promotes_into_float_slot() {
         // `a` is Float; re-assigning an Int value is fine (Int promotes), and `a` stays Float.
         assert_eq!(root_type("a = 1.0\na = 2\na"), PinpType::Float);
+    }
+
+    // --- bool, comparisons & logicals ----------------------------------------------------
+
+    #[test]
+    fn bool_literal_and_logicals() {
+        assert_eq!(root_type("true"), PinpType::Bool);
+        assert_eq!(root_type("true and false"), PinpType::Bool);
+        assert_eq!(root_type("true or false xor true"), PinpType::Bool);
+        assert_eq!(root_type("not true"), PinpType::Bool);
+    }
+
+    #[test]
+    fn comparisons_yield_bool() {
+        assert_eq!(root_type("1 < 2"), PinpType::Bool);
+        assert_eq!(root_type("1.0 >= 2"), PinpType::Bool);
+        assert_eq!(root_type("true == false"), PinpType::Bool);
+        assert_eq!(root_type("1 < 2 < 3"), PinpType::Bool); // chained
+    }
+
+    #[test]
+    fn bool_promotes_in_arithmetic() {
+        assert_eq!(root_type("true + false"), PinpType::Int); // bool -> int
+        assert_eq!(root_type("true + 1"), PinpType::Int);
+        assert_eq!(root_type("true + 1.0"), PinpType::Float);
+        assert_eq!(root_type("-true"), PinpType::Int); // unary minus promotes bool to int
+    }
+
+    #[test]
+    fn bool_assignable_to_numeric_slot() {
+        // bool flows into an int/float return slot, but not the reverse.
+        assert_eq!(
+            root_type(indoc! {"
+                f(a: bool): int is a
+                f(true)
+            "}),
+            PinpType::Int
+        );
+        assert!(matches!(
+            sema_error("f(a: int): bool is a"),
+            SemaError::Type(_)
+        ));
+    }
+
+    #[test]
+    fn logical_on_non_bool_is_error() {
+        assert!(matches!(sema_error("1 and 2"), SemaError::Type(_)));
+        assert!(matches!(sema_error("not 1"), SemaError::Type(_)));
+    }
+
+    #[test]
+    fn bool_function_signature() {
+        assert_eq!(
+            root_type(indoc! {"
+                fu(a: bool, b: bool): bool is a and b or a xor b
+                fu(true, false)
+            "}),
+            PinpType::Bool
+        );
     }
 
     // --- error cases ---------------------------------------------------------------------
@@ -449,7 +556,10 @@ mod tests {
     #[test]
     fn void_parameter_is_error() {
         // `void` is the no-return marker, not a value type, so it cannot be a parameter.
-        assert!(matches!(sema_error("f(a: void): int is 1"), SemaError::Type(_)));
+        assert!(matches!(
+            sema_error("f(a: void): int is 1"),
+            SemaError::Type(_)
+        ));
     }
 
     #[test]
