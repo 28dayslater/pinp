@@ -1,0 +1,14 @@
+#!/bin/sh
+# Reject commits that are not rustfmt-clean or that trip clippy.
+# Enable in a fresh clone with: git config core.hooksPath .githooks
+
+if ! cargo fmt --check; then
+    echo "error: not rustfmt-clean. Run 'cargo fmt', then re-stage and commit." >&2
+    exit 1
+fi
+
+# `--features llvm` lints the codegen backend too; it needs a system LLVM (see Cargo.toml).
+if ! cargo clippy --all-targets --features llvm -- -D warnings; then
+    echo "error: clippy found issues. Fix them, then re-stage and commit." >&2
+    exit 1
+fi
