@@ -78,6 +78,14 @@ impl Analyzer<'_, '_> {
     fn analyze_func(&mut self, func: &FuncDef) -> Result<(), SemaError> {
         let mut frame = FxHashMap::default();
         for p in &func.params {
+            // `void` is the no-return marker, not a value type — rejecting it here is what keeps a
+            // `Void` value from ever entering an expression.
+            if p.param_type == PinpType::Void {
+                return Err(SemaError::Type(format!(
+                    "Function argument `{}` cannot be void.",
+                    self.name(p.name)
+                )));
+            }
             frame.insert(p.name, p.param_type); // duplicate params already rejected by the parser
         }
         self.scopes.push(frame);
@@ -438,35 +446,10 @@ mod tests {
         ));
     }
 
-    // A `void` parameter is the only way to bring a `Void` value into an expression, so these
-    // exercise the otherwise-guarded `Void`-operand checks.
-
     #[test]
-    fn arithmetic_on_void_is_error() {
-        assert!(matches!(
-            sema_error("f(a: void): int is a + 1"),
-            SemaError::Type(_)
-        ));
-    }
-
-    #[test]
-    fn unary_minus_on_void_is_error() {
-        assert!(matches!(
-            sema_error("f(a: void): int is -a"),
-            SemaError::Type(_)
-        ));
-    }
-
-    #[test]
-    fn assign_void_is_error() {
-        assert!(matches!(
-            sema_error(indoc! {"
-                f(a: void): int is
-                    x = a
-                    1
-            "}),
-            SemaError::Type(_)
-        ));
+    fn void_parameter_is_error() {
+        // `void` is the no-return marker, not a value type, so it cannot be a parameter.
+        assert!(matches!(sema_error("f(a: void): int is 1"), SemaError::Type(_)));
     }
 
     #[test]
