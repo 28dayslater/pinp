@@ -55,7 +55,7 @@ impl Jit {
     /// Creates a JIT for the host machine.
     pub fn new() -> Result<Self, String> {
         Target::initialize_native(&InitializationConfig::default())
-            .map_err(|e| format!("Failed to initialize the native target: {e}."))?;
+            .map_err(|error| format!("Failed to initialize the native target: {error}."))?;
 
         let mut jit: LLVMOrcLLJITRef = std::ptr::null_mut();
         // SAFETY: a null builder asks ORC for a default LLJIT; on success it writes
@@ -97,7 +97,7 @@ impl Jit {
     /// `F` must be a function-pointer type whose signature matches the symbol's
     /// actual ABI, or calling it is undefined behaviour.
     pub unsafe fn lookup<F: Copy>(&self, name: &str) -> Result<F, String> {
-        let symbol = CString::new(name).map_err(|e| e.to_string())?;
+        let symbol = CString::new(name).map_err(|error| error.to_string())?;
         let mut address: LLVMOrcExecutorAddress = 0;
         check_error(LLVMOrcLLJITLookup(self.jit, &mut address, symbol.as_ptr()))?;
         // `address` is the symbol's runtime address; reinterpret it as `F`.
@@ -196,7 +196,7 @@ impl<'ctx, 'ast> CodeGen<'ctx, 'ast> {
 
     /// Allocates a slot in the current function's entry block (not at the live insert point), so the
     /// alloca dominates every use and is not re-run — growing the stack — inside a loop body.
-    fn alloca_at_entry(&self, ty: PinpType) -> Result<PointerValue<'ctx>, String> {
+    fn alloca_at_entry(&self, pinp_type: PinpType) -> Result<PointerValue<'ctx>, String> {
         let current = self.builder.get_insert_block().expect("an active block");
         let entry = current
             .get_parent()
@@ -209,7 +209,7 @@ impl<'ctx, 'ast> CodeGen<'ctx, 'ast> {
         }
         let slot = self
             .builder
-            .build_alloca(self.basic_type(ty), "local")
+            .build_alloca(self.basic_type(pinp_type), "local")
             .map_err(err)?;
         self.builder.position_at_end(current);
         Ok(slot)
@@ -227,8 +227,8 @@ impl<'ctx, 'ast> CodeGen<'ctx, 'ast> {
         self.context.bool_type() // i1
     }
 
-    fn basic_type(&self, ty: PinpType) -> BasicTypeEnum<'ctx> {
-        match ty {
+    fn basic_type(&self, pinp_type: PinpType) -> BasicTypeEnum<'ctx> {
+        match pinp_type {
             PinpType::Bool => self.bool_type().into(),
             PinpType::Int => self.int_type().into(),
             PinpType::Float => self.float_type().into(),
@@ -252,16 +252,19 @@ impl<'ctx, 'ast> CodeGen<'ctx, 'ast> {
     fn declare_globals(&mut self) {
         for item in &self.ast.top_level {
             if let TopLevel::Stmt(Stmt::Assign { target, rhs }) = item {
-                let sym = place_sym(*target);
-                if self.globals.contains_key(&sym) {
+                let sym_id = place_sym(*target);
+                if self.globals.contains_key(&sym_id) {
                     continue;
                 }
-                let ty = self.ast.type_of(*rhs);
-                let name = self.ast.names[sym.0 as usize];
-                let global = self.module.add_global(self.basic_type(ty), None, name);
+                let value_type = self.ast.type_of(*rhs);
+                let name = self.ast.names[sym_id.value()];
+                let global = self
+                    .module
+                    .add_global(self.basic_type(value_type), None, name);
                 global.set_linkage(Linkage::Internal);
-                global.set_initializer(&self.zero(ty));
-                self.globals.insert(sym, (global.as_pointer_value(), ty));
+                global.set_initializer(&self.zero(value_type));
+                self.globals
+                    .insert(sym_id, (global.as_pointer_value(), value_type));
             }
         }
     }
@@ -271,16 +274,17 @@ impl<'ctx, 'ast> CodeGen<'ctx, 'ast> {
     fn declare_functions(&mut self) {
         for item in &self.ast.top_level {
             let TopLevel::Func(func) = item else { continue };
-            let param_types: Vec<PinpType> = func.params.iter().map(|p| p.param_type).collect();
+            let param_types: Vec<PinpType> =
+                func.params.iter().map(|param| param.param_type).collect();
             let llvm_params: Vec<BasicMetadataTypeEnum> = param_types
                 .iter()
-                .map(|t| self.basic_type(*t).into())
+                .map(|param_type| self.basic_type(*param_type).into())
                 .collect();
             let fn_type = match func.return_type {
                 PinpType::Void => self.context.void_type().fn_type(&llvm_params, false),
-                ret => self.basic_type(ret).fn_type(&llvm_params, false),
+                value_type => self.basic_type(value_type).fn_type(&llvm_params, false),
             };
-            let name = self.ast.names[func.name.0 as usize];
+            let name = self.ast.names[func.name.value()];
             let function = self.module.add_function(name, fn_type, None);
             self.functions
                 .insert(func.name, (function, param_types, func.return_type));
@@ -373,12 +377,12 @@ impl<'ctx, 'ast> CodeGen<'ctx, 'ast> {
     /// assignment's right-hand side) — used to pick up the program's result.
     fn gen_stmt(&mut self, stmt: &Stmt) -> Result<Option<BasicValueEnum<'ctx>>, String> {
         match stmt {
-            Stmt::Expr(e) => self.gen_expr(*e),
+            Stmt::Expr(expr_id) => self.gen_expr(*expr_id),
             Stmt::Assign { target, rhs } => {
                 let value = self.expect_value(*rhs)?;
-                let (ptr, slot_type) = self.resolve_place(*target, self.ast.type_of(*rhs))?;
+                let (pointer, slot_type) = self.resolve_place(*target, self.ast.type_of(*rhs))?;
                 let stored = self.promote(value, self.ast.type_of(*rhs), slot_type);
-                self.builder.build_store(ptr, stored).map_err(err)?;
+                self.builder.build_store(pointer, stored).map_err(err)?;
                 Ok(Some(value))
             }
             Stmt::While { cond, body } => {
@@ -443,7 +447,7 @@ impl<'ctx, 'ast> CodeGen<'ctx, 'ast> {
             self.gen_stmt(stmt)?;
         }
         let result = match block.result {
-            Some(e) => self.gen_expr(e)?,
+            Some(expr_id) => self.gen_expr(expr_id)?,
             None => None,
         };
         self.pop_scope();
@@ -481,14 +485,14 @@ impl<'ctx, 'ast> CodeGen<'ctx, 'ast> {
         }
     }
 
-    fn gen_expr(&mut self, e: ExprId) -> Result<Option<BasicValueEnum<'ctx>>, String> {
-        let node = self.ast.node(e);
+    fn gen_expr(&mut self, expr_id: ExprId) -> Result<Option<BasicValueEnum<'ctx>>, String> {
+        let node = self.ast.node(expr_id);
         let value = match node {
-            Node::Int(n) => self.int_type().const_int(*n as u64, true).into(),
-            Node::Float(f) => self.float_type().const_float(*f).into(),
-            Node::Bool(b) => self.bool_type().const_int(*b as u64, false).into(),
-            Node::Var(sym) => self.load_var(*sym, false)?,
-            Node::Global(sym) => self.load_var(*sym, true)?,
+            Node::Int(int_value) => self.int_type().const_int(*int_value as u64, true).into(),
+            Node::Float(float_value) => self.float_type().const_float(*float_value).into(),
+            Node::Bool(bool_value) => self.bool_type().const_int(*bool_value as u64, false).into(),
+            Node::Var(sym_id) => self.load_var(*sym_id, false)?,
+            Node::Global(sym_id) => self.load_var(*sym_id, true)?,
             Node::Unary {
                 op: UnOp::Neg,
                 operand,
@@ -496,7 +500,7 @@ impl<'ctx, 'ast> CodeGen<'ctx, 'ast> {
                 let operand = *operand;
                 // The result type is `Int` for a bool/int operand, `Float` for a float one; promote
                 // the operand up to it (a `Bool` operand widens to `Int`) before negating.
-                let result_type = self.ast.type_of(e);
+                let result_type = self.ast.type_of(expr_id);
                 let value = self.expect_value(operand)?;
                 let value = self.promote(value, self.ast.type_of(operand), result_type);
                 if result_type == PinpType::Int {
@@ -518,9 +522,9 @@ impl<'ctx, 'ast> CodeGen<'ctx, 'ast> {
                 let value = self.expect_value(*operand)?.into_int_value(); // i1
                 self.builder.build_not(value, "not").map_err(err)?.into()
             }
-            Node::Bin { op, lhs, rhs } => self.gen_bin(e, *op, *lhs, *rhs)?,
+            Node::Bin { op, lhs, rhs } => self.gen_bin(expr_id, *op, *lhs, *rhs)?,
             Node::Call { callee, args } => return self.gen_call(*callee, args),
-            Node::If { .. } => return self.gen_if(e),
+            Node::If { .. } => return self.gen_if(expr_id),
         };
         Ok(Some(value))
     }
@@ -529,9 +533,9 @@ impl<'ctx, 'ast> CodeGen<'ctx, 'ast> {
     // of diamonds joined at a merge block. When the node has a value (an `else` is present and every
     // branch yields one), a `phi` in the merge selects the taken branch's value; otherwise the `if`
     // runs purely for effect and yields nothing.
-    fn gen_if(&mut self, e: ExprId) -> Result<Option<BasicValueEnum<'ctx>>, String> {
-        let result_type = self.ast.type_of(e);
-        let Node::If { arms, els } = self.ast.node(e) else {
+    fn gen_if(&mut self, expr_id: ExprId) -> Result<Option<BasicValueEnum<'ctx>>, String> {
+        let result_type = self.ast.type_of(expr_id);
+        let Node::If { arms, else_block } = self.ast.node(expr_id) else {
             unreachable!("gen_if on a non-If node")
         };
         let function = self.current_function();
@@ -561,9 +565,9 @@ impl<'ctx, 'ast> CodeGen<'ctx, 'ast> {
 
         // The trailing `else` (if any) occupies the final fall-through block; a missing `else`
         // leaves it empty and the node is `Void`.
-        if let Some(els) = els {
-            let value = self.gen_block(els)?;
-            self.record_branch(els, value, result_type, &mut incomings)?;
+        if let Some(else_block) = else_block {
+            let value = self.gen_block(else_block)?;
+            self.record_branch(else_block, value, result_type, &mut incomings)?;
         }
         self.builder
             .build_unconditional_branch(merge_bb)
@@ -605,18 +609,18 @@ impl<'ctx, 'ast> CodeGen<'ctx, 'ast> {
         Ok(())
     }
 
-    fn load_var(&self, sym: SymId, global: bool) -> Result<BasicValueEnum<'ctx>, String> {
+    fn load_var(&self, sym_id: SymId, global: bool) -> Result<BasicValueEnum<'ctx>, String> {
         // `::name` always reads a global; a bare name reads the nearest enclosing local, falling
         // back to a global only at the top level (where top-level vars are module globals).
-        let (ptr, ty) = if global {
-            self.globals[&sym]
-        } else if let Some(slot) = self.find_local(sym) {
+        let (pointer, value_type) = if global {
+            self.globals[&sym_id]
+        } else if let Some(slot) = self.find_local(sym_id) {
             slot
         } else {
-            self.globals[&sym]
+            self.globals[&sym_id]
         };
         self.builder
-            .build_load(self.basic_type(ty), ptr, "load")
+            .build_load(self.basic_type(value_type), pointer, "load")
             .map_err(err)
     }
 
@@ -626,15 +630,15 @@ impl<'ctx, 'ast> CodeGen<'ctx, 'ast> {
         args: &'ast [ExprId],
     ) -> Result<Option<BasicValueEnum<'ctx>>, String> {
         let (function, param_types, return_type) = self.functions[&callee].clone();
-        let mut argv: Vec<BasicMetadataValueEnum> = Vec::with_capacity(args.len());
+        let mut arg_values: Vec<BasicMetadataValueEnum> = Vec::with_capacity(args.len());
         for (arg, param_type) in args.iter().zip(&param_types) {
             let value = self.expect_value(*arg)?;
             let value = self.promote(value, self.ast.type_of(*arg), *param_type);
-            argv.push(value.into());
+            arg_values.push(value.into());
         }
         let call = self
             .builder
-            .build_call(function, &argv, "call")
+            .build_call(function, &arg_values, "call")
             .map_err(err)?;
         Ok(match return_type {
             PinpType::Void => None,
@@ -644,66 +648,66 @@ impl<'ctx, 'ast> CodeGen<'ctx, 'ast> {
 
     fn gen_bin(
         &mut self,
-        e: ExprId,
+        expr_id: ExprId,
         op: BinOp,
         lhs: ExprId,
         rhs: ExprId,
     ) -> Result<BasicValueEnum<'ctx>, String> {
-        let result_type = self.ast.type_of(e);
+        let result_type = self.ast.type_of(expr_id);
         let value = match op {
             BinOp::Add | BinOp::Sub | BinOp::Mul if result_type == PinpType::Float => {
-                let l = self.as_float(lhs)?;
-                let r = self.as_float(rhs)?;
+                let left = self.as_float(lhs)?;
+                let right = self.as_float(rhs)?;
                 match op {
-                    BinOp::Add => self.builder.build_float_add(l, r, "fadd"),
-                    BinOp::Sub => self.builder.build_float_sub(l, r, "fsub"),
-                    _ => self.builder.build_float_mul(l, r, "fmul"),
+                    BinOp::Add => self.builder.build_float_add(left, right, "fadd"),
+                    BinOp::Sub => self.builder.build_float_sub(left, right, "fsub"),
+                    _ => self.builder.build_float_mul(left, right, "fmul"),
                 }
                 .map_err(err)?
                 .into()
             }
             BinOp::Add | BinOp::Sub | BinOp::Mul => {
-                let l = self.as_int(lhs)?;
-                let r = self.as_int(rhs)?;
+                let left = self.as_int(lhs)?;
+                let right = self.as_int(rhs)?;
                 match op {
-                    BinOp::Add => self.builder.build_int_add(l, r, "add"),
-                    BinOp::Sub => self.builder.build_int_sub(l, r, "sub"),
-                    _ => self.builder.build_int_mul(l, r, "mul"),
+                    BinOp::Add => self.builder.build_int_add(left, right, "add"),
+                    BinOp::Sub => self.builder.build_int_sub(left, right, "sub"),
+                    _ => self.builder.build_int_mul(left, right, "mul"),
                 }
                 .map_err(err)?
                 .into()
             }
             BinOp::Div => {
-                let l = self.as_float(lhs)?;
-                let r = self.as_float(rhs)?;
+                let left = self.as_float(lhs)?;
+                let right = self.as_float(rhs)?;
                 self.builder
-                    .build_float_div(l, r, "fdiv")
+                    .build_float_div(left, right, "fdiv")
                     .map_err(err)?
                     .into()
             }
             BinOp::IntDiv => {
-                let l = self.as_int(lhs)?;
-                let r = self.as_int(rhs)?;
+                let left = self.as_int(lhs)?;
+                let right = self.as_int(rhs)?;
                 self.builder
-                    .build_int_signed_div(l, r, "sdiv")
+                    .build_int_signed_div(left, right, "sdiv")
                     .map_err(err)?
                     .into()
             }
             BinOp::Mod => {
-                let l = self.as_int(lhs)?;
-                let r = self.as_int(rhs)?;
+                let left = self.as_int(lhs)?;
+                let right = self.as_int(rhs)?;
                 self.builder
-                    .build_int_signed_rem(l, r, "srem")
+                    .build_int_signed_rem(left, right, "srem")
                     .map_err(err)?
                     .into()
             }
             BinOp::Pow => {
-                let l = self.as_float(lhs)?;
-                let r = self.as_float(rhs)?;
+                let left = self.as_float(lhs)?;
+                let right = self.as_float(rhs)?;
                 let pow = self.pow_intrinsic();
                 let call = self
                     .builder
-                    .build_call(pow, &[l.into(), r.into()], "pow")
+                    .build_call(pow, &[left.into(), right.into()], "pow")
                     .map_err(err)?;
                 let result = basic_value(call.try_as_basic_value()).into_float_value();
                 if result_type == PinpType::Int {
@@ -720,9 +724,12 @@ impl<'ctx, 'ast> CodeGen<'ctx, 'ast> {
             }
             // `xor` is eager — both operands always decide the result.
             BinOp::Xor => {
-                let l = self.expect_value(lhs)?.into_int_value(); // i1
-                let r = self.expect_value(rhs)?.into_int_value();
-                self.builder.build_xor(l, r, "xor").map_err(err)?.into()
+                let left = self.expect_value(lhs)?.into_int_value(); // i1
+                let right = self.expect_value(rhs)?.into_int_value();
+                self.builder
+                    .build_xor(left, right, "xor")
+                    .map_err(err)?
+                    .into()
             }
             BinOp::And | BinOp::Or => self.gen_short_circuit(op, lhs, rhs)?,
         };
@@ -738,36 +745,36 @@ impl<'ctx, 'ast> CodeGen<'ctx, 'ast> {
         lhs: ExprId,
         rhs: ExprId,
     ) -> Result<BasicValueEnum<'ctx>, String> {
-        use inkwell::{FloatPredicate as F, IntPredicate as I};
+        use inkwell::{FloatPredicate as FloatPred, IntPredicate as IntPred};
         let float =
             self.ast.type_of(lhs) == PinpType::Float || self.ast.type_of(rhs) == PinpType::Float;
         let value = if float {
-            let l = self.as_float(lhs)?;
-            let r = self.as_float(rhs)?;
+            let left = self.as_float(lhs)?;
+            let right = self.as_float(rhs)?;
             let pred = match op {
-                BinOp::Eq => F::OEQ,
-                BinOp::Ne => F::ONE,
-                BinOp::Lt => F::OLT,
-                BinOp::Gt => F::OGT,
-                BinOp::Le => F::OLE,
-                _ => F::OGE,
+                BinOp::Eq => FloatPred::OEQ,
+                BinOp::Ne => FloatPred::ONE,
+                BinOp::Lt => FloatPred::OLT,
+                BinOp::Gt => FloatPred::OGT,
+                BinOp::Le => FloatPred::OLE,
+                _ => FloatPred::OGE,
             };
             self.builder
-                .build_float_compare(pred, l, r, "fcmp")
+                .build_float_compare(pred, left, right, "fcmp")
                 .map_err(err)?
         } else {
-            let l = self.as_int(lhs)?;
-            let r = self.as_int(rhs)?;
+            let left = self.as_int(lhs)?;
+            let right = self.as_int(rhs)?;
             let pred = match op {
-                BinOp::Eq => I::EQ,
-                BinOp::Ne => I::NE,
-                BinOp::Lt => I::SLT,
-                BinOp::Gt => I::SGT,
-                BinOp::Le => I::SLE,
-                _ => I::SGE,
+                BinOp::Eq => IntPred::EQ,
+                BinOp::Ne => IntPred::NE,
+                BinOp::Lt => IntPred::SLT,
+                BinOp::Gt => IntPred::SGT,
+                BinOp::Le => IntPred::SLE,
+                _ => IntPred::SGE,
             };
             self.builder
-                .build_int_compare(pred, l, r, "icmp")
+                .build_int_compare(pred, left, right, "icmp")
                 .map_err(err)?
         };
         Ok(value.into())
@@ -830,16 +837,16 @@ impl<'ctx, 'ast> CodeGen<'ctx, 'ast> {
         self.module.add_function("llvm.pow.f64", fn_type, None)
     }
 
-    /// Evaluates `e`, requiring it to produce a value (errors on a void expression).
-    fn expect_value(&mut self, e: ExprId) -> Result<BasicValueEnum<'ctx>, String> {
-        self.gen_expr(e)?
+    /// Evaluates `expr_id`, requiring it to produce a value (errors on a void expression).
+    fn expect_value(&mut self, expr_id: ExprId) -> Result<BasicValueEnum<'ctx>, String> {
+        self.gen_expr(expr_id)?
             .ok_or_else(|| "Expected a value but the expression is void.".to_string())
     }
 
-    /// Evaluates `e` as an `i64`, widening a `Bool` (`i1`) operand with a zero-extend.
-    fn as_int(&mut self, e: ExprId) -> Result<inkwell::values::IntValue<'ctx>, String> {
-        let value = self.expect_value(e)?.into_int_value();
-        if self.ast.type_of(e) == PinpType::Bool {
+    /// Evaluates `expr_id` as an `i64`, widening a `Bool` (`i1`) operand with a zero-extend.
+    fn as_int(&mut self, expr_id: ExprId) -> Result<inkwell::values::IntValue<'ctx>, String> {
+        let value = self.expect_value(expr_id)?.into_int_value();
+        if self.ast.type_of(expr_id) == PinpType::Bool {
             self.builder
                 .build_int_z_extend(value, self.int_type(), "bwiden")
                 .map_err(err)
@@ -848,10 +855,10 @@ impl<'ctx, 'ast> CodeGen<'ctx, 'ast> {
         }
     }
 
-    /// Evaluates `e` as a float, inserting a widening conversion (`Bool`/`Int -> Float`) if needed.
-    fn as_float(&mut self, e: ExprId) -> Result<inkwell::values::FloatValue<'ctx>, String> {
-        let value = self.expect_value(e)?;
-        match self.ast.type_of(e) {
+    /// Evaluates `expr_id` as a float, inserting a widening conversion (`Bool`/`Int -> Float`) if needed.
+    fn as_float(&mut self, expr_id: ExprId) -> Result<inkwell::values::FloatValue<'ctx>, String> {
+        let value = self.expect_value(expr_id)?;
+        match self.ast.type_of(expr_id) {
             PinpType::Int => self
                 .builder
                 .build_signed_int_to_float(value.into_int_value(), self.float_type(), "promote")
@@ -891,8 +898,8 @@ impl<'ctx, 'ast> CodeGen<'ctx, 'ast> {
         }
     }
 
-    fn zero(&self, ty: PinpType) -> BasicValueEnum<'ctx> {
-        match ty {
+    fn zero(&self, pinp_type: PinpType) -> BasicValueEnum<'ctx> {
+        match pinp_type {
             PinpType::Bool => self.bool_type().const_zero().into(),
             PinpType::Int => self.int_type().const_zero().into(),
             PinpType::Float => self.float_type().const_zero().into(),
@@ -907,7 +914,7 @@ impl<'ctx, 'ast> CodeGen<'ctx, 'ast> {
 
 fn place_sym(place: Place) -> SymId {
     match place {
-        Place::Local(s) | Place::Global(s) => s,
+        Place::Local(sym_id) | Place::Global(sym_id) => sym_id,
     }
 }
 
@@ -947,8 +954,8 @@ pub struct PinpJit {
 impl PinpJit {
     /// Parses, type-checks, and JIT-compiles `src`, ready to [`run`](Self::run).
     pub fn new(src: &str) -> Result<Self, String> {
-        let mut ast = parse(src).map_err(|e| format!("{e:?}"))?;
-        analyze(&mut ast).map_err(|e| format!("{e:?}"))?;
+        let mut ast = parse(src).map_err(|error| format!("{error:?}"))?;
+        analyze(&mut ast).map_err(|error| format!("{error:?}"))?;
         let context = Context::create();
 
         let mut codegen = CodeGen::new(&context, &ast);

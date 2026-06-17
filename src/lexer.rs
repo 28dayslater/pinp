@@ -179,31 +179,31 @@ pub struct LexError {
 pub fn lex(src: &str) -> Result<Vec<Token<'_>>, LexError> {
     let line_starts = line_starts(src);
     let locate = |offset: usize| -> (u32, u32) {
-        let line = line_starts.partition_point(|&s| s <= offset) - 1;
+        let line = line_starts.partition_point(|&start| start <= offset) - 1;
         (line as u32 + 1, (offset - line_starts[line]) as u32 + 1)
     };
 
     let mut out = Vec::new();
     let mut indents = vec![0];
     let mut paren_depth: usize = 0;
-    let mut lx = Lexeme::lexer(src);
+    let mut lexer = Lexeme::lexer(src);
 
-    while let Some(res) = lx.next() {
-        let token_text = lx.slice();
-        let (line, col) = locate(lx.span().start);
-        let lexeme = res.map_err(|_| LexError {
+    while let Some(lexeme_result) = lexer.next() {
+        let token_text = lexer.slice();
+        let (line, col) = locate(lexer.span().start);
+        let lexeme = lexeme_result.map_err(|_| LexError {
             message: format!("Unexpected character `{token_text}`."),
             line,
             col,
         })?;
 
         let kind = match lexeme {
-            Lexeme::NewlineIndent(n) => {
+            Lexeme::NewlineIndent(indent) => {
                 // Inside `( … )` a newline is implicit line-joining: emit nothing, so the
                 // indent stack only ever reacts to real block indentation.
                 if paren_depth == 0 {
                     out.push(synthetic(TokenKind::Newline, line, col));
-                    emit_indent(&mut out, &mut indents, n, line, col)?;
+                    emit_indent(&mut out, &mut indents, indent, line, col)?;
                 }
                 continue;
             }
@@ -277,9 +277,9 @@ pub fn lex(src: &str) -> Result<Vec<Token<'_>>, LexError> {
 
 fn line_starts(src: &str) -> Vec<usize> {
     let mut starts = vec![0];
-    for (i, b) in src.bytes().enumerate() {
-        if b == b'\n' {
-            starts.push(i + 1);
+    for (index, byte) in src.bytes().enumerate() {
+        if byte == b'\n' {
+            starts.push(index + 1);
         }
     }
     starts
@@ -300,20 +300,20 @@ fn synthetic(kind: TokenKind, line: u32, col: u32) -> Token<'static> {
 fn emit_indent(
     out: &mut Vec<Token<'_>>,
     indents: &mut Vec<usize>,
-    n: usize,
+    indent: usize,
     line: u32,
     col: u32,
 ) -> Result<(), LexError> {
     let top = *indents.last().unwrap();
-    if n > top {
-        indents.push(n);
+    if indent > top {
+        indents.push(indent);
         out.push(synthetic(TokenKind::Indent, line, col));
-    } else if n < top {
-        while n < *indents.last().unwrap() {
+    } else if indent < top {
+        while indent < *indents.last().unwrap() {
             indents.pop();
             out.push(synthetic(TokenKind::Dedent, line, col));
         }
-        if *indents.last().unwrap() != n {
+        if *indents.last().unwrap() != indent {
             return Err(LexError {
                 message: "Inconsistent indentation.".into(),
                 line,
@@ -330,7 +330,11 @@ mod tests {
     use indoc::indoc;
 
     fn kinds(src: &str) -> Vec<TokenKind> {
-        lex(src).unwrap().into_iter().map(|t| t.kind).collect()
+        lex(src)
+            .unwrap()
+            .into_iter()
+            .map(|token| token.kind)
+            .collect()
     }
 
     #[test]
@@ -347,8 +351,8 @@ mod tests {
         let toks = lex("a Fu _BAR _baz_baz_ _fu12_11_bar").unwrap();
         let idents: Vec<_> = toks
             .iter()
-            .filter(|t| t.kind == TokenKind::Identifier)
-            .map(|t| t.text)
+            .filter(|token| token.kind == TokenKind::Identifier)
+            .map(|token| token.text)
             .collect();
         assert_eq!(idents, ["a", "Fu", "_BAR", "_baz_baz_", "_fu12_11_bar"]);
     }
@@ -489,7 +493,7 @@ mod tests {
               bb = 22
         "};
         let toks = lex(src).unwrap();
-        let bb = toks.iter().find(|t| t.text == "bb").unwrap();
+        let bb = toks.iter().find(|token| token.text == "bb").unwrap();
         assert_eq!((bb.line, bb.col), (2, 3));
         assert_eq!((toks[0].line, toks[0].col), (1, 1));
     }

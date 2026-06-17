@@ -37,24 +37,24 @@ fn assignable(from: PinpType, to: PinpType) -> bool {
 /// The wider of two types under the `Bool -> Int -> Float` lattice — the common type an `if`'s
 /// branches join to. `None` when neither is assignable to the other (e.g. a `Void` branch), which
 /// makes the whole `if` `Void` and so usable only as a statement.
-fn join(a: PinpType, b: PinpType) -> Option<PinpType> {
-    if assignable(a, b) {
-        Some(b)
-    } else if assignable(b, a) {
-        Some(a)
+fn join(left: PinpType, right: PinpType) -> Option<PinpType> {
+    if assignable(left, right) {
+        Some(right)
+    } else if assignable(right, left) {
+        Some(left)
     } else {
         None
     }
 }
 
-/// Whether `t` participates in arithmetic/comparison, i.e. is not `Void`.
-fn numeric(t: PinpType) -> bool {
-    t != PinpType::Void
+/// Whether `pinp_type` participates in arithmetic/comparison, i.e. is not `Void`.
+fn numeric(pinp_type: PinpType) -> bool {
+    pinp_type != PinpType::Void
 }
 
-/// Whether `t` promotes to `Int` (rather than forcing a `Float` result): `Bool` or `Int`.
-fn int_like(t: PinpType) -> bool {
-    matches!(t, PinpType::Bool | PinpType::Int)
+/// Whether `pinp_type` promotes to `Int` (rather than forcing a `Float` result): `Bool` or `Int`.
+fn int_like(pinp_type: PinpType) -> bool {
+    matches!(pinp_type, PinpType::Bool | PinpType::Int)
 }
 
 #[derive(Clone)]
@@ -90,10 +90,10 @@ pub fn analyze(ast: &mut Ast) -> Result<(), SemaError> {
     Ok(())
 }
 
-struct Analyzer<'a, 'src> {
-    nodes: &'a [Node],
-    names: &'a [&'src str],
-    types: &'a mut Vec<PinpType>,
+struct Analyzer<'ast, 'src> {
+    nodes: &'ast [Node],
+    names: &'ast [&'src str],
+    types: &'ast mut Vec<PinpType>,
     scopes: Vec<FxHashMap<SymId, PinpType>>,
     // Index of the current function's base frame; bare-name resolution searches `scopes[fn_base..]`
     // and never reaches the global frame from inside a function. `0` at the top level, where the
@@ -103,22 +103,22 @@ struct Analyzer<'a, 'src> {
 }
 
 impl Analyzer<'_, '_> {
-    fn name(&self, s: SymId) -> &str {
-        self.names[s.0 as usize]
+    fn name(&self, sym_id: SymId) -> &str {
+        self.names[sym_id.value()]
     }
 
     fn analyze_func(&mut self, func: &FuncDef) -> Result<(), SemaError> {
         let mut frame = FxHashMap::default();
-        for p in &func.params {
+        for param in &func.params {
             // `void` is the no-return marker, not a value type — rejecting it here is what keeps a
             // `Void` value from ever entering an expression.
-            if p.param_type == PinpType::Void {
+            if param.param_type == PinpType::Void {
                 return Err(SemaError::Type(format!(
                     "Function argument `{}` cannot be void.",
-                    self.name(p.name)
+                    self.name(param.name)
                 )));
             }
-            frame.insert(p.name, p.param_type); // duplicate params already rejected by the parser
+            frame.insert(param.name, param.param_type); // duplicate params already rejected by the parser
         }
         let old_base = self.fn_base;
         self.scopes.push(frame);
@@ -146,7 +146,7 @@ impl Analyzer<'_, '_> {
         self.funcs.insert(
             func.name,
             Signature {
-                params: func.params.iter().map(|p| p.param_type).collect(),
+                params: func.params.iter().map(|param| param.param_type).collect(),
                 return_type: func.return_type,
             },
         );
@@ -155,8 +155,8 @@ impl Analyzer<'_, '_> {
 
     fn analyze_stmt(&mut self, stmt: &Stmt) -> Result<(), SemaError> {
         match stmt {
-            Stmt::Expr(e) => {
-                self.analyze_expr(*e)?;
+            Stmt::Expr(expr_id) => {
+                self.analyze_expr(*expr_id)?;
                 Ok(())
             }
             Stmt::Assign { target, rhs } => {
@@ -165,23 +165,23 @@ impl Analyzer<'_, '_> {
                     return Err(SemaError::Type("Cannot assign a void value.".into()));
                 }
                 match *target {
-                    Place::Global(s) => match self.scopes[0].get(&s).copied() {
+                    Place::Global(sym_id) => match self.scopes[0].get(&sym_id).copied() {
                         None => {
                             return Err(SemaError::UnknownSymbol(format!(
                                 "Unknown global `::{}`.",
-                                self.name(s)
+                                self.name(sym_id)
                             )))
                         }
                         Some(existing) => self.check_assignable(rhs_type, existing)?,
                     },
-                    Place::Local(s) => match self.lookup_assign_target(s) {
+                    Place::Local(sym_id) => match self.lookup_assign_target(sym_id) {
                         // Mutate the nearest enclosing binding if one exists (so a conditional
                         // update or a loop counter alters the outer variable)...
                         Some(existing) => self.check_assignable(rhs_type, existing)?,
                         // ...otherwise introduce a fresh local in the innermost (current body)
                         // scope, where it does not escape.
                         None => {
-                            self.scopes.last_mut().unwrap().insert(s, rhs_type);
+                            self.scopes.last_mut().unwrap().insert(sym_id, rhs_type);
                         }
                     },
                 }
@@ -209,7 +209,7 @@ impl Analyzer<'_, '_> {
             self.analyze_stmt(stmt)?;
         }
         let result_type = match block.result {
-            Some(e) => Some(self.analyze_expr(e)?),
+            Some(expr_id) => Some(self.analyze_expr(expr_id)?),
             None => None,
         };
         self.scopes.pop();
@@ -218,24 +218,24 @@ impl Analyzer<'_, '_> {
 
     /// A condition (`if`/`while`/`loop`) must be `Bool` — there is no truthiness.
     fn check_condition(&mut self, cond: ExprId) -> Result<(), SemaError> {
-        let t = self.analyze_expr(cond)?;
-        if t == PinpType::Bool {
+        let cond_type = self.analyze_expr(cond)?;
+        if cond_type == PinpType::Bool {
             Ok(())
         } else {
             Err(SemaError::Type(format!(
-                "Condition must be Bool, got {t:?}."
+                "Condition must be Bool, got {cond_type:?}."
             )))
         }
     }
 
-    /// Finds the type of the nearest enclosing binding of `s` (innermost first, down to the
-    /// function base), or `None` if `s` is bound nowhere in scope — meaning an assignment should
-    /// introduce it as a new local.
-    fn lookup_assign_target(&self, s: SymId) -> Option<PinpType> {
+    /// Finds the type of the nearest enclosing binding of `sym_id` (innermost first, down to the
+    /// function base), or `None` if `sym_id` is bound nowhere in scope — meaning an assignment
+    /// should introduce it as a new local.
+    fn lookup_assign_target(&self, sym_id: SymId) -> Option<PinpType> {
         self.scopes[self.fn_base..]
             .iter()
             .rev()
-            .find_map(|frame| frame.get(&s).copied())
+            .find_map(|frame| frame.get(&sym_id).copied())
     }
 
     fn check_assignable(&self, from: PinpType, to: PinpType) -> Result<(), SemaError> {
@@ -248,28 +248,28 @@ impl Analyzer<'_, '_> {
         }
     }
 
-    /// Infers the type of `e`, records it in the arena, and returns it.
-    fn analyze_expr(&mut self, e: ExprId) -> Result<PinpType, SemaError> {
-        let ty = match self.nodes[e.0 as usize].clone() {
+    /// Infers the type of `expr_id`, records it in the arena, and returns it.
+    fn analyze_expr(&mut self, expr_id: ExprId) -> Result<PinpType, SemaError> {
+        let inferred = match self.nodes[expr_id.value()].clone() {
             Node::Int(_) => PinpType::Int,
             Node::Float(_) => PinpType::Float,
             Node::Bool(_) => PinpType::Bool,
-            Node::Var(s) => self.lookup_local(s)?,
-            Node::Global(s) => self.lookup_global(s)?,
+            Node::Var(sym_id) => self.lookup_local(sym_id)?,
+            Node::Global(sym_id) => self.lookup_global(sym_id)?,
             Node::Unary { op, operand } => {
-                let t = self.analyze_expr(operand)?;
-                self.unary_type(op, t)?
+                let operand_type = self.analyze_expr(operand)?;
+                self.unary_type(op, operand_type)?
             }
             Node::Bin { op, lhs, rhs } => {
-                let lt = self.analyze_expr(lhs)?;
-                let rt = self.analyze_expr(rhs)?;
-                self.bin_type(op, lt, rt)?
+                let left_type = self.analyze_expr(lhs)?;
+                let right_type = self.analyze_expr(rhs)?;
+                self.bin_type(op, left_type, right_type)?
             }
             Node::Call { callee, args } => self.call_type(callee, &args)?,
-            Node::If { arms, els } => self.if_type(&arms, els.as_ref())?,
+            Node::If { arms, else_block } => self.if_type(&arms, else_block.as_ref())?,
         };
-        self.types[e.0 as usize] = ty;
-        Ok(ty)
+        self.types[expr_id.value()] = inferred;
+        Ok(inferred)
     }
 
     /// Types an `if`: each condition must be `Bool`; the node's type is the join of every branch's
@@ -278,87 +278,93 @@ impl Analyzer<'_, '_> {
     fn if_type(
         &mut self,
         arms: &[crate::parser::IfArm],
-        els: Option<&Block>,
+        else_block: Option<&Block>,
     ) -> Result<PinpType, SemaError> {
         let mut branch_types = Vec::with_capacity(arms.len());
         for arm in arms {
             self.check_condition(arm.cond)?;
             branch_types.push(self.analyze_block(&arm.body)?);
         }
-        let Some(els) = els else {
+        let Some(else_body) = else_block else {
             return Ok(PinpType::Void);
         };
-        let else_type = self.analyze_block(els)?;
+        let else_type = self.analyze_block(else_body)?;
 
         // A missing branch result, or branches that do not share a common type, leave the `if`
         // valueless (`Void`).
-        let mut acc = match else_type {
-            Some(t) => t,
+        let mut joined = match else_type {
+            Some(branch_type) => branch_type,
             None => return Ok(PinpType::Void),
         };
-        for bt in branch_types {
-            match bt.and_then(|t| join(acc, t)) {
-                Some(j) => acc = j,
+        for branch in branch_types {
+            match branch.and_then(|branch_type| join(joined, branch_type)) {
+                Some(wider) => joined = wider,
                 None => return Ok(PinpType::Void),
             }
         }
-        Ok(acc)
+        Ok(joined)
     }
 
-    fn lookup_local(&self, s: SymId) -> Result<PinpType, SemaError> {
+    fn lookup_local(&self, sym_id: SymId) -> Result<PinpType, SemaError> {
         // Reading and assigning resolve a bare name the same way — outward to the function base —
         // so both share `lookup_assign_target`.
-        self.lookup_assign_target(s)
-            .ok_or_else(|| SemaError::UnknownSymbol(format!("Unknown symbol `{}`.", self.name(s))))
-    }
-
-    fn lookup_global(&self, s: SymId) -> Result<PinpType, SemaError> {
-        self.scopes[0].get(&s).copied().ok_or_else(|| {
-            SemaError::UnknownSymbol(format!("Unknown global `::{}`.", self.name(s)))
+        self.lookup_assign_target(sym_id).ok_or_else(|| {
+            SemaError::UnknownSymbol(format!("Unknown symbol `{}`.", self.name(sym_id)))
         })
     }
 
-    fn unary_type(&self, op: UnOp, t: PinpType) -> Result<PinpType, SemaError> {
+    fn lookup_global(&self, sym_id: SymId) -> Result<PinpType, SemaError> {
+        self.scopes[0].get(&sym_id).copied().ok_or_else(|| {
+            SemaError::UnknownSymbol(format!("Unknown global `::{}`.", self.name(sym_id)))
+        })
+    }
+
+    fn unary_type(&self, op: UnOp, operand_type: PinpType) -> Result<PinpType, SemaError> {
         match op {
             // Arithmetic negation: `Bool` promotes to `Int` (like any arithmetic use of a bool).
-            UnOp::Neg => match t {
+            UnOp::Neg => match operand_type {
                 PinpType::Void => Err(SemaError::Type("Unary minus on a void value.".into())),
                 PinpType::Bool => Ok(PinpType::Int),
                 other => Ok(other),
             },
             UnOp::Not => {
-                if t == PinpType::Bool {
+                if operand_type == PinpType::Bool {
                     Ok(PinpType::Bool)
                 } else {
                     Err(SemaError::Type(format!(
-                        "`not` requires a Bool operand, got {t:?}."
+                        "`not` requires a Bool operand, got {operand_type:?}."
                     )))
                 }
             }
         }
     }
 
-    fn bin_type(&self, op: BinOp, lt: PinpType, rt: PinpType) -> Result<PinpType, SemaError> {
+    fn bin_type(
+        &self,
+        op: BinOp,
+        left_type: PinpType,
+        right_type: PinpType,
+    ) -> Result<PinpType, SemaError> {
         use BinOp::*;
         use PinpType::*;
         // Logicals take and yield Bool only — no truthiness.
         if matches!(op, And | Or | Xor) {
-            return if lt == Bool && rt == Bool {
+            return if left_type == Bool && right_type == Bool {
                 Ok(Bool)
             } else {
                 Err(SemaError::Type(format!(
-                    "`{op:?}` requires Bool operands, got {lt:?} and {rt:?}."
+                    "`{op:?}` requires Bool operands, got {left_type:?} and {right_type:?}."
                 )))
             };
         }
         // Arithmetic and comparison both require numeric (non-void) operands.
-        if !numeric(lt) || !numeric(rt) {
+        if !numeric(left_type) || !numeric(right_type) {
             return Err(SemaError::Type("Operation on a void value.".into()));
         }
         Ok(match op {
             Eq | Ne | Lt | Gt | Le | Ge => Bool,
             Add | Sub | Mul | Pow => {
-                if int_like(lt) && int_like(rt) {
+                if int_like(left_type) && int_like(right_type) {
                     Int
                 } else {
                     Float
@@ -366,7 +372,7 @@ impl Analyzer<'_, '_> {
             }
             Div => Float,
             IntDiv | Mod => {
-                if int_like(lt) && int_like(rt) {
+                if int_like(left_type) && int_like(right_type) {
                     Int
                 } else {
                     return Err(SemaError::Type(format!("{op:?} requires Int operands.")));
@@ -377,31 +383,31 @@ impl Analyzer<'_, '_> {
     }
 
     fn call_type(&mut self, callee: SymId, args: &[ExprId]) -> Result<PinpType, SemaError> {
-        let sig = self.funcs.get(&callee).cloned().ok_or_else(|| {
+        let signature = self.funcs.get(&callee).cloned().ok_or_else(|| {
             SemaError::UnknownSymbol(format!(
                 "Call to undefined function `{}`.",
                 self.name(callee)
             ))
         })?;
-        if args.len() != sig.params.len() {
+        if args.len() != signature.params.len() {
             return Err(SemaError::Type(format!(
                 "Function `{}` expects {} argument(s), got {}.",
                 self.name(callee),
-                sig.params.len(),
+                signature.params.len(),
                 args.len()
             )));
         }
-        for (i, (&arg, &pt)) in args.iter().zip(sig.params.iter()).enumerate() {
-            let at = self.analyze_expr(arg)?;
-            if !assignable(at, pt) {
+        for (index, (&arg, &param_type)) in args.iter().zip(signature.params.iter()).enumerate() {
+            let arg_type = self.analyze_expr(arg)?;
+            if !assignable(arg_type, param_type) {
                 return Err(SemaError::Type(format!(
-                    "Argument {} of `{}`: {at:?} not assignable to {pt:?}.",
-                    i + 1,
+                    "Argument {} of `{}`: {arg_type:?} not assignable to {param_type:?}.",
+                    index + 1,
                     self.name(callee)
                 )));
             }
         }
-        Ok(sig.return_type)
+        Ok(signature.return_type)
     }
 }
 
@@ -428,7 +434,7 @@ mod tests {
     fn root_type(src: &str) -> PinpType {
         let ast = analyzed(src);
         match ast.top_level.last().unwrap() {
-            TopLevel::Stmt(Stmt::Expr(e)) => ast.type_of(*e),
+            TopLevel::Stmt(Stmt::Expr(expr_id)) => ast.type_of(*expr_id),
             TopLevel::Stmt(Stmt::Assign { rhs, .. }) => ast.type_of(*rhs),
             other => panic!("program does not end in an expression: {other:?}"),
         }
@@ -455,11 +461,14 @@ mod tests {
     #[test]
     fn assignment_then_reference() {
         let ast = analyzed("a = 2 + 3\na * a");
-        let TopLevel::Stmt(Stmt::Expr(e)) = ast.top_level.last().unwrap() else {
+        let TopLevel::Stmt(Stmt::Expr(expr_id)) = ast.top_level.last().unwrap() else {
             panic!("expected an expression statement");
         };
-        assert!(matches!(ast.node(*e), Node::Bin { op: BinOp::Mul, .. }));
-        assert_eq!(ast.type_of(*e), PinpType::Int);
+        assert!(matches!(
+            ast.node(*expr_id),
+            Node::Bin { op: BinOp::Mul, .. }
+        ));
+        assert_eq!(ast.type_of(*expr_id), PinpType::Int);
     }
 
     #[test]

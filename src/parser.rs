@@ -13,7 +13,7 @@
 //! - **AST arena** — nodes live in `Ast::nodes: Vec<Node>` and reference each other by
 //!   [`ExprId`] (an index), so there is no `Box`/`Rc`. The inferred [`PinpType`] of each node
 //!   sits in the parallel `Ast::types` vec at the same index.
-//! - **Interner** — identifiers map to [`SymId`] via `Ast::syms`, backed by `&'src str`
+//! - **Interner** — identifiers map to [`SymId`] via `Ast::symbols`, backed by `&'src str`
 //!   slices borrowed straight from the source (no string copies).
 //!
 //! Parsing is **purely syntactic**: it builds the structural AST and reports only lexical/layout
@@ -40,10 +40,24 @@ pub enum PinpType {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct SymId(pub u32);
 
+impl SymId {
+    /// This id's underlying value — its index into [`Ast::names`].
+    pub fn value(self) -> usize {
+        self.0 as usize
+    }
+}
+
 /// An index into the [`Ast::nodes`] arena. The node's inferred [`PinpType`] sits at the same
 /// index in the parallel [`Ast::types`] vec.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct ExprId(pub u32);
+
+impl ExprId {
+    /// This id's underlying value — its index into the parallel [`Ast::nodes`]/[`Ast::types`] arenas.
+    pub fn value(self) -> usize {
+        self.0 as usize
+    }
+}
 
 /// A binary operator. `IntDiv` and `Mod` are the `div`/`mod` keyword operators (integer-only);
 /// `Pow` is `^` (right-associative). `Div` (`/`) always yields `Float`. The comparisons
@@ -98,11 +112,11 @@ pub enum Node {
         args: Vec<ExprId>,
     },
     /// `if`/`elif`/`else` — one node for both the block form and the one-line ternary (which is a
-    /// single arm plus a mandatory `els`). Each arm's value is its body's trailing expression; the
-    /// node yields a value only when `els` is present and every branch ends in one (see sema).
+    /// single arm plus a mandatory `else_block`). Each arm's value is its body's trailing expression; the
+    /// node yields a value only when `else_block` is present and every branch ends in one (see sema).
     If {
         arms: Vec<IfArm>,
-        els: Option<Block>,
+        else_block: Option<Block>,
     },
 }
 
@@ -189,6 +203,12 @@ pub enum ParseError {
     Unexpected(String),
     /// An indentation or parameter-alignment error.
     Layout(String),
+    /// Parse nesting (parens, ternaries, or block bodies) ran past [`MAX_NESTING_DEPTH`] — refused
+    /// as runaway input before it could overflow the stack, rather than reported as a bad token.
+    TooDeeplyNested(String),
+    /// A single `if` carried more arms than [`MAX_IF_ARMS`] — a deliberate sanity cap on an
+    /// otherwise-unbounded (but stack-safe) `elif` ladder.
+    TooManyArms(String),
 }
 
 /// A parsed program. Borrows the source for the lifetime `'src` (identifiers are slices into it).
@@ -202,55 +222,56 @@ pub struct Ast<'src> {
     pub types: Vec<PinpType>,
     pub top_level: Vec<TopLevel>,
     pub names: Vec<&'src str>,
-    syms: FxHashMap<&'src str, SymId>,
+    symbols: FxHashMap<&'src str, SymId>,
 }
 
 impl<'src> Ast<'src> {
-    /// Borrows the node at `e`.
-    pub fn node(&self, e: ExprId) -> &Node {
-        &self.nodes[e.0 as usize]
+    /// Borrows the node at `expr_id`.
+    pub fn node(&self, expr_id: ExprId) -> &Node {
+        &self.nodes[expr_id.value()]
     }
 
-    /// The type of the node at `e` — valid only after [`crate::sema::analyze`] has run.
-    pub fn type_of(&self, e: ExprId) -> PinpType {
-        self.types[e.0 as usize]
+    /// The type of the node at `expr_id` — valid only after [`crate::sema::analyze`] has run.
+    pub fn type_of(&self, expr_id: ExprId) -> PinpType {
+        self.types[expr_id.value()]
     }
 
     /// Pushes a node, returning its id. The type is left as a placeholder for sema to fill.
     fn push(&mut self, node: Node) -> ExprId {
-        let id = ExprId(self.nodes.len() as u32);
+        let expr_id = ExprId(self.nodes.len() as u32);
         self.nodes.push(node);
         self.types.push(PinpType::Void);
-        id
+        expr_id
     }
 
     fn intern(&mut self, name: &'src str) -> SymId {
-        if let Some(&id) = self.syms.get(name) {
-            return id;
+        if let Some(&sym_id) = self.symbols.get(name) {
+            return sym_id;
         }
-        let id = SymId(self.names.len() as u32);
+        let sym_id = SymId(self.names.len() as u32);
         self.names.push(name);
-        self.syms.insert(name, id);
-        id
+        self.symbols.insert(name, sym_id);
+        sym_id
     }
 }
 
 /// Lexes and parses `src` into a structural [`Ast`] (its `types` left for [`crate::sema::analyze`]
 /// to fill). The returned AST borrows `src`. Stops at and returns the first [`ParseError`].
 pub fn parse(src: &str) -> Result<Ast<'_>, ParseError> {
-    let toks = lex(src).map_err(|e| ParseError::Lex(e.message))?;
-    let mut p = Parser {
-        toks,
+    let tokens = lex(src).map_err(|error| ParseError::Lex(error.message))?;
+    let mut parser = Parser {
+        tokens,
         pos: 0,
         ast: Ast::default(),
         pending_dedents: 0,
+        depth: 0,
     };
-    p.parse_program()?;
-    Ok(p.ast)
+    parser.parse_program()?;
+    Ok(parser.ast)
 }
 
 struct Parser<'src> {
-    toks: Vec<Token<'src>>,
+    tokens: Vec<Token<'src>>,
     pos: usize,
     ast: Ast<'src>,
     // A wrapped one-line conditional (`… if c` then `else …` on the next line, aligned to the
@@ -260,6 +281,9 @@ struct Parser<'src> {
     // At the top level there is no enclosing `parse_block`; the stray `Dedent` is harmlessly
     // absorbed by `skip_separators` and this counter is reset each `parse_program` iteration.
     pending_dedents: usize,
+    // Current nesting depth across the two recursion hubs `parse_expr` and `parse_block`, bounded by
+    // `MAX_NESTING_DEPTH` so adversarially nested input fails fast instead of overflowing the stack.
+    depth: usize,
 }
 
 // Binding-power "table". See articles on Pratt parsing.
@@ -308,6 +332,17 @@ const COMPARISON_BP: u8 = 45;
 // `a if p else (b if q else c)`. Handled apart from `infix`, like the comparison chain.
 const CONDITIONAL_BP: u8 = 10;
 
+// Maximum parse-nesting depth (parenthesised expressions, ternaries, and `if`/`while`/`loop`
+// bodies). Real programs nest a few dozen levels at most; the limit exists only so adversarial
+// input — thousands of nested `(` — fails fast with an error rather than overflowing the stack.
+// Clang's analogous `-fbracket-depth` defaults to the same value.
+const MAX_NESTING_DEPTH: usize = 256;
+
+// Maximum number of arms (the leading `if` plus its `elif`s) in one `if` construct. Unlike nesting,
+// an `elif` ladder is parsed iteratively, so it is *not* a stack risk — this is a deliberate sanity
+// cap: a construct this wide is far likelier a generation bug than intent.
+const MAX_IF_ARMS: usize = 256;
+
 // Right binding power of the prefix operators `-` and `not`: above `*`/`/` (70), below `^` (80),
 // so `-a*b` is `(-a)*b` and `-a^b` is `-(a^b)`. `not` shares this level to match C's unary-tight
 // `!`, so `not a == b` is `(not a) == b`.
@@ -318,22 +353,22 @@ const UNARY_MINUS_BP: u8 = 75;
 // `!=` is non-transitive (`a != b != c` is not "all distinct"), so it has no direction and never
 // chains.
 #[derive(PartialEq)]
-enum ChainDir {
+enum ChainDirection {
     Ascending,  // < <=
     Descending, // > >=
     Equality,   // ==
 }
 
-fn chain_dir(op: BinOp) -> Option<ChainDir> {
+fn chain_direction(op: BinOp) -> Option<ChainDirection> {
     Some(match op {
-        BinOp::Lt | BinOp::Le => ChainDir::Ascending,
-        BinOp::Gt | BinOp::Ge => ChainDir::Descending,
-        BinOp::Eq => ChainDir::Equality,
+        BinOp::Lt | BinOp::Le => ChainDirection::Ascending,
+        BinOp::Gt | BinOp::Ge => ChainDirection::Descending,
+        BinOp::Eq => ChainDirection::Equality,
         _ => return None,
     })
 }
 
-fn cmp_symbol(op: BinOp) -> &'static str {
+fn comparison_symbol(op: BinOp) -> &'static str {
     match op {
         BinOp::Eq => "==",
         BinOp::Ne => "!=",
@@ -370,25 +405,38 @@ fn assign_op(kind: TokenKind) -> Option<AssignKind> {
 impl From<Place> for Node {
     fn from(place: Place) -> Node {
         match place {
-            Place::Local(s) => Node::Var(s),
-            Place::Global(s) => Node::Global(s),
+            Place::Local(sym_id) => Node::Var(sym_id),
+            Place::Global(sym_id) => Node::Global(sym_id),
         }
     }
 }
 
 impl<'src> Parser<'src> {
     fn peek(&self) -> &Token<'src> {
-        &self.toks[self.pos]
+        &self.tokens[self.pos]
     }
 
     fn at(&self, offset: usize) -> TokenKind {
-        self.toks[self.pos + offset].kind
+        self.tokens[self.pos + offset].kind
     }
 
     fn advance(&mut self) -> Token<'src> {
-        let t = self.toks[self.pos].clone();
+        let token = self.tokens[self.pos].clone();
         self.pos += 1;
-        t
+        token
+    }
+
+    // Enter one level of recursion (`parse_expr`/`parse_block`), failing fast past the depth limit.
+    // The matching `self.depth -= 1` runs on the success path; an error aborts the whole parse, so a
+    // leaked count is harmless.
+    fn enter_nesting(&mut self) -> Result<(), ParseError> {
+        self.depth += 1;
+        if self.depth > MAX_NESTING_DEPTH {
+            return Err(ParseError::TooDeeplyNested(format!(
+                "Nesting is implausibly deep (over {MAX_NESTING_DEPTH} levels); the input looks unbounded."
+            )));
+        }
+        Ok(())
     }
 
     fn expect(&mut self, kind: TokenKind) -> Result<Token<'src>, ParseError> {
@@ -414,6 +462,7 @@ impl<'src> Parser<'src> {
     fn parse_program(&mut self) -> Result<(), ParseError> {
         loop {
             self.pending_dedents = 0;
+            self.depth = 0;
             self.skip_separators();
             if self.peek().kind == TokenKind::Eof {
                 return Ok(());
@@ -429,7 +478,7 @@ impl<'src> Parser<'src> {
                 // `skip_separators` on the next iteration. (`parse_block` applies the same
                 // end-of-statement rule for nested blocks; keep the two in sync.)
                 let ended_at_layout = matches!(
-                    self.toks[self.pos - 1].kind,
+                    self.tokens[self.pos - 1].kind,
                     TokenKind::Newline | TokenKind::Dedent | TokenKind::Indent
                 );
                 match self.peek().kind {
@@ -452,43 +501,43 @@ impl<'src> Parser<'src> {
             return false;
         }
         let close = match self.matching_paren(self.pos + 1) {
-            Some(i) => i,
+            Some(index) => index,
             None => return false,
         };
-        let mut j = close + 1;
-        if self.toks.get(j).map(|t| t.kind) == Some(TokenKind::Colon) {
-            j += 2; // ": type"
+        let mut cursor = close + 1;
+        if self.tokens.get(cursor).map(|token| token.kind) == Some(TokenKind::Colon) {
+            cursor += 2; // ": type"
         }
-        self.toks.get(j).map(|t| t.kind) == Some(TokenKind::KwIs)
+        self.tokens.get(cursor).map(|token| token.kind) == Some(TokenKind::KwIs)
     }
 
     // Index of the `)` that closes the `(` at `lparen`, found by counting nesting depth.
-    // A non-consuming lookahead (it indexes `toks` directly, never advances `pos`).
+    // A non-consuming lookahead (it indexes `tokens` directly, never advances `pos`).
     // Used by `looks_like_func_def` to skip past the parameter list and peek at what follows.
     // Returns `None` if the parens are unbalanced or `Eof` is hit first.
     fn matching_paren(&self, lparen: usize) -> Option<usize> {
         let mut depth = 0usize;
-        let mut i = lparen;
-        while i < self.toks.len() {
-            match self.toks[i].kind {
+        let mut index = lparen;
+        while index < self.tokens.len() {
+            match self.tokens[index].kind {
                 TokenKind::LParen => depth += 1,
                 TokenKind::RParen => {
                     depth -= 1;
                     if depth == 0 {
-                        return Some(i);
+                        return Some(index);
                     }
                 }
                 TokenKind::Eof => return None,
                 _ => {}
             }
-            i += 1;
+            index += 1;
         }
         None
     }
 
     fn parse_func_def(&mut self) -> Result<(), ParseError> {
-        let name_tok = self.advance(); // Identifier
-        let name = self.ast.intern(name_tok.text);
+        let name_token = self.advance(); // Identifier
+        let name = self.ast.intern(name_token.text);
         self.expect(TokenKind::LParen)?;
         let params = self.parse_params()?;
         self.expect(TokenKind::RParen)?;
@@ -504,11 +553,11 @@ impl<'src> Parser<'src> {
 
         // Reject duplicate parameter names — a structural check (no types needed).
         let mut seen = FxHashSet::default();
-        for p in &params {
-            if !seen.insert(p.name) {
+        for param in &params {
+            if !seen.insert(param.name) {
                 return Err(ParseError::Unexpected(format!(
                     "Duplicate parameter `{}`.",
-                    self.ast.names[p.name.0 as usize]
+                    self.ast.names[param.name.value()]
                 )));
             }
         }
@@ -532,8 +581,8 @@ impl<'src> Parser<'src> {
         let first = self.peek().clone();
         loop {
             let (line, col) = {
-                let t = self.peek();
-                (t.line, t.col)
+                let token = self.peek();
+                (token.line, token.col)
             };
             if line != first.line && col != first.col {
                 return Err(ParseError::Layout(format!(
@@ -541,8 +590,8 @@ impl<'src> Parser<'src> {
                     first.col
                 )));
             }
-            let name_tok = self.expect(TokenKind::Identifier)?;
-            let name = self.ast.intern(name_tok.text);
+            let name_token = self.expect(TokenKind::Identifier)?;
+            let name = self.ast.intern(name_token.text);
             self.expect(TokenKind::Colon)?;
             let param_type = self.parse_type()?;
             params.push(Param { name, param_type });
@@ -556,8 +605,8 @@ impl<'src> Parser<'src> {
     }
 
     fn parse_type(&mut self) -> Result<PinpType, ParseError> {
-        let tok = self.expect(TokenKind::Identifier)?;
-        match tok.text {
+        let token = self.expect(TokenKind::Identifier)?;
+        match token.text {
             "bool" => Ok(PinpType::Bool),
             "int" => Ok(PinpType::Int),
             "float" => Ok(PinpType::Float),
@@ -604,6 +653,7 @@ impl<'src> Parser<'src> {
     // block's `result` (its value when the block is used as one); a block ending in any other
     // statement has `result: None`.
     fn parse_block(&mut self) -> Result<Block, ParseError> {
+        self.enter_nesting()?;
         self.expect(TokenKind::Newline)?;
         self.expect(TokenKind::Indent)?;
         let mut stmts: Vec<Stmt> = Vec::new();
@@ -625,7 +675,7 @@ impl<'src> Parser<'src> {
             // A multiline construct (or a swallowed continuation) leaves us on a layout token, so
             // the next statement may follow with no separator of its own.
             let ended_at_layout = matches!(
-                self.toks[self.pos - 1].kind,
+                self.tokens[self.pos - 1].kind,
                 TokenKind::Newline | TokenKind::Dedent | TokenKind::Indent
             );
             match self.peek().kind {
@@ -652,13 +702,14 @@ impl<'src> Parser<'src> {
         }
         // A trailing expression statement becomes the block's result value.
         let result = match stmts.last() {
-            Some(Stmt::Expr(e)) => {
-                let e = *e;
+            Some(Stmt::Expr(expr_id)) => {
+                let expr_id = *expr_id;
                 stmts.pop();
-                Some(e)
+                Some(expr_id)
             }
             _ => None,
         };
+        self.depth -= 1;
         Ok(Block { stmts, result })
     }
 
@@ -694,7 +745,7 @@ impl<'src> Parser<'src> {
         let cond = self.parse_expr(0)?;
         let body = self.parse_block()?;
         let mut arms = vec![IfArm { cond, body }];
-        let mut els = None;
+        let mut else_block = None;
         loop {
             match self.peek().kind {
                 TokenKind::KwElif => {
@@ -702,16 +753,21 @@ impl<'src> Parser<'src> {
                     let cond = self.parse_expr(0)?;
                     let body = self.parse_block()?;
                     arms.push(IfArm { cond, body });
+                    if arms.len() > MAX_IF_ARMS {
+                        return Err(ParseError::TooManyArms(format!(
+                            "Excessive number of if-elif constructs. The maximum is {MAX_IF_ARMS}."
+                        )));
+                    }
                 }
                 TokenKind::KwElse => {
                     self.advance();
-                    els = Some(self.parse_block()?);
+                    else_block = Some(self.parse_block()?);
                     break;
                 }
                 _ => break,
             }
         }
-        Ok(self.ast.push(Node::If { arms, els }))
+        Ok(self.ast.push(Node::If { arms, else_block }))
     }
 
     // Tail of the one-line conditional `then_val if cond else else_val`, entered at `if` with
@@ -764,7 +820,7 @@ impl<'src> Parser<'src> {
                 cond,
                 body: then_block,
             }],
-            els: Some(else_block),
+            else_block: Some(else_block),
         }))
     }
 
@@ -793,18 +849,18 @@ impl<'src> Parser<'src> {
                 self.advance(); // '::'
             }
             let name = self.advance().text; // Identifier
-            let sym = self.ast.intern(name);
+            let sym_id = self.ast.intern(name);
             let op = assign_op(self.advance().kind).unwrap();
             let rhs = self.parse_expr(0)?;
             let place = if global {
-                Place::Global(sym)
+                Place::Global(sym_id)
             } else {
-                Place::Local(sym)
+                Place::Local(sym_id)
             };
             Ok(self.finish_assign(place, op, rhs))
         } else {
-            let e = self.parse_expr(0)?;
-            Ok(Stmt::Expr(e))
+            let expr_id = self.parse_expr(0)?;
+            Ok(Stmt::Expr(expr_id))
         }
     }
 
@@ -829,6 +885,7 @@ impl<'src> Parser<'src> {
     }
 
     fn parse_expr(&mut self, min_bp: u8) -> Result<ExprId, ParseError> {
+        self.enter_nesting()?;
         let start_col = self.peek().col;
         let mut lhs = self.parse_prefix()?;
         loop {
@@ -844,16 +901,17 @@ impl<'src> Parser<'src> {
                 lhs = self.parse_comparison_chain(lhs)?;
                 continue;
             }
-            let Some((lbp, rbp, op)) = infix(self.peek().kind) else {
+            let Some((left_bp, right_bp, op)) = infix(self.peek().kind) else {
                 break;
             };
-            if lbp < min_bp {
+            if left_bp < min_bp {
                 break;
             }
             self.advance();
-            let rhs = self.parse_expr(rbp)?;
+            let rhs = self.parse_expr(right_bp)?;
             lhs = self.ast.push(Node::Bin { op, lhs, rhs });
         }
+        self.depth -= 1;
         Ok(lhs)
     }
 
@@ -862,30 +920,30 @@ impl<'src> Parser<'src> {
     // shared. A chain of one comparison is just that comparison — no `and` is introduced.
     fn parse_comparison_chain(&mut self, first: ExprId) -> Result<ExprId, ParseError> {
         let mut prev = first;
-        let mut ops: Vec<BinOp> = Vec::new();
+        let mut operators: Vec<BinOp> = Vec::new();
         let mut result: Option<ExprId> = None;
         while let Some(op) = comparison_op(self.peek().kind) {
             self.advance();
             // Operands bind just above the band so a following comparison starts a new link
             // rather than nesting inside this one.
             let next = self.parse_expr(COMPARISON_BP + 1)?;
-            let cmp = self.ast.push(Node::Bin {
+            let comparison = self.ast.push(Node::Bin {
                 op,
                 lhs: prev,
                 rhs: next,
             });
             result = Some(match result {
-                None => cmp,
-                Some(acc) => self.ast.push(Node::Bin {
+                None => comparison,
+                Some(accumulated) => self.ast.push(Node::Bin {
                     op: BinOp::And,
-                    lhs: acc,
-                    rhs: cmp,
+                    lhs: accumulated,
+                    rhs: comparison,
                 }),
             });
-            ops.push(op);
+            operators.push(op);
             prev = next;
         }
-        check_monotonic(&ops)?;
+        check_monotonic(&operators)?;
         Ok(result.expect("a chain is only started when a comparison operator is next"))
     }
 
@@ -903,12 +961,12 @@ impl<'src> Parser<'src> {
     fn parse_primary(&mut self) -> Result<ExprId, ParseError> {
         match self.peek().kind {
             TokenKind::Int => {
-                let v = parse_int(self.advance().text)?;
-                Ok(self.ast.push(Node::Int(v)))
+                let value = parse_int(self.advance().text)?;
+                Ok(self.ast.push(Node::Int(value)))
             }
             TokenKind::Float => {
-                let v = parse_float(self.advance().text);
-                Ok(self.ast.push(Node::Float(v)))
+                let value = parse_float(self.advance().text);
+                Ok(self.ast.push(Node::Float(value)))
             }
             TokenKind::KwTrue => {
                 self.advance();
@@ -923,23 +981,23 @@ impl<'src> Parser<'src> {
                     return self.parse_call();
                 }
                 let name = self.advance().text;
-                let sym = self.ast.intern(name);
-                Ok(self.ast.push(Node::Var(sym)))
+                let sym_id = self.ast.intern(name);
+                Ok(self.ast.push(Node::Var(sym_id)))
             }
             TokenKind::ColonColon => {
                 self.advance(); // '::'
                 let name = self.expect(TokenKind::Identifier)?.text;
-                let sym = self.ast.intern(name);
-                Ok(self.ast.push(Node::Global(sym)))
+                let sym_id = self.ast.intern(name);
+                Ok(self.ast.push(Node::Global(sym_id)))
             }
             // `if` opening an expression is the block form; the one-line ternary is reached from
             // the `parse_expr` loop instead, after a left operand.
             TokenKind::KwIf => self.parse_if(),
             TokenKind::LParen => {
                 self.advance();
-                let e = self.parse_expr(0)?;
+                let expr_id = self.parse_expr(0)?;
                 self.expect(TokenKind::RParen)?;
-                Ok(e)
+                Ok(expr_id)
             }
             other => Err(ParseError::Unexpected(format!(
                 "Unexpected token {other:?}."
@@ -979,56 +1037,62 @@ impl<'src> Parser<'src> {
 fn parse_int(text: &str) -> Result<i64, ParseError> {
     let out_of_range =
         || ParseError::Unexpected(format!("Integer literal `{text}` is out of range."));
-    let s: String = text.chars().filter(|&c| c != '_').collect();
-    if let Some(h) = s.strip_prefix("0x").or_else(|| s.strip_prefix("0X")) {
-        return i64::from_str_radix(h, 16).map_err(|_| out_of_range());
+    let digits: String = text.chars().filter(|&ch| ch != '_').collect();
+    if let Some(hex) = digits
+        .strip_prefix("0x")
+        .or_else(|| digits.strip_prefix("0X"))
+    {
+        return i64::from_str_radix(hex, 16).map_err(|_| out_of_range());
     }
-    if let Some(b) = s.strip_prefix("0b").or_else(|| s.strip_prefix("0B")) {
-        return i64::from_str_radix(b, 2).map_err(|_| out_of_range());
+    if let Some(binary) = digits
+        .strip_prefix("0b")
+        .or_else(|| digits.strip_prefix("0B"))
+    {
+        return i64::from_str_radix(binary, 2).map_err(|_| out_of_range());
     }
-    if let Some(pos) = s.find(['e', 'E']) {
-        let mantissa: i64 = s[..pos].parse().map_err(|_| out_of_range())?;
-        let exp: u32 = s[pos + 1..].parse().map_err(|_| out_of_range())?;
+    if let Some(pos) = digits.find(['e', 'E']) {
+        let mantissa: i64 = digits[..pos].parse().map_err(|_| out_of_range())?;
+        let exponent: u32 = digits[pos + 1..].parse().map_err(|_| out_of_range())?;
         return 10i64
-            .checked_pow(exp)
+            .checked_pow(exponent)
             .and_then(|factor| mantissa.checked_mul(factor))
             .ok_or_else(out_of_range);
     }
-    s.parse().map_err(|_| out_of_range())
+    digits.parse().map_err(|_| out_of_range())
 }
 
 fn parse_float(text: &str) -> f64 {
-    let s: String = text.chars().filter(|&c| c != '_').collect();
-    s.parse().unwrap()
+    let digits: String = text.chars().filter(|&ch| ch != '_').collect();
+    digits.parse().unwrap()
 }
 
 // A chain of more than one comparison must be monotonic: every operator shares one direction
 // (all ascending `< <=`, all descending `> >=`, or all `==`), and `!=` never chains. A lone
 // comparison is always fine — including `!=`.
-fn check_monotonic(ops: &[BinOp]) -> Result<(), ParseError> {
-    if ops.len() < 2 {
+fn check_monotonic(operators: &[BinOp]) -> Result<(), ParseError> {
+    if operators.len() < 2 {
         return Ok(());
     }
-    let first = ops[0];
-    let dir = chain_dir(first).ok_or_else(|| {
+    let first = operators[0];
+    let direction = chain_direction(first).ok_or_else(|| {
         ParseError::Unexpected(format!(
             "Cannot chain `{}`; it is not transitive.",
-            cmp_symbol(first)
+            comparison_symbol(first)
         ))
     })?;
-    for &op in &ops[1..] {
-        match chain_dir(op) {
+    for &op in &operators[1..] {
+        match chain_direction(op) {
             None => {
                 return Err(ParseError::Unexpected(format!(
                     "Cannot chain `{}`; it is not transitive.",
-                    cmp_symbol(op)
+                    comparison_symbol(op)
                 )))
             }
-            Some(d) if d != dir => {
+            Some(op_direction) if op_direction != direction => {
                 return Err(ParseError::Unexpected(format!(
                     "Cannot chain `{}` with `{}`.",
-                    cmp_symbol(first),
-                    cmp_symbol(op)
+                    comparison_symbol(first),
+                    comparison_symbol(op)
                 )))
             }
             Some(_) => {}
@@ -1046,17 +1110,17 @@ mod tests {
         parse(src).unwrap()
     }
 
-    fn func<'a>(ast: &'a Ast, i: usize) -> &'a FuncDef {
-        match &ast.top_level[i] {
-            TopLevel::Func(f) => f,
-            other => panic!("Top-level element {i} is not a function: {other:?}."),
+    fn func<'ast>(ast: &'ast Ast, index: usize) -> &'ast FuncDef {
+        match &ast.top_level[index] {
+            TopLevel::Func(func_def) => func_def,
+            other => panic!("Top-level element {index} is not a function: {other:?}."),
         }
     }
 
     // ExprId of the last top-level statement's expression.
     fn root(ast: &Ast) -> ExprId {
         match ast.top_level.last().unwrap() {
-            TopLevel::Stmt(Stmt::Expr(e)) => *e,
+            TopLevel::Stmt(Stmt::Expr(expr_id)) => *expr_id,
             TopLevel::Stmt(Stmt::Assign { rhs, .. }) => *rhs,
             other => panic!("Program does not end in an expression: {other:?}."),
         }
@@ -1156,10 +1220,10 @@ mod tests {
 
     #[test]
     fn bool_literals() {
-        let t = parse_ok("true");
-        assert_eq!(*t.node(root(&t)), Node::Bool(true));
-        let f = parse_ok("false");
-        assert_eq!(*f.node(root(&f)), Node::Bool(false));
+        let true_ast = parse_ok("true");
+        assert_eq!(*true_ast.node(root(&true_ast)), Node::Bool(true));
+        let false_ast = parse_ok("false");
+        assert_eq!(*false_ast.node(root(&false_ast)), Node::Bool(false));
     }
 
     #[test]
@@ -1289,23 +1353,23 @@ mod tests {
     fn ternary_binds_below_or() {
         // `a or b if c else d` = `(a or b) if c else d`.
         let ast = parse_ok("a or b if c else d");
-        let Node::If { arms, els } = ast.node(root(&ast)) else {
+        let Node::If { arms, else_block } = ast.node(root(&ast)) else {
             panic!("Expected an If at the root.");
         };
         assert_eq!(arms.len(), 1);
         let then = arms[0].body.result.unwrap();
         assert!(matches!(ast.node(then), Node::Bin { op: BinOp::Or, .. }));
-        assert!(els.is_some());
+        assert!(else_block.is_some());
     }
 
     #[test]
     fn ternary_else_tail_is_right_associative() {
         // `a if p else b if q else c` = `a if p else (b if q else c)`.
         let ast = parse_ok("a if p else b if q else c");
-        let Node::If { els, .. } = ast.node(root(&ast)) else {
+        let Node::If { else_block, .. } = ast.node(root(&ast)) else {
             panic!("Expected an If at the root.");
         };
-        let tail = els.as_ref().unwrap().result.unwrap();
+        let tail = else_block.as_ref().unwrap().result.unwrap();
         assert!(matches!(ast.node(tail), Node::If { .. }));
     }
 
@@ -1329,11 +1393,11 @@ mod tests {
             else
                 c
         "});
-        let Node::If { arms, els } = ast.node(root(&ast)) else {
+        let Node::If { arms, else_block } = ast.node(root(&ast)) else {
             panic!("Expected an If at the root.");
         };
         assert_eq!(arms.len(), 2); // `if` + one `elif`
-        assert!(els.is_some());
+        assert!(else_block.is_some());
         assert!(arms[0].body.result.is_some());
     }
 
@@ -1346,8 +1410,11 @@ mod tests {
                 else
                     b
         "});
-        let f = func(&ast, 0);
-        assert!(matches!(ast.node(f.body.result.unwrap()), Node::If { .. }));
+        let func_def = func(&ast, 0);
+        assert!(matches!(
+            ast.node(func_def.body.result.unwrap()),
+            Node::If { .. }
+        ));
     }
 
     #[test]
@@ -1401,6 +1468,32 @@ mod tests {
     }
 
     #[test]
+    fn deeply_nested_input_errors_rather_than_overflowing() {
+        // Thousands of nested parens would blow the stack without the depth guard; instead the
+        // parser bails fast with an error well before the real stack is exhausted.
+        let deep = format!("{}1{}", "(".repeat(5_000), ")".repeat(5_000));
+        assert!(matches!(parse(&deep), Err(ParseError::TooDeeplyNested(_))));
+    }
+
+    #[test]
+    fn moderately_nested_input_still_parses() {
+        // Well under the limit — ordinary (if unusual) nesting must keep working.
+        let nested = format!("{}1{}", "(".repeat(50), ")".repeat(50));
+        assert!(parse(&nested).is_ok());
+    }
+
+    #[test]
+    fn excessive_if_arms_are_rejected() {
+        // A flat `elif` ladder past the arm cap is refused (a sanity bound, not a stack risk).
+        let mut src = String::from("if a > 0\n    1\n");
+        for _ in 0..300 {
+            src.push_str("elif a > 0\n    1\n");
+        }
+        src.push_str("else\n    1\n");
+        assert!(matches!(parse(&src), Err(ParseError::TooManyArms(_))));
+    }
+
+    #[test]
     fn bool_type_annotation() {
         let ast = parse_ok("f(a: bool): bool is a");
         assert_eq!(func(&ast, 0).params[0].param_type, PinpType::Bool);
@@ -1412,12 +1505,15 @@ mod tests {
     #[test]
     fn single_line_function() {
         let ast = parse_ok("fu(a:float, b:float, c:float): float is b^2 - 4*a*c");
-        let f = func(&ast, 0);
-        assert_eq!(ast.names[f.name.0 as usize], "fu");
-        assert_eq!(f.params.len(), 3);
-        assert!(f.params.iter().all(|p| p.param_type == PinpType::Float));
-        assert_eq!(f.return_type, PinpType::Float);
-        assert!(f.body.stmts.is_empty());
+        let func_def = func(&ast, 0);
+        assert_eq!(ast.names[func_def.name.value()], "fu");
+        assert_eq!(func_def.params.len(), 3);
+        assert!(func_def
+            .params
+            .iter()
+            .all(|param| param.param_type == PinpType::Float));
+        assert_eq!(func_def.return_type, PinpType::Float);
+        assert!(func_def.body.stmts.is_empty());
 
         // Omitting the return type on the single-line form is an explicit, specific error —
         // it must name the missing return type, not fall back to a generic syntax message.
@@ -1437,11 +1533,11 @@ mod tests {
                 xx = a+b*b
                 xx
         "});
-        let f = func(&ast, 0);
-        assert_eq!(f.params.len(), 2);
-        assert_eq!(f.return_type, PinpType::Int);
-        assert_eq!(f.body.stmts.len(), 1);
-        assert!(matches!(f.body.stmts[0], Stmt::Assign { .. }));
+        let func_def = func(&ast, 0);
+        assert_eq!(func_def.params.len(), 2);
+        assert_eq!(func_def.return_type, PinpType::Int);
+        assert_eq!(func_def.body.stmts.len(), 1);
+        assert!(matches!(func_def.body.stmts[0], Stmt::Assign { .. }));
     }
 
     #[test]
