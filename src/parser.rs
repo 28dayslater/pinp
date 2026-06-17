@@ -84,9 +84,33 @@ pub enum Node {
     Bool(bool),
     Var(SymId),    // bare name: a parameter/local, or a top-level global
     Global(SymId), // `::name`
-    Unary { op: UnOp, operand: ExprId },
-    Bin { op: BinOp, lhs: ExprId, rhs: ExprId },
-    Call { callee: SymId, args: Vec<ExprId> },
+    Unary {
+        op: UnOp,
+        operand: ExprId,
+    },
+    Bin {
+        op: BinOp,
+        lhs: ExprId,
+        rhs: ExprId,
+    },
+    Call {
+        callee: SymId,
+        args: Vec<ExprId>,
+    },
+    /// `if`/`elif`/`else` — one node for both the block form and the one-line ternary (which is a
+    /// single arm plus a mandatory `els`). Each arm's value is its body's trailing expression; the
+    /// node yields a value only when `els` is present and every branch ends in one (see sema).
+    If {
+        arms: Vec<IfArm>,
+        els: Option<Block>,
+    },
+}
+
+/// One `if`/`elif` arm: a condition and the body taken when it holds.
+#[derive(Debug, Clone, PartialEq)]
+pub struct IfArm {
+    pub cond: ExprId,
+    pub body: Block,
 }
 
 /// A named location that can be read or written: a bare name (current scope) or an
@@ -102,8 +126,23 @@ pub enum Place {
 /// compound assignment (`x += e`) is desugared at parse time into an `Assign`.
 #[derive(Debug, Clone, PartialEq)]
 pub enum Stmt {
-    Assign { target: Place, rhs: ExprId },
+    Assign {
+        target: Place,
+        rhs: ExprId,
+    },
     Expr(ExprId),
+    /// Pre-test loop: run `body` while `cond` holds.
+    While {
+        cond: ExprId,
+        body: Block,
+    },
+    /// Post-test (do–while) loop: run `body`, then repeat while `cond` holds (`until` ⇒ repeat
+    /// while `cond` is *false*).
+    Loop {
+        body: Block,
+        cond: ExprId,
+        until: bool,
+    },
 }
 
 /// A function parameter: its interned name and resolved type.
@@ -113,12 +152,13 @@ pub struct Param {
     pub param_type: PinpType,
 }
 
-/// A function body: zero or more statements followed by the `result` expression, whose type is
-/// the function's return value. The single-line form has empty `stmts`.
+/// A block of statements with an optional trailing `result` expression — its value when used as
+/// one (an `if` arm or a function body). A function body always carries a `result` (the parser
+/// requires it); a control-flow body that ends in a statement has `result: None`.
 #[derive(Debug, Clone, PartialEq)]
 pub struct Block {
     pub stmts: Vec<Stmt>,
-    pub result: ExprId,
+    pub result: Option<ExprId>,
 }
 
 /// A parsed function definition: name, parameters, return type, and body.
@@ -203,6 +243,7 @@ pub fn parse(src: &str) -> Result<Ast<'_>, ParseError> {
         toks,
         pos: 0,
         ast: Ast::default(),
+        pending_dedents: 0,
     };
     p.parse_program()?;
     Ok(p.ast)
@@ -212,6 +253,13 @@ struct Parser<'src> {
     toks: Vec<Token<'src>>,
     pos: usize,
     ast: Ast<'src>,
+    // A wrapped one-line conditional (`… if c` then `else …` on the next line, aligned to the
+    // expression's column) opens an `Indent` the layout will later close with a `Dedent`. That
+    // `Dedent` is *not* a block terminator, so `parse_conditional` records it here and the
+    // enclosing `parse_block` swallows it instead of ending the block. See `parse_conditional`.
+    // At the top level there is no enclosing `parse_block`; the stray `Dedent` is harmlessly
+    // absorbed by `skip_separators` and this counter is reset each `parse_program` iteration.
+    pending_dedents: usize,
 }
 
 // Binding-power "table". See articles on Pratt parsing.
@@ -253,6 +301,12 @@ fn comparison_op(kind: TokenKind) -> Option<BinOp> {
 // Binding power of the comparison band. Looser than additive (60), tighter than the logicals
 // (`and`=30); chain operands are parsed just above it so a comparison never swallows another.
 const COMPARISON_BP: u8 = 45;
+
+// Binding power of the one-line conditional `e1 if c else e2`. The loosest operator of all — below
+// `or` (20) — so `a or b if c else d` is `(a or b) if c else d`. Its else-tail is right-associative
+// (the right operand is parsed at this same power), giving `a if p else b if q else c` =
+// `a if p else (b if q else c)`. Handled apart from `infix`, like the comparison chain.
+const CONDITIONAL_BP: u8 = 10;
 
 // Right binding power of the prefix operators `-` and `not`: above `*`/`/` (70), below `^` (80),
 // so `-a*b` is `(-a)*b` and `-a^b` is `-(a^b)`. `not` shares this level to match C's unary-tight
@@ -359,6 +413,7 @@ impl<'src> Parser<'src> {
 
     fn parse_program(&mut self) -> Result<(), ParseError> {
         loop {
+            self.pending_dedents = 0;
             self.skip_separators();
             if self.peek().kind == TokenKind::Eof {
                 return Ok(());
@@ -368,8 +423,18 @@ impl<'src> Parser<'src> {
             } else {
                 let stmt = self.parse_stmt()?;
                 self.ast.top_level.push(TopLevel::Stmt(stmt));
+                // A single-line statement must reach end of line; a multiline construct (`while`/
+                // `loop`/block `if`) ends on a layout token, after which the next statement may
+                // begin straight away. Any stray continuation dedents are absorbed by
+                // `skip_separators` on the next iteration. (`parse_block` applies the same
+                // end-of-statement rule for nested blocks; keep the two in sync.)
+                let ended_at_layout = matches!(
+                    self.toks[self.pos - 1].kind,
+                    TokenKind::Newline | TokenKind::Dedent | TokenKind::Indent
+                );
                 match self.peek().kind {
-                    TokenKind::Newline | TokenKind::Eof => {}
+                    TokenKind::Newline | TokenKind::Eof | TokenKind::Dedent => {}
+                    _ if ended_at_layout => {}
                     other => {
                         return Err(ParseError::Unexpected(format!(
                             "Unexpected token {other:?}."
@@ -504,46 +569,13 @@ impl<'src> Parser<'src> {
     fn parse_func_body(&mut self, has_return_type: bool) -> Result<Block, ParseError> {
         if self.peek().kind == TokenKind::Newline {
             // Block form: a run of statements ending in a result expression.
-            self.expect(TokenKind::Newline)?;
-            self.expect(TokenKind::Indent)?;
-            let mut lines: Vec<Stmt> = Vec::new();
-            loop {
-                let stmt = self.parse_stmt()?;
-                lines.push(stmt);
-                match self.peek().kind {
-                    TokenKind::Newline => self.pos += 1,
-                    TokenKind::Dedent => {
-                        self.pos += 1;
-                        break;
-                    }
-                    TokenKind::Eof => break,
-                    other => {
-                        return Err(ParseError::Unexpected(format!(
-                            "Unexpected token {other:?}."
-                        )))
-                    }
-                }
-                if self.peek().kind == TokenKind::Dedent {
-                    self.pos += 1;
-                    break;
-                }
-                if self.peek().kind == TokenKind::Eof {
-                    break;
-                }
+            let block = self.parse_block()?;
+            if block.result.is_none() {
+                return Err(ParseError::Unexpected(
+                    "Function body must end with an expression.".into(),
+                ));
             }
-            let result = match lines.pop() {
-                Some(Stmt::Expr(e)) => e,
-                Some(Stmt::Assign { .. }) => {
-                    return Err(ParseError::Unexpected(
-                        "Function body must end with an expression.".into(),
-                    ))
-                }
-                None => return Err(ParseError::Unexpected("Empty function body.".into())),
-            };
-            Ok(Block {
-                stmts: lines,
-                result,
-            })
+            Ok(block)
         } else {
             // Single-line form: `is` then an expression — which must declare a return type.
             if !has_return_type {
@@ -562,12 +594,186 @@ impl<'src> Parser<'src> {
             }
             Ok(Block {
                 stmts: Vec::new(),
-                result,
+                result: Some(result),
             })
         }
     }
 
+    // Parse an indented block — `Newline Indent <stmts> Dedent` — shared by function bodies and
+    // every control-flow body (`if`/`while`/`loop`). A trailing expression statement becomes the
+    // block's `result` (its value when the block is used as one); a block ending in any other
+    // statement has `result: None`.
+    fn parse_block(&mut self) -> Result<Block, ParseError> {
+        self.expect(TokenKind::Newline)?;
+        self.expect(TokenKind::Indent)?;
+        let mut stmts: Vec<Stmt> = Vec::new();
+        loop {
+            let stmt = self.parse_stmt()?;
+            stmts.push(stmt);
+            // A wrapped one-line conditional inside this statement opened indents whose closing
+            // dedents sit just past the statement's newline; swallow them so they are not taken
+            // for this block's terminator.
+            if self.pending_dedents > 0 {
+                if self.peek().kind == TokenKind::Newline {
+                    self.pos += 1;
+                }
+                while self.pending_dedents > 0 && self.peek().kind == TokenKind::Dedent {
+                    self.pos += 1;
+                    self.pending_dedents -= 1;
+                }
+            }
+            // A multiline construct (or a swallowed continuation) leaves us on a layout token, so
+            // the next statement may follow with no separator of its own.
+            let ended_at_layout = matches!(
+                self.toks[self.pos - 1].kind,
+                TokenKind::Newline | TokenKind::Dedent | TokenKind::Indent
+            );
+            match self.peek().kind {
+                TokenKind::Newline => self.pos += 1,
+                TokenKind::Dedent => {
+                    self.pos += 1;
+                    break;
+                }
+                TokenKind::Eof => break,
+                _ if ended_at_layout => {}
+                other => {
+                    return Err(ParseError::Unexpected(format!(
+                        "Unexpected token {other:?}."
+                    )))
+                }
+            }
+            if self.peek().kind == TokenKind::Dedent {
+                self.pos += 1;
+                break;
+            }
+            if self.peek().kind == TokenKind::Eof {
+                break;
+            }
+        }
+        // A trailing expression statement becomes the block's result value.
+        let result = match stmts.last() {
+            Some(Stmt::Expr(e)) => {
+                let e = *e;
+                stmts.pop();
+                Some(e)
+            }
+            _ => None,
+        };
+        Ok(Block { stmts, result })
+    }
+
+    fn parse_while(&mut self) -> Result<Stmt, ParseError> {
+        self.advance(); // 'while'
+        let cond = self.parse_expr(0)?;
+        let body = self.parse_block()?;
+        Ok(Stmt::While { cond, body })
+    }
+
+    fn parse_loop(&mut self) -> Result<Stmt, ParseError> {
+        self.advance(); // 'loop'
+        let body = self.parse_block()?;
+        let until = match self.peek().kind {
+            TokenKind::KwWhile => false,
+            TokenKind::KwUntil => true,
+            other => {
+                return Err(ParseError::Unexpected(format!(
+                    "Expected `while` or `until` after a loop body, found {other:?}."
+                )))
+            }
+        };
+        self.advance(); // 'while' / 'until'
+        let cond = self.parse_expr(0)?;
+        Ok(Stmt::Loop { body, cond, until })
+    }
+
+    // Block form `if cond <body> [elif cond <body>]* [else <body>]`, reached when `if` opens an
+    // expression. Each arm and the optional `else` is an indented block; their values (the trailing
+    // expressions) are what an `if`-as-a-value yields.
+    fn parse_if(&mut self) -> Result<ExprId, ParseError> {
+        self.advance(); // 'if'
+        let cond = self.parse_expr(0)?;
+        let body = self.parse_block()?;
+        let mut arms = vec![IfArm { cond, body }];
+        let mut els = None;
+        loop {
+            match self.peek().kind {
+                TokenKind::KwElif => {
+                    self.advance();
+                    let cond = self.parse_expr(0)?;
+                    let body = self.parse_block()?;
+                    arms.push(IfArm { cond, body });
+                }
+                TokenKind::KwElse => {
+                    self.advance();
+                    els = Some(self.parse_block()?);
+                    break;
+                }
+                _ => break,
+            }
+        }
+        Ok(self.ast.push(Node::If { arms, els }))
+    }
+
+    // Tail of the one-line conditional `then_val if cond else else_val`, entered at `if` with
+    // `then_val` already parsed. `start_col` is the column where the whole expression began; a
+    // wrapped `else` (on its own line) must align to it.
+    fn parse_conditional(
+        &mut self,
+        then_val: ExprId,
+        start_col: u32,
+    ) -> Result<ExprId, ParseError> {
+        self.advance(); // 'if'
+        let cond = self.parse_expr(0)?;
+        // `else` may sit on the next line. Skip the continuation's layout tokens, recording any
+        // `Indent` so the enclosing block ignores its later closing `Dedent`.
+        let mut wrapped = false;
+        while matches!(
+            self.peek().kind,
+            TokenKind::Newline | TokenKind::Indent | TokenKind::Dedent
+        ) {
+            if self.peek().kind == TokenKind::Indent {
+                self.pending_dedents += 1;
+            }
+            wrapped = true;
+            self.pos += 1;
+        }
+        if self.peek().kind != TokenKind::KwElse {
+            return Err(ParseError::Unexpected(
+                "Expected `else` in a conditional expression.".into(),
+            ));
+        }
+        if wrapped && self.peek().col != start_col {
+            return Err(ParseError::Layout(format!(
+                "Continuation `else` at column {} must align to the conditional's column {}.",
+                self.peek().col,
+                start_col
+            )));
+        }
+        self.advance(); // 'else'
+        let else_val = self.parse_expr(CONDITIONAL_BP)?;
+        let then_block = Block {
+            stmts: Vec::new(),
+            result: Some(then_val),
+        };
+        let else_block = Block {
+            stmts: Vec::new(),
+            result: Some(else_val),
+        };
+        Ok(self.ast.push(Node::If {
+            arms: vec![IfArm {
+                cond,
+                body: then_block,
+            }],
+            els: Some(else_block),
+        }))
+    }
+
     fn parse_stmt(&mut self) -> Result<Stmt, ParseError> {
+        match self.peek().kind {
+            TokenKind::KwWhile => return self.parse_while(),
+            TokenKind::KwLoop => return self.parse_loop(),
+            _ => {}
+        }
         // An assignment is a `place` (bare name or `::name`) immediately followed by an
         // assignment operator; anything else is an expression statement.
         let is_global =
@@ -623,8 +829,15 @@ impl<'src> Parser<'src> {
     }
 
     fn parse_expr(&mut self, min_bp: u8) -> Result<ExprId, ParseError> {
+        let start_col = self.peek().col;
         let mut lhs = self.parse_prefix()?;
         loop {
+            // The one-line conditional `lhs if c else e` is the loosest operator and chains right;
+            // like the comparison band it sits outside the `infix` table.
+            if self.peek().kind == TokenKind::KwIf && CONDITIONAL_BP >= min_bp {
+                lhs = self.parse_conditional(lhs, start_col)?;
+                continue;
+            }
             // The comparison band chains rather than left-folds, so it is handled apart from the
             // `infix` binding-power loop.
             if comparison_op(self.peek().kind).is_some() && COMPARISON_BP >= min_bp {
@@ -719,6 +932,9 @@ impl<'src> Parser<'src> {
                 let sym = self.ast.intern(name);
                 Ok(self.ast.push(Node::Global(sym)))
             }
+            // `if` opening an expression is the block form; the one-line ternary is reached from
+            // the `parse_expr` loop instead, after a left operand.
+            TokenKind::KwIf => self.parse_if(),
             TokenKind::LParen => {
                 self.advance();
                 let e = self.parse_expr(0)?;
@@ -842,9 +1058,7 @@ mod tests {
         match ast.top_level.last().unwrap() {
             TopLevel::Stmt(Stmt::Expr(e)) => *e,
             TopLevel::Stmt(Stmt::Assign { rhs, .. }) => *rhs,
-            TopLevel::Func(_) => {
-                panic!("Program ends in a function definition, not an expression.")
-            }
+            other => panic!("Program does not end in an expression: {other:?}."),
         }
     }
 
@@ -1069,6 +1283,123 @@ mod tests {
         ));
     }
 
+    // --- control flow: `if` expression, `while`/`loop` statements ------------------------
+
+    #[test]
+    fn ternary_binds_below_or() {
+        // `a or b if c else d` = `(a or b) if c else d`.
+        let ast = parse_ok("a or b if c else d");
+        let Node::If { arms, els } = ast.node(root(&ast)) else {
+            panic!("Expected an If at the root.");
+        };
+        assert_eq!(arms.len(), 1);
+        let then = arms[0].body.result.unwrap();
+        assert!(matches!(ast.node(then), Node::Bin { op: BinOp::Or, .. }));
+        assert!(els.is_some());
+    }
+
+    #[test]
+    fn ternary_else_tail_is_right_associative() {
+        // `a if p else b if q else c` = `a if p else (b if q else c)`.
+        let ast = parse_ok("a if p else b if q else c");
+        let Node::If { els, .. } = ast.node(root(&ast)) else {
+            panic!("Expected an If at the root.");
+        };
+        let tail = els.as_ref().unwrap().result.unwrap();
+        assert!(matches!(ast.node(tail), Node::If { .. }));
+    }
+
+    #[test]
+    fn wrapped_conditional_alignment() {
+        // The `else` line must align to the column where the then-expression (`42`) starts.
+        parse_ok("fu = 42 + 142 if a > 42\n     else 42");
+        assert!(matches!(
+            parse("fu = 42 + 142 if a > 42\n   else 42"),
+            Err(ParseError::Layout(_))
+        ));
+    }
+
+    #[test]
+    fn block_if_shape() {
+        let ast = parse_ok(indoc! {"
+            if a > b
+                a
+            elif a == b
+                b
+            else
+                c
+        "});
+        let Node::If { arms, els } = ast.node(root(&ast)) else {
+            panic!("Expected an If at the root.");
+        };
+        assert_eq!(arms.len(), 2); // `if` + one `elif`
+        assert!(els.is_some());
+        assert!(arms[0].body.result.is_some());
+    }
+
+    #[test]
+    fn block_if_as_function_result() {
+        let ast = parse_ok(indoc! {"
+            mx(a: int, b: int): int is
+                if a > b
+                    a
+                else
+                    b
+        "});
+        let f = func(&ast, 0);
+        assert!(matches!(ast.node(f.body.result.unwrap()), Node::If { .. }));
+    }
+
+    #[test]
+    fn while_and_loop_shapes() {
+        let w = parse_ok(indoc! {"
+            while a > 0
+                a
+        "});
+        assert!(matches!(w.top_level[0], TopLevel::Stmt(Stmt::While { .. })));
+
+        let l = parse_ok(indoc! {"
+            loop
+                a
+            while a > 0
+        "});
+        assert!(matches!(
+            l.top_level[0],
+            TopLevel::Stmt(Stmt::Loop { until: false, .. })
+        ));
+
+        let u = parse_ok(indoc! {"
+            loop
+                a
+            until a > 0
+        "});
+        assert!(matches!(
+            u.top_level[0],
+            TopLevel::Stmt(Stmt::Loop { until: true, .. })
+        ));
+    }
+
+    #[test]
+    fn body_ending_in_statement_has_no_result() {
+        let ast = parse_ok(indoc! {"
+            while a > 0
+                b = 1
+        "});
+        let TopLevel::Stmt(Stmt::While { body, .. }) = &ast.top_level[0] else {
+            panic!("Expected a while statement.");
+        };
+        assert_eq!(body.stmts.len(), 1);
+        assert!(body.result.is_none());
+    }
+
+    #[test]
+    fn loop_without_trailing_condition_is_error() {
+        assert!(matches!(
+            parse("loop\n    a\nb"),
+            Err(ParseError::Unexpected(_))
+        ));
+    }
+
     #[test]
     fn bool_type_annotation() {
         let ast = parse_ok("f(a: bool): bool is a");
@@ -1129,7 +1460,7 @@ mod tests {
                 b + fu(b)
         "});
         let bar = func(&ast, 1);
-        let Node::Bin { rhs, .. } = *ast.node(bar.body.result) else {
+        let Node::Bin { rhs, .. } = *ast.node(bar.body.result.unwrap()) else {
             panic!("Expected the body to end in a binary expression.");
         };
         assert!(matches!(ast.node(rhs), Node::Call { .. }));

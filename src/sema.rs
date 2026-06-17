@@ -15,7 +15,7 @@
 use rustc_hash::FxHashMap;
 
 use crate::parser::{
-    Ast, BinOp, ExprId, FuncDef, Node, PinpType, Place, Stmt, SymId, TopLevel, UnOp,
+    Ast, BinOp, Block, ExprId, FuncDef, Node, PinpType, Place, Stmt, SymId, TopLevel, UnOp,
 };
 
 /// A semantic failure. pinp is fail-fast: the first error stops the pass.
@@ -32,6 +32,19 @@ pub enum SemaError {
 fn assignable(from: PinpType, to: PinpType) -> bool {
     use PinpType::*;
     from == to || matches!((from, to), (Bool, Int) | (Bool, Float) | (Int, Float))
+}
+
+/// The wider of two types under the `Bool -> Int -> Float` lattice — the common type an `if`'s
+/// branches join to. `None` when neither is assignable to the other (e.g. a `Void` branch), which
+/// makes the whole `if` `Void` and so usable only as a statement.
+fn join(a: PinpType, b: PinpType) -> Option<PinpType> {
+    if assignable(a, b) {
+        Some(b)
+    } else if assignable(b, a) {
+        Some(a)
+    } else {
+        None
+    }
 }
 
 /// Whether `t` participates in arithmetic/comparison, i.e. is not `Void`.
@@ -65,6 +78,7 @@ pub fn analyze(ast: &mut Ast) -> Result<(), SemaError> {
         names,
         types,
         scopes: vec![FxHashMap::default()], // global frame
+        fn_base: 0,
         funcs: FxHashMap::default(),
     };
     for item in top_level.iter() {
@@ -81,6 +95,10 @@ struct Analyzer<'a, 'src> {
     names: &'a [&'src str],
     types: &'a mut Vec<PinpType>,
     scopes: Vec<FxHashMap<SymId, PinpType>>,
+    // Index of the current function's base frame; bare-name resolution searches `scopes[fn_base..]`
+    // and never reaches the global frame from inside a function. `0` at the top level, where the
+    // global frame *is* the base.
+    fn_base: usize,
     funcs: FxHashMap<SymId, Signature>,
 }
 
@@ -102,12 +120,19 @@ impl Analyzer<'_, '_> {
             }
             frame.insert(p.name, p.param_type); // duplicate params already rejected by the parser
         }
+        let old_base = self.fn_base;
         self.scopes.push(frame);
+        self.fn_base = self.scopes.len() - 1;
         for stmt in &func.body.stmts {
             self.analyze_stmt(stmt)?;
         }
-        let result_type = self.analyze_expr(func.body.result)?;
+        let result = func
+            .body
+            .result
+            .expect("a function body always ends in a result expression");
+        let result_type = self.analyze_expr(result)?;
         self.scopes.pop();
+        self.fn_base = old_base;
 
         if !assignable(result_type, func.return_type) {
             return Err(SemaError::Type(format!(
@@ -149,19 +174,68 @@ impl Analyzer<'_, '_> {
                         }
                         Some(existing) => self.check_assignable(rhs_type, existing)?,
                     },
-                    Place::Local(s) => {
-                        let frame = self.scopes.last().unwrap();
-                        match frame.get(&s).copied() {
-                            Some(existing) => self.check_assignable(rhs_type, existing)?,
-                            None => {
-                                self.scopes.last_mut().unwrap().insert(s, rhs_type);
-                            }
+                    Place::Local(s) => match self.lookup_assign_target(s) {
+                        // Mutate the nearest enclosing binding if one exists (so a conditional
+                        // update or a loop counter alters the outer variable)...
+                        Some(existing) => self.check_assignable(rhs_type, existing)?,
+                        // ...otherwise introduce a fresh local in the innermost (current body)
+                        // scope, where it does not escape.
+                        None => {
+                            self.scopes.last_mut().unwrap().insert(s, rhs_type);
                         }
-                    }
+                    },
                 }
                 Ok(())
             }
+            Stmt::While { cond, body } => {
+                self.check_condition(*cond)?;
+                self.analyze_block(body)?;
+                Ok(())
+            }
+            Stmt::Loop { body, cond, .. } => {
+                self.analyze_block(body)?;
+                self.check_condition(*cond)?;
+                Ok(())
+            }
         }
+    }
+
+    /// Analyses a control-flow body in its own scope, returning the type of its trailing result
+    /// expression (or `None` when it ends in a statement). The scope is popped on the way out, so a
+    /// name first assigned here does not escape.
+    fn analyze_block(&mut self, block: &Block) -> Result<Option<PinpType>, SemaError> {
+        self.scopes.push(FxHashMap::default());
+        for stmt in &block.stmts {
+            self.analyze_stmt(stmt)?;
+        }
+        let result_type = match block.result {
+            Some(e) => Some(self.analyze_expr(e)?),
+            None => None,
+        };
+        self.scopes.pop();
+        Ok(result_type)
+    }
+
+    /// A condition (`if`/`while`/`loop`) must be `Bool` — there is no truthiness.
+    fn check_condition(&mut self, cond: ExprId) -> Result<(), SemaError> {
+        let t = self.analyze_expr(cond)?;
+        if t == PinpType::Bool {
+            Ok(())
+        } else {
+            Err(SemaError::Type(format!(
+                "Condition must be Bool, got {t:?}."
+            )))
+        }
+    }
+
+    /// Finds the type of the nearest enclosing binding of `s` (innermost first, down to the
+    /// function base), or `None` if `s` is bound nowhere in scope — meaning an assignment should
+    /// introduce it as a new local.
+    fn lookup_assign_target(&self, s: SymId) -> Option<PinpType> {
+        self.scopes[self.fn_base..]
+            .iter()
+            .rev()
+            .find_map(|frame| frame.get(&s).copied())
     }
 
     fn check_assignable(&self, from: PinpType, to: PinpType) -> Result<(), SemaError> {
@@ -192,17 +266,49 @@ impl Analyzer<'_, '_> {
                 self.bin_type(op, lt, rt)?
             }
             Node::Call { callee, args } => self.call_type(callee, &args)?,
+            Node::If { arms, els } => self.if_type(&arms, els.as_ref())?,
         };
         self.types[e.0 as usize] = ty;
         Ok(ty)
     }
 
+    /// Types an `if`: each condition must be `Bool`; the node's type is the join of every branch's
+    /// result, but only when an `else` is present and every branch (arms and `else`) ends in an
+    /// expression. Otherwise it is `Void` — usable as a statement, but not as a value.
+    fn if_type(
+        &mut self,
+        arms: &[crate::parser::IfArm],
+        els: Option<&Block>,
+    ) -> Result<PinpType, SemaError> {
+        let mut branch_types = Vec::with_capacity(arms.len());
+        for arm in arms {
+            self.check_condition(arm.cond)?;
+            branch_types.push(self.analyze_block(&arm.body)?);
+        }
+        let Some(els) = els else {
+            return Ok(PinpType::Void);
+        };
+        let else_type = self.analyze_block(els)?;
+
+        // A missing branch result, or branches that do not share a common type, leave the `if`
+        // valueless (`Void`).
+        let mut acc = match else_type {
+            Some(t) => t,
+            None => return Ok(PinpType::Void),
+        };
+        for bt in branch_types {
+            match bt.and_then(|t| join(acc, t)) {
+                Some(j) => acc = j,
+                None => return Ok(PinpType::Void),
+            }
+        }
+        Ok(acc)
+    }
+
     fn lookup_local(&self, s: SymId) -> Result<PinpType, SemaError> {
-        self.scopes
-            .last()
-            .unwrap()
-            .get(&s)
-            .copied()
+        // Reading and assigning resolve a bare name the same way — outward to the function base —
+        // so both share `lookup_assign_target`.
+        self.lookup_assign_target(s)
             .ok_or_else(|| SemaError::UnknownSymbol(format!("Unknown symbol `{}`.", self.name(s))))
     }
 
@@ -425,6 +531,82 @@ mod tests {
                 fu(true, false)
             "}),
             PinpType::Bool
+        );
+    }
+
+    // --- control flow --------------------------------------------------------------------
+
+    #[test]
+    fn if_expression_type_is_branch_join() {
+        assert_eq!(root_type("1 if true else 2"), PinpType::Int);
+        assert_eq!(root_type("1 if true else 2.0"), PinpType::Float); // join(Int, Float)
+        assert_eq!(root_type("true if false else false"), PinpType::Bool);
+    }
+
+    #[test]
+    fn condition_must_be_bool() {
+        assert!(matches!(sema_error("1 if 5 else 2"), SemaError::Type(_)));
+        assert!(matches!(
+            sema_error(indoc! {"
+                i = 0
+                while i
+                    i += 1
+                i
+            "}),
+            SemaError::Type(_)
+        ));
+    }
+
+    #[test]
+    fn if_without_else_is_void_and_unusable_as_value() {
+        assert!(matches!(
+            sema_error(indoc! {"
+                x = 0
+                x = if true
+                    1
+            "}),
+            SemaError::Type(_)
+        ));
+    }
+
+    #[test]
+    fn body_local_does_not_escape() {
+        // `m` is introduced inside the if-body, so it is not in scope afterwards.
+        assert!(matches!(
+            sema_error(indoc! {"
+                if true
+                    m = 1
+                m
+            "}),
+            SemaError::UnknownSymbol(_)
+        ));
+    }
+
+    #[test]
+    fn conditional_update_mutates_outer() {
+        // `m` exists before the `if`; assigning it inside mutates that binding, so `m` stays in
+        // scope (and Int) afterwards.
+        assert_eq!(
+            root_type(indoc! {"
+                m = 5
+                if true
+                    m = 7
+                m
+            "}),
+            PinpType::Int
+        );
+    }
+
+    #[test]
+    fn bare_loop_counter_type_checks() {
+        assert_eq!(
+            root_type(indoc! {"
+                i = 0
+                while i < 3
+                    i += 1
+                i
+            "}),
+            PinpType::Int
         );
     }
 

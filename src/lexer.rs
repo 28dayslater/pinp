@@ -136,6 +136,12 @@ pub enum TokenKind {
     KwOr,
     KwXor,
     KwNot,
+    KwIf,
+    KwElif,
+    KwElse,
+    KwWhile,
+    KwUntil,
+    KwLoop,
     Newline,
     Indent,
     Dedent,
@@ -213,6 +219,12 @@ pub fn lex(src: &str) -> Result<Vec<Token<'_>>, LexError> {
                 "or" => TokenKind::KwOr,
                 "xor" => TokenKind::KwXor,
                 "not" => TokenKind::KwNot,
+                "if" => TokenKind::KwIf,
+                "elif" => TokenKind::KwElif,
+                "else" => TokenKind::KwElse,
+                "while" => TokenKind::KwWhile,
+                "until" => TokenKind::KwUntil,
+                "loop" => TokenKind::KwLoop,
                 _ => TokenKind::Identifier,
             },
             Lexeme::PlusEq => TokenKind::PlusEq,
@@ -362,6 +374,15 @@ mod tests {
         assert_eq!(
             kinds("true false and or xor not bool"),
             vec![KwTrue, KwFalse, KwAnd, KwOr, KwXor, KwNot, Identifier, Eof]
+        );
+    }
+
+    #[test]
+    fn control_flow_keywords() {
+        use TokenKind::*;
+        assert_eq!(
+            kinds("if elif else while until loop"),
+            vec![KwIf, KwElif, KwElse, KwWhile, KwUntil, KwLoop, Eof]
         );
     }
 

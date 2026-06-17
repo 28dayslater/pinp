@@ -10,6 +10,7 @@
 
 use std::ffi::{CStr, CString};
 
+use inkwell::basic_block::BasicBlock;
 use inkwell::builder::Builder;
 use inkwell::context::Context;
 use inkwell::llvm_sys::error::{LLVMDisposeErrorMessage, LLVMErrorRef, LLVMGetErrorMessage};
@@ -142,7 +143,12 @@ struct CodeGen<'ctx, 'ast> {
     ast: &'ast Ast<'ast>,
     functions: FxHashMap<SymId, (FunctionValue<'ctx>, Vec<PinpType>, PinpType)>,
     globals: FxHashMap<SymId, (PointerValue<'ctx>, PinpType)>,
-    locals: FxHashMap<SymId, (PointerValue<'ctx>, PinpType)>,
+    // A stack of local scope frames mirroring sema: a function (or the entry) pushes a base frame,
+    // and every control-flow body pushes another. Bare-name resolution searches `locals[fn_base..]`
+    // outward, so an assignment mutates the nearest enclosing local while a name new to all frames
+    // becomes a non-escaping body-local (its slot is still alloca'd in the entry block).
+    locals: Vec<FxHashMap<SymId, (PointerValue<'ctx>, PinpType)>>,
+    fn_base: usize,
     in_function: bool,
 }
 
@@ -155,9 +161,58 @@ impl<'ctx, 'ast> CodeGen<'ctx, 'ast> {
             ast,
             functions: FxHashMap::default(),
             globals: FxHashMap::default(),
-            locals: FxHashMap::default(),
+            locals: Vec::new(),
+            fn_base: 0,
             in_function: false,
         }
+    }
+
+    fn push_scope(&mut self) {
+        self.locals.push(FxHashMap::default());
+    }
+
+    fn pop_scope(&mut self) {
+        self.locals.pop();
+    }
+
+    /// The function currently being emitted into — the parent of the active basic block. Used to
+    /// append the new blocks that `if`/`while`/`loop` need.
+    fn current_function(&self) -> FunctionValue<'ctx> {
+        self.builder
+            .get_insert_block()
+            .expect("an active block")
+            .get_parent()
+            .expect("a block has a parent function")
+    }
+
+    /// The slot+type of the nearest enclosing local binding of `sym`, searched innermost-first down
+    /// to the current function base (never the global frame).
+    fn find_local(&self, sym: SymId) -> Option<(PointerValue<'ctx>, PinpType)> {
+        self.locals[self.fn_base..]
+            .iter()
+            .rev()
+            .find_map(|frame| frame.get(&sym).copied())
+    }
+
+    /// Allocates a slot in the current function's entry block (not at the live insert point), so the
+    /// alloca dominates every use and is not re-run — growing the stack — inside a loop body.
+    fn alloca_at_entry(&self, ty: PinpType) -> Result<PointerValue<'ctx>, String> {
+        let current = self.builder.get_insert_block().expect("an active block");
+        let entry = current
+            .get_parent()
+            .expect("a block has a parent function")
+            .get_first_basic_block()
+            .expect("a function has an entry block");
+        match entry.get_first_instruction() {
+            Some(first) => self.builder.position_before(&first),
+            None => self.builder.position_at_end(entry),
+        }
+        let slot = self
+            .builder
+            .build_alloca(self.basic_type(ty), "local")
+            .map_err(err)?;
+        self.builder.position_at_end(current);
+        Ok(slot)
     }
 
     fn int_type(&self) -> IntType<'ctx> {
@@ -238,6 +293,8 @@ impl<'ctx, 'ast> CodeGen<'ctx, 'ast> {
         self.builder.position_at_end(entry);
 
         self.locals.clear();
+        self.locals.push(FxHashMap::default()); // function base frame
+        self.fn_base = 0;
         self.in_function = true;
         // Give each parameter an alloca so reads/writes are uniform with locals.
         for (i, param) in func.params.iter().enumerate() {
@@ -247,19 +304,23 @@ impl<'ctx, 'ast> CodeGen<'ctx, 'ast> {
                 .map_err(err)?;
             let incoming = function.get_nth_param(i as u32).expect("parameter count");
             self.builder.build_store(slot, incoming).map_err(err)?;
-            self.locals.insert(param.name, (slot, param.param_type));
+            self.locals[0].insert(param.name, (slot, param.param_type));
         }
 
         for stmt in &func.body.stmts {
             self.gen_stmt(stmt)?;
         }
 
+        let result = func
+            .body
+            .result
+            .expect("a function body always ends in a result expression");
         if func.return_type == PinpType::Void {
-            self.gen_expr(func.body.result)?; // side effects only
+            self.gen_expr(result)?; // side effects only
             self.builder.build_return(None).map_err(err)?;
         } else {
-            let value = self.expect_value(func.body.result)?;
-            let value = self.promote(value, self.ast.type_of(func.body.result), func.return_type);
+            let value = self.expect_value(result)?;
+            let value = self.promote(value, self.ast.type_of(result), func.return_type);
             self.builder.build_return(Some(&value)).map_err(err)?;
         }
         self.in_function = false;
@@ -282,6 +343,9 @@ impl<'ctx, 'ast> CodeGen<'ctx, 'ast> {
         let entry_fn = self.module.add_function(ENTRY, fn_type, None);
         let block = self.context.append_basic_block(entry_fn, "entry");
         self.builder.position_at_end(block);
+        self.locals.clear();
+        self.locals.push(FxHashMap::default()); // entry base frame, for control-flow body-locals
+        self.fn_base = 0;
         self.in_function = false;
 
         let last = self.ast.top_level.len().wrapping_sub(1);
@@ -317,7 +381,73 @@ impl<'ctx, 'ast> CodeGen<'ctx, 'ast> {
                 self.builder.build_store(ptr, stored).map_err(err)?;
                 Ok(Some(value))
             }
+            Stmt::While { cond, body } => {
+                let function = self.current_function();
+                let header = self.context.append_basic_block(function, "while_header");
+                let body_bb = self.context.append_basic_block(function, "while_body");
+                let exit = self.context.append_basic_block(function, "while_exit");
+                self.builder
+                    .build_unconditional_branch(header)
+                    .map_err(err)?;
+
+                self.builder.position_at_end(header);
+                let cond_val = self.expect_value(*cond)?.into_int_value();
+                self.builder
+                    .build_conditional_branch(cond_val, body_bb, exit)
+                    .map_err(err)?;
+
+                self.builder.position_at_end(body_bb);
+                self.gen_block(body)?; // run for effect
+                self.builder
+                    .build_unconditional_branch(header)
+                    .map_err(err)?; // back-edge
+
+                self.builder.position_at_end(exit);
+                Ok(None)
+            }
+            Stmt::Loop { body, cond, until } => {
+                let function = self.current_function();
+                let body_bb = self.context.append_basic_block(function, "loop_body");
+                let exit = self.context.append_basic_block(function, "loop_exit");
+                self.builder
+                    .build_unconditional_branch(body_bb)
+                    .map_err(err)?;
+
+                self.builder.position_at_end(body_bb);
+                self.gen_block(body)?;
+                // Post-test: repeat while `cond` holds; `until` flips the sense (repeat while false).
+                let cond_val = self.expect_value(*cond)?.into_int_value();
+                let (true_bb, false_bb) = if *until {
+                    (exit, body_bb)
+                } else {
+                    (body_bb, exit)
+                };
+                self.builder
+                    .build_conditional_branch(cond_val, true_bb, false_bb)
+                    .map_err(err)?;
+
+                self.builder.position_at_end(exit);
+                Ok(None)
+            }
         }
+    }
+
+    /// Emits a block's statements then its optional result, each in a fresh local scope so any
+    /// name introduced here does not escape. Returns the result value (if the block ends in one).
+    fn gen_block(
+        &mut self,
+        block: &crate::parser::Block,
+    ) -> Result<Option<BasicValueEnum<'ctx>>, String> {
+        self.push_scope();
+        for stmt in &block.stmts {
+            self.gen_stmt(stmt)?;
+        }
+        let result = match block.result {
+            Some(e) => self.gen_expr(e)?,
+            None => None,
+        };
+        self.pop_scope();
+        Ok(result)
     }
 
     /// Resolves an assignable place to its pointer, creating a function-local
@@ -329,18 +459,24 @@ impl<'ctx, 'ast> CodeGen<'ctx, 'ast> {
     ) -> Result<(PointerValue<'ctx>, PinpType), String> {
         match place {
             Place::Global(sym) => Ok(self.globals[&sym]),
-            Place::Local(sym) if !self.in_function => Ok(self.globals[&sym]),
             Place::Local(sym) => {
-                if let Some(slot) = self.locals.get(&sym) {
-                    Ok(*slot)
-                } else {
-                    let slot = self
-                        .builder
-                        .build_alloca(self.basic_type(rhs_type), "local")
-                        .map_err(err)?;
-                    self.locals.insert(sym, (slot, rhs_type));
-                    Ok((slot, rhs_type))
+                // Mutate the nearest enclosing local if there is one.
+                if let Some(slot) = self.find_local(sym) {
+                    return Ok(slot);
                 }
+                // At the top level a bare name not held in any local frame is a module global.
+                if !self.in_function {
+                    if let Some(slot) = self.globals.get(&sym) {
+                        return Ok(*slot);
+                    }
+                }
+                // Otherwise introduce a fresh body-local, its slot alloca'd in the entry block.
+                let slot = self.alloca_at_entry(rhs_type)?;
+                self.locals
+                    .last_mut()
+                    .unwrap()
+                    .insert(sym, (slot, rhs_type));
+                Ok((slot, rhs_type))
             }
         }
     }
@@ -384,15 +520,100 @@ impl<'ctx, 'ast> CodeGen<'ctx, 'ast> {
             }
             Node::Bin { op, lhs, rhs } => self.gen_bin(e, *op, *lhs, *rhs)?,
             Node::Call { callee, args } => return self.gen_call(*callee, args),
+            Node::If { .. } => return self.gen_if(e),
         };
         Ok(Some(value))
     }
 
+    // Lower an `if`/`elif`/`else` (and the one-line ternary, which is a single-arm `If`) as a chain
+    // of diamonds joined at a merge block. When the node has a value (an `else` is present and every
+    // branch yields one), a `phi` in the merge selects the taken branch's value; otherwise the `if`
+    // runs purely for effect and yields nothing.
+    fn gen_if(&mut self, e: ExprId) -> Result<Option<BasicValueEnum<'ctx>>, String> {
+        let result_type = self.ast.type_of(e);
+        let Node::If { arms, els } = self.ast.node(e) else {
+            unreachable!("gen_if on a non-If node")
+        };
+        let function = self.current_function();
+        let merge_bb = self.context.append_basic_block(function, "if_merge");
+
+        // Value + originating block for each branch, for the merge `phi` (only when typed).
+        let mut incomings: Vec<(BasicValueEnum<'ctx>, BasicBlock<'ctx>)> = Vec::new();
+
+        for arm in arms {
+            let cond = self.expect_value(arm.cond)?.into_int_value(); // i1
+            let then_bb = self.context.append_basic_block(function, "if_then");
+            let next_bb = self.context.append_basic_block(function, "if_next");
+            self.builder
+                .build_conditional_branch(cond, then_bb, next_bb)
+                .map_err(err)?;
+
+            self.builder.position_at_end(then_bb);
+            let value = self.gen_block(&arm.body)?;
+            self.record_branch(&arm.body, value, result_type, &mut incomings)?;
+            self.builder
+                .build_unconditional_branch(merge_bb)
+                .map_err(err)?;
+
+            // Subsequent arms test in the fall-through block.
+            self.builder.position_at_end(next_bb);
+        }
+
+        // The trailing `else` (if any) occupies the final fall-through block; a missing `else`
+        // leaves it empty and the node is `Void`.
+        if let Some(els) = els {
+            let value = self.gen_block(els)?;
+            self.record_branch(els, value, result_type, &mut incomings)?;
+        }
+        self.builder
+            .build_unconditional_branch(merge_bb)
+            .map_err(err)?;
+
+        self.builder.position_at_end(merge_bb);
+        if result_type == PinpType::Void {
+            return Ok(None);
+        }
+        let phi = self
+            .builder
+            .build_phi(self.basic_type(result_type), "if")
+            .map_err(err)?;
+        for (value, block) in &incomings {
+            phi.add_incoming(&[(value, *block)]);
+        }
+        Ok(Some(phi.as_basic_value()))
+    }
+
+    // Record a branch's value (promoted to the `if`'s result type) and the block it flows from, for
+    // the merge `phi`. A no-op when the `if` is `Void`.
+    fn record_branch(
+        &self,
+        body: &crate::parser::Block,
+        value: Option<BasicValueEnum<'ctx>>,
+        result_type: PinpType,
+        incomings: &mut Vec<(BasicValueEnum<'ctx>, BasicBlock<'ctx>)>,
+    ) -> Result<(), String> {
+        if result_type == PinpType::Void {
+            return Ok(());
+        }
+        let result = body
+            .result
+            .expect("a typed if branch ends in an expression");
+        let value = value.expect("a typed if branch yields a value");
+        let value = self.promote(value, self.ast.type_of(result), result_type);
+        let end = self.builder.get_insert_block().expect("an active block");
+        incomings.push((value, end));
+        Ok(())
+    }
+
     fn load_var(&self, sym: SymId, global: bool) -> Result<BasicValueEnum<'ctx>, String> {
-        let (ptr, ty) = if global || !self.in_function {
+        // `::name` always reads a global; a bare name reads the nearest enclosing local, falling
+        // back to a global only at the top level (where top-level vars are module globals).
+        let (ptr, ty) = if global {
             self.globals[&sym]
+        } else if let Some(slot) = self.find_local(sym) {
+            slot
         } else {
-            self.locals[&sym]
+            self.globals[&sym]
         };
         self.builder
             .build_load(self.basic_type(ty), ptr, "load")
