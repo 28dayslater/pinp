@@ -539,7 +539,7 @@ impl<'src> Parser<'src> {
         let name_token = self.advance(); // Identifier
         let name = self.ast.intern(name_token.text);
         self.expect(TokenKind::LParen)?;
-        let params = self.parse_params()?;
+        let params = self.parse_params(name_token.line, name_token.col)?; // line/col anchor the hung-param rule
         self.expect(TokenKind::RParen)?;
 
         let has_return_type = self.peek().kind == TokenKind::Colon;
@@ -572,13 +572,25 @@ impl<'src> Parser<'src> {
         Ok(())
     }
 
-    fn parse_params(&mut self) -> Result<Vec<Param>, ParseError> {
+    fn parse_params(
+        &mut self,
+        function_line: u32,
+        function_col: u32,
+    ) -> Result<Vec<Param>, ParseError> {
         let mut params = Vec::new();
         if self.peek().kind == TokenKind::RParen {
             return Ok(params);
         }
         // The first parameter fixes the column that continuation lines must align to.
         let first = self.peek().clone();
+        // A first parameter hung onto a later line — the opening line left bare — must be indented
+        // past the function's own line, mirroring how a block body indents under its header.
+        if first.line != function_line && first.col <= function_col {
+            return Err(ParseError::Layout(format!(
+                "Parameter at line {} col {} must be indented past the function at column {function_col}.",
+                first.line, first.col
+            )));
+        }
         loop {
             let (line, col) = {
                 let token = self.peek();
@@ -1385,12 +1397,14 @@ mod tests {
     }
 
     // --- multiple-target assignment: line continuation -----------------------------------
-    // These keep explicit `\n` + literal spaces: the exact alignment column is what is under test.
 
     #[test]
     fn rhs_continuation_aligned_parses() {
-        // `1` is at column 8; the continued `2` aligns under it (7 leading spaces).
-        let ast = parse_ok("a, b = 1,\n       2");
+        // `1` is at column 8; the continued `2` aligns under it.
+        let ast = parse_ok(indoc! {"
+            a, b = 1,
+                   2
+        "});
         let (_, values) = last_assign(&ast);
         assert_eq!(values.len(), 2);
     }
@@ -1398,7 +1412,10 @@ mod tests {
     #[test]
     fn lhs_continuation_aligned_parses() {
         // The LHS wraps via a trailing comma; the continuation is at the same indent.
-        let ast = parse_ok("a,\nb = 1, 2");
+        let ast = parse_ok(indoc! {"
+            a,
+            b = 1, 2
+        "});
         let (target_lists, _) = last_assign(&ast);
         assert_eq!(target_lists[0].len(), 2);
     }
@@ -1406,7 +1423,12 @@ mod tests {
     #[test]
     fn continuation_inside_function_body_parses() {
         // The RHS continuation is indented past the body, exercising the pending-dedent path.
-        let ast = parse_ok("f(): int is\n    a, b = 1,\n           2\n    a + b");
+        let ast = parse_ok(indoc! {"
+            f(): int is
+                a, b = 1,
+                       2
+                a + b
+        "});
         let Stmt::Assign { values, .. } = &func(&ast, 0).body.stmts[0] else {
             panic!("Expected an assignment in the body.");
         };
@@ -1416,26 +1438,28 @@ mod tests {
     #[test]
     fn misaligned_continuation_is_error() {
         // `2` does not align to `1`'s column (8).
-        assert!(matches!(
-            parse("a, b = 1,\n  2"),
-            Err(ParseError::Layout(_))
-        ));
+        let src = indoc! {"
+            a, b = 1,
+              2
+        "};
+        assert!(matches!(parse(src), Err(ParseError::Layout(_))));
     }
 
     #[test]
     fn comma_starting_a_line_is_error() {
-        assert!(matches!(
-            parse("a, b\n, c = 1, 2, 3"),
-            Err(ParseError::Layout(_))
-        ));
+        let src = indoc! {"
+            a, b
+            , c = 1, 2, 3
+        "};
+        assert!(matches!(parse(src), Err(ParseError::Layout(_))));
     }
 
     #[test]
     fn trailing_comma_without_continuation_is_error() {
-        assert!(matches!(
-            parse("a, b = 1, 2,\n"),
-            Err(ParseError::Layout(_))
-        ));
+        let src = indoc! {"
+            a, b = 1, 2,
+        "};
+        assert!(matches!(parse(src), Err(ParseError::Layout(_))));
     }
 
     // --- bool literals, logical & comparison operators -----------------------------------
@@ -1598,11 +1622,15 @@ mod tests {
     #[test]
     fn wrapped_conditional_alignment() {
         // The `else` line must align to the column where the then-expression (`42`) starts.
-        parse_ok("fu = 42 + 142 if a > 42\n     else 42");
-        assert!(matches!(
-            parse("fu = 42 + 142 if a > 42\n   else 42"),
-            Err(ParseError::Layout(_))
-        ));
+        parse_ok(indoc! {"
+            fu = 42 + 142 if a > 42
+                 else 42
+        "});
+        let misaligned = indoc! {"
+            fu = 42 + 142 if a > 42
+               else 42
+        "};
+        assert!(matches!(parse(misaligned), Err(ParseError::Layout(_))));
     }
 
     #[test]
@@ -1771,7 +1799,21 @@ mod tests {
     #[test]
     fn multiline_params_aligned() {
         // `bb` aligns under `aa` (both column 3).
-        let ast = parse_ok("f(aa: float,\n  bb: float): float is aa^2 + bb^2");
+        let ast = parse_ok(indoc! {"
+            f(aa: float,
+              bb: float): float is aa^2 + bb^2
+        "});
+        assert_eq!(func(&ast, 0).params.len(), 2);
+    }
+
+    #[test]
+    fn hung_first_param_indented_parses() {
+        // The opening line is bare; the hung params are indented past the function line.
+        let ast = parse_ok(indoc! {"
+            f(
+                aa: float,
+                bb: float): float is aa + bb
+        "});
         assert_eq!(func(&ast, 0).params.len(), 2);
     }
 
@@ -1833,10 +1875,22 @@ mod tests {
     #[test]
     fn misaligned_param_is_error() {
         // `bb` is one column past `aa`.
-        assert!(matches!(
-            parse("f(aa: int,\n   bb: int): int is aa+bb"),
-            Err(ParseError::Layout(_))
-        ));
+        let src = indoc! {"
+            f(aa: int,
+               bb: int): int is aa+bb
+        "};
+        assert!(matches!(parse(src), Err(ParseError::Layout(_))));
+    }
+
+    #[test]
+    fn hung_first_param_not_indented_is_error() {
+        // The opening line is bare, but the hung first param is not indented past the function line.
+        let src = indoc! {"
+            f(
+            aa: int,
+            bb: int): int is aa+bb
+        "};
+        assert!(matches!(parse(src), Err(ParseError::Layout(_))));
     }
 
     #[test]

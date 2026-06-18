@@ -110,7 +110,11 @@ fn chained_promotes_into_existing_float_slot() {
 
 #[test]
 fn wrapped_rhs_evaluates() {
-    // The RHS wraps onto a second line aligned under the first value (`1` is at column 8). Kept as
-    // explicit `\n` + spaces, since the alignment column is exactly what this exercises.
-    assert_eq!(eval_int("a, b = 1,\n       2\na + b"), 3);
+    // The RHS wraps onto a second line aligned under the first value (`1` is at column 8).
+    let src = indoc! {"
+        a, b = 1,
+               2
+        a + b
+    "};
+    assert_eq!(eval_int(src), 3);
 }
