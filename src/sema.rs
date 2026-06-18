@@ -159,31 +159,24 @@ impl Analyzer<'_, '_> {
                 self.analyze_expr(*expr_id)?;
                 Ok(())
             }
-            Stmt::Assign { target, rhs } => {
-                let rhs_type = self.analyze_expr(*rhs)?;
-                if rhs_type == PinpType::Void {
-                    return Err(SemaError::Type("Cannot assign a void value.".into()));
+            Stmt::Assign {
+                target_lists,
+                values,
+            } => {
+                // Type every value first (rejecting `Void`), then assign positionally to each target
+                // group — arity (group length == value count) is guaranteed by the parser.
+                let mut value_types = Vec::with_capacity(values.len());
+                for value in values {
+                    let value_type = self.analyze_expr(*value)?;
+                    if value_type == PinpType::Void {
+                        return Err(SemaError::Type("Cannot assign a void value.".into()));
+                    }
+                    value_types.push(value_type);
                 }
-                match *target {
-                    Place::Global(sym_id) => match self.scopes[0].get(&sym_id).copied() {
-                        None => {
-                            return Err(SemaError::UnknownSymbol(format!(
-                                "Unknown global `::{}`.",
-                                self.name(sym_id)
-                            )))
-                        }
-                        Some(existing) => self.check_assignable(rhs_type, existing)?,
-                    },
-                    Place::Local(sym_id) => match self.lookup_assign_target(sym_id) {
-                        // Mutate the nearest enclosing binding if one exists (so a conditional
-                        // update or a loop counter alters the outer variable)...
-                        Some(existing) => self.check_assignable(rhs_type, existing)?,
-                        // ...otherwise introduce a fresh local in the innermost (current body)
-                        // scope, where it does not escape.
-                        None => {
-                            self.scopes.last_mut().unwrap().insert(sym_id, rhs_type);
-                        }
-                    },
+                for group in target_lists {
+                    for (place, value_type) in group.iter().zip(&value_types) {
+                        self.assign_place(*place, *value_type)?;
+                    }
                 }
                 Ok(())
             }
@@ -197,6 +190,28 @@ impl Analyzer<'_, '_> {
                 self.check_condition(*cond)?;
                 Ok(())
             }
+        }
+    }
+
+    /// Checks one assignment target against the type of the value bound to it: a `::global` must
+    /// already exist; a bare name mutates the nearest enclosing binding, or introduces a fresh
+    /// non-escaping local (the 0006 scoping rules).
+    fn assign_place(&mut self, place: Place, value_type: PinpType) -> Result<(), SemaError> {
+        match place {
+            Place::Global(sym_id) => match self.scopes[0].get(&sym_id).copied() {
+                None => Err(SemaError::UnknownSymbol(format!(
+                    "Unknown global `::{}`.",
+                    self.name(sym_id)
+                ))),
+                Some(existing) => self.check_assignable(value_type, existing),
+            },
+            Place::Local(sym_id) => match self.lookup_assign_target(sym_id) {
+                Some(existing) => self.check_assignable(value_type, existing),
+                None => {
+                    self.scopes.last_mut().unwrap().insert(sym_id, value_type);
+                    Ok(())
+                }
+            },
         }
     }
 
@@ -435,7 +450,7 @@ mod tests {
         let ast = analyzed(src);
         match ast.top_level.last().unwrap() {
             TopLevel::Stmt(Stmt::Expr(expr_id)) => ast.type_of(*expr_id),
-            TopLevel::Stmt(Stmt::Assign { rhs, .. }) => ast.type_of(*rhs),
+            TopLevel::Stmt(Stmt::Assign { values, .. }) => ast.type_of(*values.last().unwrap()),
             other => panic!("program does not end in an expression: {other:?}"),
         }
     }
@@ -455,12 +470,21 @@ mod tests {
 
     #[test]
     fn int_promotes_to_float() {
-        assert_eq!(root_type("a = 2\n2.0 * a"), PinpType::Float);
+        assert_eq!(
+            root_type(indoc! {"
+                a = 2
+                2.0 * a
+            "}),
+            PinpType::Float
+        );
     }
 
     #[test]
     fn assignment_then_reference() {
-        let ast = analyzed("a = 2 + 3\na * a");
+        let ast = analyzed(indoc! {"
+            a = 2 + 3
+            a * a
+        "});
         let TopLevel::Stmt(Stmt::Expr(expr_id)) = ast.top_level.last().unwrap() else {
             panic!("expected an expression statement");
         };
@@ -475,13 +499,105 @@ mod tests {
     fn reassignment_to_incompatible_type_is_error() {
         // Decision (0004): assignment is checked uniformly — re-binding to a non-assignable
         // type is an error, just like a compound assignment. `Float` is not assignable to `Int`.
-        assert!(matches!(sema_error("a = 1\na = 2.0"), SemaError::Type(_)));
+        assert!(matches!(
+            sema_error(indoc! {"
+                a = 1
+                a = 2.0
+            "}),
+            SemaError::Type(_)
+        ));
+    }
+
+    #[test]
+    fn parallel_assignment_introduces_each_target() {
+        // `a` (Int) and `b` (Float) are both defined and usable afterwards.
+        assert_eq!(
+            root_type(indoc! {"
+                a, b = 1, 2.0
+                a
+            "}),
+            PinpType::Int
+        );
+        assert_eq!(
+            root_type(indoc! {"
+                a, b = 1, 2.0
+                b
+            "}),
+            PinpType::Float
+        );
+    }
+
+    #[test]
+    fn chained_assignment_types_all_targets_from_value() {
+        assert_eq!(
+            root_type(indoc! {"
+                a = b = 2.0
+                a + b
+            "}),
+            PinpType::Float
+        );
+    }
+
+    #[test]
+    fn parallel_assignment_mutates_existing_targets() {
+        // Pre-existing Int `a`,`b`; a swap re-binds both (type-checked), staying Int.
+        assert_eq!(
+            root_type(indoc! {"
+                a = 1
+                b = 2
+                a, b = b, a
+                a
+            "}),
+            PinpType::Int
+        );
+    }
+
+    #[test]
+    fn parallel_assignment_rejects_void_value() {
+        // `noop` is void (its body is an `else`-less `if`, which is Void); binding its result fails.
+        assert!(matches!(
+            sema_error(indoc! {"
+                noop(c: bool) is
+                    if c
+                        0
+                a, b = 1, noop(true)
+            "}),
+            SemaError::Type(_)
+        ));
+    }
+
+    #[test]
+    fn parallel_assignment_type_mismatch_is_error() {
+        // `a` is Int; re-binding it to a Float in a parallel assignment is rejected.
+        assert!(matches!(
+            sema_error(indoc! {"
+                a = 1
+                a, b = 2.0, 3
+            "}),
+            SemaError::Type(_)
+        ));
+    }
+
+    #[test]
+    fn parallel_assignment_to_unknown_global_is_error() {
+        // A `::global` target must already exist, even in a multi-target assignment.
+        assert!(matches!(
+            sema_error("a, ::g = 1, 2"),
+            SemaError::UnknownSymbol(_)
+        ));
     }
 
     #[test]
     fn reassignment_promotes_into_float_slot() {
         // `a` is Float; re-assigning an Int value is fine (Int promotes), and `a` stays Float.
-        assert_eq!(root_type("a = 1.0\na = 2\na"), PinpType::Float);
+        assert_eq!(
+            root_type(indoc! {"
+                a = 1.0
+                a = 2
+                a
+            "}),
+            PinpType::Float
+        );
     }
 
     // --- bool, comparisons & logicals ----------------------------------------------------

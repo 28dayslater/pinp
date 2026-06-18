@@ -136,13 +136,17 @@ pub enum Place {
     Global(SymId),
 }
 
-/// A statement: an assignment to a [`Place`], or an expression evaluated for its value. A
-/// compound assignment (`x += e`) is desugared at parse time into an `Assign`.
+/// A statement: an assignment, or an expression evaluated for its value.
+///
+/// `Assign` follows Python's `(target_list =)+ expr_list`: the `values` are evaluated once (in full,
+/// before any store, so `a, b = b, a` swaps), then assigned positionally to every target group in
+/// `target_lists`. Single `a = 1` is the degenerate `target_lists: [[a]], values: [rhs]`; a compound
+/// assignment (`x += e`) desugars at parse time into that same single-target, single-value shape.
 #[derive(Debug, Clone, PartialEq)]
 pub enum Stmt {
     Assign {
-        target: Place,
-        rhs: ExprId,
+        target_lists: Vec<Vec<Place>>,
+        values: Vec<ExprId>,
     },
     Expr(ExprId),
     /// Pre-test loop: run `body` while `cond` holds.
@@ -380,22 +384,18 @@ fn comparison_symbol(op: BinOp) -> &'static str {
     }
 }
 
-enum AssignKind {
-    Plain,
-    Compound(BinOp), // += *= ...
-}
-
-fn assign_op(kind: TokenKind) -> Option<AssignKind> {
+// The binary operator behind a compound-assignment token (`+=` -> `Add`, …). Plain `=` is not a
+// compound op and is handled directly. Compound assignment is single-target, single-value.
+fn compound_assign_op(kind: TokenKind) -> Option<BinOp> {
     use TokenKind::*;
     Some(match kind {
-        Equal => AssignKind::Plain,
-        PlusEq => AssignKind::Compound(BinOp::Add),
-        MinusEq => AssignKind::Compound(BinOp::Sub),
-        StarEq => AssignKind::Compound(BinOp::Mul),
-        SlashEq => AssignKind::Compound(BinOp::Div),
-        CaretEq => AssignKind::Compound(BinOp::Pow),
-        DivEq => AssignKind::Compound(BinOp::IntDiv),
-        ModEq => AssignKind::Compound(BinOp::Mod),
+        PlusEq => BinOp::Add,
+        MinusEq => BinOp::Sub,
+        StarEq => BinOp::Mul,
+        SlashEq => BinOp::Div,
+        CaretEq => BinOp::Pow,
+        DivEq => BinOp::IntDiv,
+        ModEq => BinOp::Mod,
         _ => return None,
     })
 }
@@ -830,57 +830,142 @@ impl<'src> Parser<'src> {
             TokenKind::KwLoop => return self.parse_loop(),
             _ => {}
         }
-        // An assignment is a `place` (bare name or `::name`) immediately followed by an
-        // assignment operator; anything else is an expression statement.
-        let is_global =
-            if self.peek().kind == TokenKind::Identifier && assign_op(self.at(1)).is_some() {
-                Some(false)
-            } else if self.peek().kind == TokenKind::ColonColon
-                && self.at(1) == TokenKind::Identifier
-                && assign_op(self.at(2)).is_some()
-            {
-                Some(true)
-            } else {
-                None
-            };
+        // Otherwise parse as Python does: one or more comma-separated lists joined by `=`. A single
+        // list with no following `=` is an expression statement; a `place <op>= e` is compound
+        // assignment; everything else is a plain (parallel/chained) assignment.
+        let first_group = self.parse_expr_list()?;
 
-        if let Some(global) = is_global {
-            if global {
-                self.advance(); // '::'
+        // Compound assignment is single-target, single-value: `place <op>= e`.
+        if first_group.len() == 1 {
+            if let Some(op) = compound_assign_op(self.peek().kind) {
+                let place = self.expr_as_place(first_group[0])?;
+                self.advance(); // the compound operator
+                let rhs = self.parse_expr(0)?;
+                return Ok(self.finish_compound(place, op, rhs));
             }
-            let name = self.advance().text; // Identifier
-            let sym_id = self.ast.intern(name);
-            let op = assign_op(self.advance().kind).unwrap();
-            let rhs = self.parse_expr(0)?;
-            let place = if global {
-                Place::Global(sym_id)
-            } else {
-                Place::Local(sym_id)
-            };
-            Ok(self.finish_assign(place, op, rhs))
-        } else {
-            let expr_id = self.parse_expr(0)?;
-            Ok(Stmt::Expr(expr_id))
+        }
+
+        if self.peek().kind != TokenKind::Equal {
+            // No `=` — an expression statement, which is exactly one expression.
+            if first_group.len() == 1 {
+                return Ok(Stmt::Expr(first_group[0]));
+            }
+            // A comma-list with no `=`: if the next line starts with a comma, the user tried a
+            // leading-comma continuation — the comma must instead trail the current line.
+            if self.next_line_starts_with_comma() {
+                return Err(ParseError::Layout(
+                    "Multi-line assignment: comma must not start a line.".into(),
+                ));
+            }
+            return Err(ParseError::Unexpected(
+                "Expected `=` after a comma-separated target list.".into(),
+            ));
+        }
+
+        // Plain assignment: `target_list = (target_list =)* expr_list`. The trailing group is the
+        // values; every earlier group is a list of targets.
+        let mut groups = vec![first_group];
+        while self.peek().kind == TokenKind::Equal {
+            self.advance(); // '='
+            groups.push(self.parse_expr_list()?);
+        }
+        let values = groups.pop().expect("the first group is always present");
+        let mut target_lists = Vec::with_capacity(groups.len());
+        for group in groups {
+            // Convert each target before the arity check, so a non-place like `1, 2 = 3` reports the
+            // more specific "invalid target" rather than an arity mismatch.
+            let mut targets = Vec::with_capacity(group.len());
+            for expr_id in group {
+                targets.push(self.expr_as_place(expr_id)?);
+            }
+            if targets.len() != values.len() {
+                return Err(ParseError::Unexpected(format!(
+                    "Assignment has {} target(s) but {} value(s).",
+                    targets.len(),
+                    values.len()
+                )));
+            }
+            target_lists.push(targets);
+        }
+        Ok(Stmt::Assign {
+            target_lists,
+            values,
+        })
+    }
+
+    // A comma-separated list of expressions, e.g. `1, 2, 3` or an assignment's target/value list.
+    // A trailing comma continues the list onto the next line (an assignment LHS or RHS that wraps);
+    // the continuation must align to the column where the list began.
+    fn parse_expr_list(&mut self) -> Result<Vec<ExprId>, ParseError> {
+        let list_col = self.peek().col;
+        let mut exprs = vec![self.parse_expr(0)?];
+        while self.peek().kind == TokenKind::Comma {
+            self.advance(); // ','
+                            // A comma at the end of a line continues the list; the next item aligns to `list_col`.
+            if self.peek().kind == TokenKind::Newline {
+                self.consume_list_continuation(list_col)?;
+            }
+            exprs.push(self.parse_expr(0)?);
+        }
+        Ok(exprs)
+    }
+
+    // Skip the layout tokens of a wrapped comma-list and require the continuation to start at
+    // `list_col`. A continuation indented past the enclosing block opens an `Indent`, banked into
+    // `pending_dedents` so `parse_block` later swallows the matching `Dedent` (as for a wrapped
+    // `else`); a same-indent continuation is just a `Newline`.
+    fn consume_list_continuation(&mut self, list_col: u32) -> Result<(), ParseError> {
+        while matches!(
+            self.peek().kind,
+            TokenKind::Newline | TokenKind::Indent | TokenKind::Dedent
+        ) {
+            if self.peek().kind == TokenKind::Indent {
+                self.pending_dedents += 1;
+            }
+            self.pos += 1;
+        }
+        if self.peek().col != list_col {
+            return Err(ParseError::Layout(format!(
+                "Continuation at column {} must align to the list's column {list_col}.",
+                self.peek().col
+            )));
+        }
+        Ok(())
+    }
+
+    // Non-consuming: does the next line (past the layout tokens at the cursor) begin with a comma?
+    // Used only to give the specific "comma must not start a line" diagnostic.
+    fn next_line_starts_with_comma(&self) -> bool {
+        let mut index = self.pos;
+        while matches!(
+            self.tokens[index].kind,
+            TokenKind::Newline | TokenKind::Indent | TokenKind::Dedent
+        ) {
+            index += 1;
+        }
+        self.tokens[index].kind == TokenKind::Comma
+    }
+
+    // Reinterpret an already-parsed expression as an assignment target. Only a bare name or `::name`
+    // is a valid place; anything else (a literal, a call, an arithmetic node) is rejected. The read
+    // `Var`/`Global` node parsed for the target is left unused in the arena.
+    fn expr_as_place(&self, expr_id: ExprId) -> Result<Place, ParseError> {
+        match self.ast.node(expr_id) {
+            Node::Var(sym_id) => Ok(Place::Local(*sym_id)),
+            Node::Global(sym_id) => Ok(Place::Global(*sym_id)),
+            _ => Err(ParseError::Unexpected(
+                "Invalid assignment target; only names and `::globals` can be assigned.".into(),
+            )),
         }
     }
 
-    // Desugar `place <op>= e` into `place = place <op> e`. Purely structural — the binding and
-    // type checks happen later in sema.
-    fn finish_assign(&mut self, place: Place, op: AssignKind, rhs: ExprId) -> Stmt {
-        match op {
-            AssignKind::Plain => Stmt::Assign { target: place, rhs },
-            AssignKind::Compound(binop) => {
-                let read = self.ast.push(Node::from(place));
-                let combined = self.ast.push(Node::Bin {
-                    op: binop,
-                    lhs: read,
-                    rhs,
-                });
-                Stmt::Assign {
-                    target: place,
-                    rhs: combined,
-                }
-            }
+    // Desugar `place <op>= e` into `place = place <op> e` — the single-target, single-value shape.
+    fn finish_compound(&mut self, place: Place, op: BinOp, rhs: ExprId) -> Stmt {
+        let read = self.ast.push(Node::from(place));
+        let combined = self.ast.push(Node::Bin { op, lhs: read, rhs });
+        Stmt::Assign {
+            target_lists: vec![vec![place]],
+            values: vec![combined],
         }
     }
 
@@ -1121,7 +1206,7 @@ mod tests {
     fn root(ast: &Ast) -> ExprId {
         match ast.top_level.last().unwrap() {
             TopLevel::Stmt(Stmt::Expr(expr_id)) => *expr_id,
-            TopLevel::Stmt(Stmt::Assign { rhs, .. }) => *rhs,
+            TopLevel::Stmt(Stmt::Assign { values, .. }) => *values.last().unwrap(),
             other => panic!("Program does not end in an expression: {other:?}."),
         }
     }
@@ -1196,24 +1281,161 @@ mod tests {
 
     #[test]
     fn compound_assign_desugars_to_read_and_op() {
-        // `b += 1` becomes `b = (b + 1)`: an Assign whose rhs is a Bin reading the target.
-        let ast = parse_ok("b = 1\nb += 1");
+        // `b += 1` becomes `b = (b + 1)`: a single-target Assign whose value is a Bin reading `b`.
+        let ast = parse_ok(indoc! {"
+            b = 1
+            b += 1
+        "});
         let TopLevel::Stmt(Stmt::Assign {
-            target: Place::Local(_),
-            rhs,
+            target_lists,
+            values,
         }) = ast.top_level.last().unwrap()
         else {
             panic!("Expected a desugared local assignment.");
         };
+        assert_eq!(target_lists.len(), 1);
+        assert!(matches!(target_lists[0].as_slice(), [Place::Local(_)]));
         let Node::Bin {
             op: BinOp::Add,
             lhs,
             ..
-        } = *ast.node(*rhs)
+        } = *ast.node(values[0])
         else {
-            panic!("Expected the rhs to be an Add.");
+            panic!("Expected the value to be an Add.");
         };
         assert!(matches!(ast.node(lhs), Node::Var(_)));
+    }
+
+    // --- multiple-target assignment ------------------------------------------------------
+
+    fn last_assign<'a>(ast: &'a Ast) -> (&'a Vec<Vec<Place>>, &'a Vec<ExprId>) {
+        let TopLevel::Stmt(Stmt::Assign {
+            target_lists,
+            values,
+        }) = ast.top_level.last().unwrap()
+        else {
+            panic!("Expected an assignment statement.");
+        };
+        (target_lists, values)
+    }
+
+    #[test]
+    fn parallel_assignment_shape() {
+        let ast = parse_ok("a, b = 1, 2");
+        let (target_lists, values) = last_assign(&ast);
+        assert_eq!(target_lists.len(), 1);
+        assert_eq!(target_lists[0].len(), 2);
+        assert_eq!(values.len(), 2);
+    }
+
+    #[test]
+    fn chained_assignment_shape() {
+        let ast = parse_ok("a = b = c = 0");
+        let (target_lists, values) = last_assign(&ast);
+        assert_eq!(target_lists.len(), 3); // a, b, c each their own group
+        assert!(target_lists.iter().all(|group| group.len() == 1));
+        assert_eq!(values.len(), 1);
+    }
+
+    #[test]
+    fn combined_parallel_and_chained_shape() {
+        let ast = parse_ok("a, b = c, d = 1, 2");
+        let (target_lists, values) = last_assign(&ast);
+        assert_eq!(target_lists.len(), 2);
+        assert!(target_lists.iter().all(|group| group.len() == 2));
+        assert_eq!(values.len(), 2);
+    }
+
+    #[test]
+    fn single_assignment_is_degenerate_multi() {
+        let ast = parse_ok("a = 1");
+        let (target_lists, values) = last_assign(&ast);
+        assert_eq!(target_lists.len(), 1);
+        assert_eq!(target_lists[0].len(), 1);
+        assert_eq!(values.len(), 1);
+    }
+
+    #[test]
+    fn arity_mismatch_is_error() {
+        assert!(matches!(parse("a, b = 1"), Err(ParseError::Unexpected(_))));
+        assert!(matches!(
+            parse("a, b = c = 1, 2"),
+            Err(ParseError::Unexpected(_))
+        ));
+    }
+
+    #[test]
+    fn non_place_target_is_error() {
+        assert!(matches!(parse("1 = 2"), Err(ParseError::Unexpected(_))));
+        assert!(matches!(parse("a + b = 1"), Err(ParseError::Unexpected(_))));
+    }
+
+    #[test]
+    fn compound_assign_in_multi_target_is_error() {
+        // Compound assignment is single-target only; `a, b += 1, 2` is rejected.
+        assert!(matches!(
+            parse("a, b += 1, 2"),
+            Err(ParseError::Unexpected(_))
+        ));
+    }
+
+    #[test]
+    fn bare_comma_list_without_assignment_is_error() {
+        assert!(matches!(parse("a, b"), Err(ParseError::Unexpected(_))));
+    }
+
+    // --- multiple-target assignment: line continuation -----------------------------------
+    // These keep explicit `\n` + literal spaces: the exact alignment column is what is under test.
+
+    #[test]
+    fn rhs_continuation_aligned_parses() {
+        // `1` is at column 8; the continued `2` aligns under it (7 leading spaces).
+        let ast = parse_ok("a, b = 1,\n       2");
+        let (_, values) = last_assign(&ast);
+        assert_eq!(values.len(), 2);
+    }
+
+    #[test]
+    fn lhs_continuation_aligned_parses() {
+        // The LHS wraps via a trailing comma; the continuation is at the same indent.
+        let ast = parse_ok("a,\nb = 1, 2");
+        let (target_lists, _) = last_assign(&ast);
+        assert_eq!(target_lists[0].len(), 2);
+    }
+
+    #[test]
+    fn continuation_inside_function_body_parses() {
+        // The RHS continuation is indented past the body, exercising the pending-dedent path.
+        let ast = parse_ok("f(): int is\n    a, b = 1,\n           2\n    a + b");
+        let Stmt::Assign { values, .. } = &func(&ast, 0).body.stmts[0] else {
+            panic!("Expected an assignment in the body.");
+        };
+        assert_eq!(values.len(), 2);
+    }
+
+    #[test]
+    fn misaligned_continuation_is_error() {
+        // `2` does not align to `1`'s column (8).
+        assert!(matches!(
+            parse("a, b = 1,\n  2"),
+            Err(ParseError::Layout(_))
+        ));
+    }
+
+    #[test]
+    fn comma_starting_a_line_is_error() {
+        assert!(matches!(
+            parse("a, b\n, c = 1, 2, 3"),
+            Err(ParseError::Layout(_))
+        ));
+    }
+
+    #[test]
+    fn trailing_comma_without_continuation_is_error() {
+        assert!(matches!(
+            parse("a, b = 1, 2,\n"),
+            Err(ParseError::Layout(_))
+        ));
     }
 
     // --- bool literals, logical & comparison operators -----------------------------------
@@ -1462,7 +1684,11 @@ mod tests {
     #[test]
     fn loop_without_trailing_condition_is_error() {
         assert!(matches!(
-            parse("loop\n    a\nb"),
+            parse(indoc! {"
+                loop
+                    a
+                b
+            "}),
             Err(ParseError::Unexpected(_))
         ));
     }
@@ -1570,13 +1796,11 @@ mod tests {
                 ::g += 1
                 a + ::g
         "});
-        assert!(matches!(
-            func(&ast, 1).body.stmts[0],
-            Stmt::Assign {
-                target: Place::Global(_),
-                ..
-            }
-        ));
+        let Stmt::Assign { target_lists, .. } = &func(&ast, 1).body.stmts[0] else {
+            panic!("Expected a global compound assignment.");
+        };
+        assert_eq!(target_lists.len(), 1);
+        assert!(matches!(target_lists[0].as_slice(), [Place::Global(_)]));
     }
 
     #[test]

@@ -90,18 +90,18 @@ impl Jit {
         }
     }
 
-    /// Looks up a JITed symbol and returns it as the function-pointer type `F`.
+    /// Looks up a JITed symbol and returns it as the function-pointer type `FPT`.
     ///
     /// # Safety
     ///
-    /// `F` must be a function-pointer type whose signature matches the symbol's
+    /// `FPT` must be a function-pointer type whose signature matches the symbol's
     /// actual ABI, or calling it is undefined behaviour.
-    pub unsafe fn lookup<F: Copy>(&self, name: &str) -> Result<F, String> {
+    pub unsafe fn lookup<FPT: Copy>(&self, name: &str) -> Result<FPT, String> {
         let symbol = CString::new(name).map_err(|error| error.to_string())?;
         let mut address: LLVMOrcExecutorAddress = 0;
         check_error(LLVMOrcLLJITLookup(self.jit, &mut address, symbol.as_ptr()))?;
-        // `address` is the symbol's runtime address; reinterpret it as `F`.
-        Ok(std::mem::transmute_copy::<LLVMOrcExecutorAddress, F>(
+        // `address` is the symbol's runtime address; reinterpret it as `FPT`.
+        Ok(std::mem::transmute_copy::<LLVMOrcExecutorAddress, FPT>(
             &address,
         ))
     }
@@ -251,20 +251,28 @@ impl<'ctx, 'ast> CodeGen<'ctx, 'ast> {
     /// Declares a module global for every symbol assigned at the top level.
     fn declare_globals(&mut self) {
         for item in &self.ast.top_level {
-            if let TopLevel::Stmt(Stmt::Assign { target, rhs }) = item {
-                let sym_id = place_sym(*target);
-                if self.globals.contains_key(&sym_id) {
-                    continue;
+            if let TopLevel::Stmt(Stmt::Assign {
+                target_lists,
+                values,
+            }) = item
+            {
+                for group in target_lists {
+                    for (place, value) in group.iter().zip(values) {
+                        let sym_id = place_sym(*place);
+                        if self.globals.contains_key(&sym_id) {
+                            continue;
+                        }
+                        let value_type = self.ast.type_of(*value);
+                        let name = self.ast.names[sym_id.value()];
+                        let global =
+                            self.module
+                                .add_global(self.basic_type(value_type), None, name);
+                        global.set_linkage(Linkage::Internal);
+                        global.set_initializer(&self.zero(value_type));
+                        self.globals
+                            .insert(sym_id, (global.as_pointer_value(), value_type));
+                    }
                 }
-                let value_type = self.ast.type_of(*rhs);
-                let name = self.ast.names[sym_id.value()];
-                let global = self
-                    .module
-                    .add_global(self.basic_type(value_type), None, name);
-                global.set_linkage(Linkage::Internal);
-                global.set_initializer(&self.zero(value_type));
-                self.globals
-                    .insert(sym_id, (global.as_pointer_value(), value_type));
             }
         }
     }
@@ -336,7 +344,9 @@ impl<'ctx, 'ast> CodeGen<'ctx, 'ast> {
     fn gen_entry(&mut self) -> Result<PinpType, String> {
         let result_type = match self.ast.top_level.last() {
             Some(TopLevel::Stmt(Stmt::Expr(e))) => self.ast.type_of(*e),
-            Some(TopLevel::Stmt(Stmt::Assign { rhs, .. })) => self.ast.type_of(*rhs),
+            Some(TopLevel::Stmt(Stmt::Assign { values, .. })) => {
+                self.ast.type_of(*values.last().unwrap())
+            }
             _ => PinpType::Void,
         };
 
@@ -378,12 +388,25 @@ impl<'ctx, 'ast> CodeGen<'ctx, 'ast> {
     fn gen_stmt(&mut self, stmt: &Stmt) -> Result<Option<BasicValueEnum<'ctx>>, String> {
         match stmt {
             Stmt::Expr(expr_id) => self.gen_expr(*expr_id),
-            Stmt::Assign { target, rhs } => {
-                let value = self.expect_value(*rhs)?;
-                let (pointer, slot_type) = self.resolve_place(*target, self.ast.type_of(*rhs))?;
-                let stored = self.promote(value, self.ast.type_of(*rhs), slot_type);
-                self.builder.build_store(pointer, stored).map_err(err)?;
-                Ok(Some(value))
+            Stmt::Assign {
+                target_lists,
+                values,
+            } => {
+                // Evaluate every value first (so `a, b = b, a` swaps), then store to each target
+                // group. The SSA values are the temporaries; no extra slots needed.
+                let mut evaluated = Vec::with_capacity(values.len());
+                for value in values {
+                    evaluated.push((self.expect_value(*value)?, self.ast.type_of(*value)));
+                }
+                for group in target_lists {
+                    for (place, (value, value_type)) in group.iter().zip(&evaluated) {
+                        let (pointer, slot_type) = self.resolve_place(*place, *value_type)?;
+                        let stored = self.promote(*value, *value_type, slot_type);
+                        self.builder.build_store(pointer, stored).map_err(err)?;
+                    }
+                }
+                // The program result of a trailing assignment is the last value bound.
+                Ok(evaluated.last().map(|(value, _)| *value))
             }
             Stmt::While { cond, body } => {
                 let function = self.current_function();
