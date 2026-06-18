@@ -5,8 +5,11 @@ edition = "2021"
 license = "MIT"
 
 [features]
-# The LLVM backend is optional so the lexer/parser still build and test without a
-# system LLVM. Enable with `cargo build --features llvm` (needs LLVM 22 installed).
+# The LLVM backend is on by default — it is core to pinp (the whole point is compiling
+# to LLVM), so a plain `cargo build`/`cargo test` exercises the full pipeline (needs LLVM 22
+# installed). Build the front-end (lexer/parser/sema) alone — no system LLVM required — with
+# `cargo build --no-default-features`.
+default = ["llvm"]
 llvm = ["dep:inkwell"]
 
 [dependencies]
