@@ -34,7 +34,7 @@ fn comparisons() {
 fn bool_promotes_in_arithmetic() {
     assert_eq!(eval_int("true + true + false"), 2);
     assert_eq!(eval_int("(1 < 2) + (3 < 1)"), 1); // true + false = 1
-                                                  // Mirrors the spec's `bar*baz + (b1 > b2)`: comparison promoted into the sum.
+    // Mirrors the spec's `bar*baz + (b1 > b2)`: comparison promoted into the sum.
     assert_eq!(eval_int("2 * 3 + (5 > 2)"), 7);
 }
 

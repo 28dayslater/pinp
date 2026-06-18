@@ -429,7 +429,7 @@ impl Analyzer<'_, '_> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::parser::{parse, Node, Stmt, TopLevel};
+    use crate::parser::{Node, Stmt, TopLevel, parse};
     use indoc::indoc;
 
     /// Parse + analyze, returning the typed AST (panicking on any error).

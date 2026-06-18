@@ -22,7 +22,7 @@
 //! [`crate::sema::SemaError`]. Type annotations (`int`/`float`/`void`) are the one exception: they
 //! are resolved here while building the signature, since that is a fixed lexical mapping.
 
-use crate::lexer::{lex, Token, TokenKind};
+use crate::lexer::{Token, TokenKind, lex};
 use rustc_hash::{FxHashMap, FxHashSet};
 
 /// The type of every expression and binding. `Void` is the type of a function with no declared
@@ -487,7 +487,7 @@ impl<'src> Parser<'src> {
                     other => {
                         return Err(ParseError::Unexpected(format!(
                             "Unexpected token {other:?}."
-                        )))
+                        )));
                     }
                 }
             }
@@ -638,7 +638,7 @@ impl<'src> Parser<'src> {
                 other => {
                     return Err(ParseError::Unexpected(format!(
                         "Unexpected token {other:?}."
-                    )))
+                    )));
                 }
             }
             Ok(Block {
@@ -689,7 +689,7 @@ impl<'src> Parser<'src> {
                 other => {
                     return Err(ParseError::Unexpected(format!(
                         "Unexpected token {other:?}."
-                    )))
+                    )));
                 }
             }
             if self.peek().kind == TokenKind::Dedent {
@@ -729,7 +729,7 @@ impl<'src> Parser<'src> {
             other => {
                 return Err(ParseError::Unexpected(format!(
                     "Expected `while` or `until` after a loop body, found {other:?}."
-                )))
+                )));
             }
         };
         self.advance(); // 'while' / 'until'
@@ -836,13 +836,13 @@ impl<'src> Parser<'src> {
         let first_group = self.parse_expr_list()?;
 
         // Compound assignment is single-target, single-value: `place <op>= e`.
-        if first_group.len() == 1 {
-            if let Some(op) = compound_assign_op(self.peek().kind) {
-                let place = self.expr_as_place(first_group[0])?;
-                self.advance(); // the compound operator
-                let rhs = self.parse_expr(0)?;
-                return Ok(self.finish_compound(place, op, rhs));
-            }
+        if first_group.len() == 1
+            && let Some(op) = compound_assign_op(self.peek().kind)
+        {
+            let place = self.expr_as_place(first_group[0])?;
+            self.advance(); // the compound operator
+            let rhs = self.parse_expr(0)?;
+            return Ok(self.finish_compound(place, op, rhs));
         }
 
         if self.peek().kind != TokenKind::Equal {
@@ -901,7 +901,7 @@ impl<'src> Parser<'src> {
         let mut exprs = vec![self.parse_expr(0)?];
         while self.peek().kind == TokenKind::Comma {
             self.advance(); // ','
-                            // A comma at the end of a line continues the list; the next item aligns to `list_col`.
+            // A comma at the end of a line continues the list; the next item aligns to `list_col`.
             if self.peek().kind == TokenKind::Newline {
                 self.consume_list_continuation(list_col)?;
             }
@@ -1106,7 +1106,7 @@ impl<'src> Parser<'src> {
                     other => {
                         return Err(ParseError::Unexpected(format!(
                             "Unexpected token {other:?}."
-                        )))
+                        )));
                     }
                 }
             }
@@ -1171,14 +1171,14 @@ fn check_monotonic(operators: &[BinOp]) -> Result<(), ParseError> {
                 return Err(ParseError::Unexpected(format!(
                     "Cannot chain `{}`; it is not transitive.",
                     comparison_symbol(op)
-                )))
+                )));
             }
             Some(op_direction) if op_direction != direction => {
                 return Err(ParseError::Unexpected(format!(
                     "Cannot chain `{}` with `{}`.",
                     comparison_symbol(first),
                     comparison_symbol(op)
-                )))
+                )));
             }
             Some(_) => {}
         }
@@ -1734,10 +1734,12 @@ mod tests {
         let func_def = func(&ast, 0);
         assert_eq!(ast.names[func_def.name.value()], "fu");
         assert_eq!(func_def.params.len(), 3);
-        assert!(func_def
-            .params
-            .iter()
-            .all(|param| param.param_type == PinpType::Float));
+        assert!(
+            func_def
+                .params
+                .iter()
+                .all(|param| param.param_type == PinpType::Float)
+        );
         assert_eq!(func_def.return_type, PinpType::Float);
         assert!(func_def.body.stmts.is_empty());
 

@@ -31,7 +31,7 @@ use inkwell::values::{
 use rustc_hash::FxHashMap;
 
 use crate::parser::{
-    parse, Ast, BinOp, ExprId, Node, PinpType, Place, Stmt, SymId, TopLevel, UnOp,
+    Ast, BinOp, ExprId, Node, PinpType, Place, Stmt, SymId, TopLevel, UnOp, parse,
 };
 use crate::sema::analyze;
 
@@ -99,11 +99,14 @@ impl Jit {
     pub unsafe fn lookup<FPT: Copy>(&self, name: &str) -> Result<FPT, String> {
         let symbol = CString::new(name).map_err(|error| error.to_string())?;
         let mut address: LLVMOrcExecutorAddress = 0;
-        check_error(LLVMOrcLLJITLookup(self.jit, &mut address, symbol.as_ptr()))?;
-        // `address` is the symbol's runtime address; reinterpret it as `FPT`.
-        Ok(std::mem::transmute_copy::<LLVMOrcExecutorAddress, FPT>(
-            &address,
-        ))
+        // SAFETY: the caller guarantees `FPT` matches the symbol's ABI.
+        unsafe {
+            check_error(LLVMOrcLLJITLookup(self.jit, &mut address, symbol.as_ptr()))?;
+            // `address` is the symbol's runtime address; reinterpret it as `FPT`.
+            Ok(std::mem::transmute_copy::<LLVMOrcExecutorAddress, FPT>(
+                &address,
+            ))
+        }
     }
 }
 
@@ -122,10 +125,13 @@ unsafe fn check_error(error: LLVMErrorRef) -> Result<(), String> {
     if error.is_null() {
         return Ok(());
     }
-    let message = LLVMGetErrorMessage(error); // consumes `error`, returns owned C string
-    let owned = CStr::from_ptr(message).to_string_lossy().into_owned();
-    LLVMDisposeErrorMessage(message);
-    Err(owned)
+    // SAFETY: `error` is non-null here, so the caller's LLVM error pointer is live.
+    unsafe {
+        let message = LLVMGetErrorMessage(error); // consumes `error`, returns owned C string
+        let owned = CStr::from_ptr(message).to_string_lossy().into_owned();
+        LLVMDisposeErrorMessage(message);
+        Err(owned)
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -492,10 +498,10 @@ impl<'ctx, 'ast> CodeGen<'ctx, 'ast> {
                     return Ok(slot);
                 }
                 // At the top level a bare name not held in any local frame is a module global.
-                if !self.in_function {
-                    if let Some(slot) = self.globals.get(&sym) {
-                        return Ok(*slot);
-                    }
+                if !self.in_function
+                    && let Some(slot) = self.globals.get(&sym)
+                {
+                    return Ok(*slot);
                 }
                 // Otherwise introduce a fresh body-local, its slot alloca'd in the entry block.
                 let slot = self.alloca_at_entry(rhs_type)?;

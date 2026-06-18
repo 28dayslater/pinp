@@ -431,7 +431,9 @@ mod tests {
         "};
         assert_eq!(
             kinds(src),
-            vec![Identifier, Equal, Int, Newline, Identifier, Equal, Int, Newline, Eof]
+            vec![
+                Identifier, Equal, Int, Newline, Identifier, Equal, Int, Newline, Eof
+            ]
         );
     }
 
