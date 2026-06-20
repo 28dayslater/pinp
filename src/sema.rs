@@ -15,7 +15,8 @@
 use rustc_hash::FxHashMap;
 
 use crate::parser::{
-    Ast, BinOp, Block, ExprId, FuncDef, Node, PinpType, Place, Stmt, SymId, TopLevel, UnOp,
+    Ast, BinOp, Block, ExprId, FuncDef, Node, PinpType, Place, RangeKind, Stmt, SymId, TopLevel,
+    UnOp,
 };
 
 /// A semantic failure. pinp is fail-fast: the first error stops the pass.
@@ -47,9 +48,10 @@ fn join(left: PinpType, right: PinpType) -> Option<PinpType> {
     }
 }
 
-/// Whether `pinp_type` participates in arithmetic/comparison, i.e. is not `Void`.
+/// Whether `pinp_type` is a scalar arithmetic/comparison operand — `Bool`/`Int`/`Float`, not `Void`
+/// and not an aggregate like `Range`.
 fn numeric(pinp_type: PinpType) -> bool {
-    pinp_type != PinpType::Void
+    matches!(pinp_type, PinpType::Bool | PinpType::Int | PinpType::Float)
 }
 
 /// Whether `pinp_type` promotes to `Int` (rather than forcing a `Float` result): `Bool` or `Int`.
@@ -80,6 +82,7 @@ pub fn analyze(ast: &mut Ast) -> Result<(), SemaError> {
         scopes: vec![FxHashMap::default()], // global frame
         fn_base: 0,
         funcs: FxHashMap::default(),
+        loop_vars: Vec::new(),
     };
     for item in top_level.iter() {
         match item {
@@ -100,6 +103,9 @@ struct Analyzer<'ast, 'src> {
     // global frame *is* the base.
     fn_base: usize,
     funcs: FxHashMap<SymId, Signature>,
+    // The loop variables of the enclosing `for`s; each is read-only inside its body, so an
+    // assignment to one is rejected rather than allowed to corrupt the iteration counter.
+    loop_vars: Vec<SymId>,
 }
 
 impl Analyzer<'_, '_> {
@@ -190,6 +196,23 @@ impl Analyzer<'_, '_> {
                 self.check_condition(*cond)?;
                 Ok(())
             }
+            Stmt::For { var, range, body } => {
+                let range_type = self.analyze_expr(*range)?;
+                if range_type != PinpType::Range {
+                    return Err(SemaError::Type(format!(
+                        "`for` requires a range to iterate, got {range_type:?}."
+                    )));
+                }
+                // Seed a body frame with the loop counter (`Int`, read-only) before analysing the
+                // body; the inner block scope nests within it, so reads resolve outward to `var`.
+                self.scopes.push(FxHashMap::default());
+                self.scopes.last_mut().unwrap().insert(*var, PinpType::Int);
+                self.loop_vars.push(*var);
+                self.analyze_block(body)?;
+                self.loop_vars.pop();
+                self.scopes.pop();
+                Ok(())
+            }
         }
     }
 
@@ -205,13 +228,21 @@ impl Analyzer<'_, '_> {
                 ))),
                 Some(existing) => self.check_assignable(value_type, existing),
             },
-            Place::Local(sym_id) => match self.lookup_assign_target(sym_id) {
-                Some(existing) => self.check_assignable(value_type, existing),
-                None => {
-                    self.scopes.last_mut().unwrap().insert(sym_id, value_type);
-                    Ok(())
+            Place::Local(sym_id) => {
+                if self.loop_vars.contains(&sym_id) {
+                    return Err(SemaError::Type(format!(
+                        "Cannot assign to loop variable `{}`.",
+                        self.name(sym_id)
+                    )));
                 }
-            },
+                match self.lookup_assign_target(sym_id) {
+                    Some(existing) => self.check_assignable(value_type, existing),
+                    None => {
+                        self.scopes.last_mut().unwrap().insert(sym_id, value_type);
+                        Ok(())
+                    }
+                }
+            }
         }
     }
 
@@ -282,6 +313,13 @@ impl Analyzer<'_, '_> {
             }
             Node::Call { callee, args } => self.call_type(callee, &args)?,
             Node::If { arms, else_block } => self.if_type(&arms, else_block.as_ref())?,
+            Node::Range {
+                start,
+                stop,
+                step,
+                kind,
+            } => self.range_type(start, stop, step, kind)?,
+            Node::Membership { value, range } => self.membership_type(value, range)?,
         };
         self.types[expr_id.value()] = inferred;
         Ok(inferred)
@@ -320,6 +358,123 @@ impl Analyzer<'_, '_> {
         Ok(joined)
     }
 
+    /// Types a range: each part (`start`, `stop`, and `step` if given) must be `Int`-like; the
+    /// node's type is `Range`. When the parts are literals, the operator/direction is validated;
+    /// variable parts are left to run time (an inconsistent one yields an empty range).
+    fn range_type(
+        &mut self,
+        start: ExprId,
+        stop: ExprId,
+        step: Option<ExprId>,
+        kind: RangeKind,
+    ) -> Result<PinpType, SemaError> {
+        let start_type = self.analyze_expr(start)?;
+        self.require_int_part(start_type)?;
+        let stop_type = self.analyze_expr(stop)?;
+        self.require_int_part(stop_type)?;
+        if let Some(step_id) = step {
+            let step_type = self.analyze_expr(step_id)?;
+            self.require_int_part(step_type)?;
+            // A literal zero step is invalid whatever the bounds are (it never advances); a variable
+            // step that is zero at run time yields an empty range instead.
+            if self.int_literal(step_id) == Some(0) {
+                return Err(SemaError::Type("Range step cannot be zero.".into()));
+            }
+        }
+        self.validate_literal_range(start, stop, step, kind)?;
+        Ok(PinpType::Range)
+    }
+
+    fn require_int_part(&self, part_type: PinpType) -> Result<(), SemaError> {
+        if int_like(part_type) {
+            Ok(())
+        } else {
+            Err(SemaError::Type(format!(
+                "Range bounds and step must be Int, got {part_type:?}."
+            )))
+        }
+    }
+
+    /// The literal value of `expr_id` if it is an integer literal — the hook for compile-time range
+    /// validation, which only applies when the bounds (and step) are constants.
+    fn int_literal(&self, expr_id: ExprId) -> Option<i64> {
+        match self.nodes[expr_id.value()] {
+            Node::Int(value) => Some(value),
+            // A negative literal (e.g. a `:-2` step) parses as unary minus over an integer literal.
+            Node::Unary {
+                op: UnOp::Neg,
+                operand,
+            } => match self.nodes[operand.value()] {
+                Node::Int(value) => Some(-value),
+                _ => None,
+            },
+            _ => None,
+        }
+    }
+
+    /// Rejects an ill-formed range whose bounds are literals: an inclusive range whose step opposes
+    /// its direction, or an exclusive operator pointing the wrong way. (A zero step is rejected
+    /// earlier, in `range_type`, since it is invalid regardless of the bounds.)
+    fn validate_literal_range(
+        &self,
+        start: ExprId,
+        stop: ExprId,
+        step: Option<ExprId>,
+        kind: RangeKind,
+    ) -> Result<(), SemaError> {
+        let (Some(start_value), Some(stop_value)) =
+            (self.int_literal(start), self.int_literal(stop))
+        else {
+            return Ok(()); // a variable bound is a run-time concern
+        };
+        let step_value = step.and_then(|step_id| self.int_literal(step_id));
+        match kind {
+            RangeKind::Inclusive => {
+                if let Some(step) = step_value {
+                    if start_value < stop_value && step < 0 {
+                        return Err(SemaError::Type(
+                            "The range ascends, but the step is negative.".into(),
+                        ));
+                    }
+                    if start_value > stop_value && step > 0 {
+                        return Err(SemaError::Type(
+                            "The range descends, but the step is positive.".into(),
+                        ));
+                    }
+                }
+            }
+            RangeKind::UpExclusive => {
+                if start_value >= stop_value {
+                    return Err(SemaError::Type("A descending range must use ..>.".into()));
+                }
+            }
+            RangeKind::DownExclusive => {
+                if start_value <= stop_value {
+                    return Err(SemaError::Type("An ascending range must use ..<.".into()));
+                }
+            }
+        }
+        Ok(())
+    }
+
+    /// Types a membership test: the tested value must be `Int`-like and the right operand a range;
+    /// the result is `Bool`.
+    fn membership_type(&mut self, value: ExprId, range: ExprId) -> Result<PinpType, SemaError> {
+        let value_type = self.analyze_expr(value)?;
+        if !int_like(value_type) {
+            return Err(SemaError::Type(format!(
+                "The value tested with `in` must be Int, got {value_type:?}."
+            )));
+        }
+        let range_type = self.analyze_expr(range)?;
+        if range_type != PinpType::Range {
+            return Err(SemaError::Type(format!(
+                "`in` requires a range on the right, got {range_type:?}."
+            )));
+        }
+        Ok(PinpType::Bool)
+    }
+
     fn lookup_local(&self, sym_id: SymId) -> Result<PinpType, SemaError> {
         // Reading and assigning resolve a bare name the same way — outward to the function base —
         // so both share `lookup_assign_target`.
@@ -336,11 +491,14 @@ impl Analyzer<'_, '_> {
 
     fn unary_type(&self, op: UnOp, operand_type: PinpType) -> Result<PinpType, SemaError> {
         match op {
-            // Arithmetic negation: `Bool` promotes to `Int` (like any arithmetic use of a bool).
+            // Arithmetic negation: `Bool` promotes to `Int` (like any arithmetic use of a bool);
+            // `Void`/`Range` are not numeric and are rejected.
             UnOp::Neg => match operand_type {
-                PinpType::Void => Err(SemaError::Type("Unary minus on a void value.".into())),
-                PinpType::Bool => Ok(PinpType::Int),
-                other => Ok(other),
+                PinpType::Bool | PinpType::Int => Ok(PinpType::Int),
+                PinpType::Float => Ok(PinpType::Float),
+                PinpType::Void | PinpType::Range => Err(SemaError::Type(format!(
+                    "Unary minus requires a numeric operand, got {operand_type:?}."
+                ))),
             },
             UnOp::Not => {
                 if operand_type == PinpType::Bool {
@@ -372,9 +530,11 @@ impl Analyzer<'_, '_> {
                 )))
             };
         }
-        // Arithmetic and comparison both require numeric (non-void) operands.
+        // Arithmetic and comparison both require scalar operands — never `Void` or a `Range`.
         if !numeric(left_type) || !numeric(right_type) {
-            return Err(SemaError::Type("Operation on a void value.".into()));
+            return Err(SemaError::Type(format!(
+                "`{op:?}` requires numeric operands, got {left_type:?} and {right_type:?}."
+            )));
         }
         Ok(match op {
             Eq | Ne | Lt | Gt | Le | Ge => Bool,
@@ -466,6 +626,109 @@ mod tests {
         assert_eq!(root_type("2 ^ 10"), PinpType::Int);
         assert_eq!(root_type("2.0 ^ 10"), PinpType::Float);
         assert_eq!(root_type("-3.14"), PinpType::Float);
+    }
+
+    // --- ranges, for, membership ---------------------------------------------------------
+
+    #[test]
+    fn range_types_as_range() {
+        assert_eq!(root_type("1..10"), PinpType::Range);
+        assert_eq!(root_type("1..<10:2"), PinpType::Range);
+    }
+
+    #[test]
+    fn float_part_is_a_type_error() {
+        assert!(matches!(sema_error("1.0..3"), SemaError::Type(_)));
+        assert!(matches!(sema_error("1..10:2.0"), SemaError::Type(_)));
+    }
+
+    #[test]
+    fn literal_ranges_are_validated() {
+        for (src, message) in [
+            ("1..149:-13", "The range ascends, but the step is negative."),
+            ("1..>149:13", "An ascending range must use ..<."),
+            ("42..<1:5", "A descending range must use ..>."),
+            ("1..10:0", "Range step cannot be zero."),
+        ] {
+            assert_eq!(
+                sema_error(src),
+                SemaError::Type(message.into()),
+                "for `{src}`"
+            );
+        }
+    }
+
+    #[test]
+    fn zero_step_is_rejected_even_with_variable_bounds() {
+        // The bounds are variables, so the direction checks are deferred — but a literal zero step
+        // never advances and is invalid regardless.
+        assert_eq!(
+            sema_error(indoc! {"
+                a, b = 1, 10
+                a..b:0
+            "}),
+            SemaError::Type("Range step cannot be zero.".into())
+        );
+    }
+
+    #[test]
+    fn for_binds_an_int_loop_variable() {
+        assert_eq!(
+            root_type(indoc! {"
+                total = 0
+                for idx in 1..3
+                    total += idx
+                total
+            "}),
+            PinpType::Int
+        );
+    }
+
+    #[test]
+    fn loop_variable_is_read_only() {
+        assert!(matches!(
+            sema_error(indoc! {"
+                for idx in 1..3
+                    idx = 5
+            "}),
+            SemaError::Type(_)
+        ));
+    }
+
+    #[test]
+    fn for_over_a_non_range_is_an_error() {
+        assert!(matches!(
+            sema_error(indoc! {"
+                for idx in 5
+                    idx
+            "}),
+            SemaError::Type(_)
+        ));
+    }
+
+    #[test]
+    fn membership_types_as_bool() {
+        assert_eq!(root_type("3 in 1..9"), PinpType::Bool);
+    }
+
+    #[test]
+    fn membership_rejects_a_non_int_value() {
+        assert!(matches!(sema_error("1.5 in 1..9"), SemaError::Type(_)));
+    }
+
+    #[test]
+    fn range_is_not_a_scalar_operand() {
+        // A range is not numeric: arithmetic, comparison, and unary minus on one are type errors,
+        // not values that reach codegen as scalars.
+        assert!(matches!(sema_error("(1..5) + 1"), SemaError::Type(_)));
+        assert!(matches!(
+            sema_error(indoc! {"
+                r = 1..5
+                r == r
+            "}),
+            SemaError::Type(_)
+        ));
+        assert!(matches!(sema_error("-(1..5)"), SemaError::Type(_)));
     }
 
     #[test]

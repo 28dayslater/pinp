@@ -93,6 +93,16 @@ enum Lexeme {
     Colon,
     #[token(",")]
     Comma,
+
+    // Range operators. `..` is the inclusive form; `..<`/`..>` exclude the stop bound (longest-match
+    // beats `..`). `..` competes with the `Float` regex only where a digit follows the dot, so `.5`
+    // stays a float while `..5` is `DotDot` then `Int`.
+    #[token("..")]
+    DotDot,
+    #[token("..<")]
+    DotDotLt,
+    #[token("..>")]
+    DotDotGt,
 }
 
 /// The kind of a lexical token the parser consumes. Beyond literals, identifiers, and operators,
@@ -127,6 +137,9 @@ pub enum TokenKind {
     Colon,
     ColonColon,
     Comma,
+    DotDot,
+    DotDotLt,
+    DotDotGt,
     KwDiv,
     KwMod,
     KwIs,
@@ -142,6 +155,8 @@ pub enum TokenKind {
     KwWhile,
     KwUntil,
     KwLoop,
+    KwFor,
+    KwIn,
     Newline,
     Indent,
     Dedent,
@@ -225,6 +240,8 @@ pub fn lex(src: &str) -> Result<Vec<Token<'_>>, LexError> {
                 "while" => TokenKind::KwWhile,
                 "until" => TokenKind::KwUntil,
                 "loop" => TokenKind::KwLoop,
+                "for" => TokenKind::KwFor,
+                "in" => TokenKind::KwIn,
                 _ => TokenKind::Identifier,
             },
             Lexeme::PlusEq => TokenKind::PlusEq,
@@ -257,6 +274,9 @@ pub fn lex(src: &str) -> Result<Vec<Token<'_>>, LexError> {
             Lexeme::ColonColon => TokenKind::ColonColon,
             Lexeme::Colon => TokenKind::Colon,
             Lexeme::Comma => TokenKind::Comma,
+            Lexeme::DotDot => TokenKind::DotDot,
+            Lexeme::DotDotLt => TokenKind::DotDotLt,
+            Lexeme::DotDotGt => TokenKind::DotDotGt,
         };
         out.push(Token {
             kind,
@@ -388,6 +408,29 @@ mod tests {
             kinds("if elif else while until loop"),
             vec![KwIf, KwElif, KwElse, KwWhile, KwUntil, KwLoop, Eof]
         );
+    }
+
+    #[test]
+    fn range_operators() {
+        use TokenKind::*;
+        // Longest-match: `..<`/`..>` beat `..`; `for`/`in` classify as keywords.
+        assert_eq!(
+            kinds("1..10 1..<10 5..>1 for idx in"),
+            vec![
+                Int, DotDot, Int, Int, DotDotLt, Int, Int, DotDotGt, Int, KwFor, Identifier, KwIn,
+                Eof
+            ]
+        );
+    }
+
+    #[test]
+    fn dot_dot_does_not_disturb_floats() {
+        use TokenKind::*;
+        // A dot followed by a digit is still a float; two dots are the range operator.
+        assert_eq!(kinds(".5"), vec![Float, Eof]);
+        assert_eq!(kinds("1..5"), vec![Int, DotDot, Int, Eof]);
+        // A stepped range: `1..10:2` carries the step after a `Colon`.
+        assert_eq!(kinds("1..10:2"), vec![Int, DotDot, Int, Colon, Int, Eof]);
     }
 
     #[test]

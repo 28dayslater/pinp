@@ -33,6 +33,7 @@ pub enum PinpType {
     Int,
     Float,
     Void,
+    Range,
 }
 
 /// An interned identifier: an index into [`Ast::names`]. `Copy` and cheap to compare; the
@@ -118,6 +119,28 @@ pub enum Node {
         arms: Vec<IfArm>,
         else_block: Option<Block>,
     },
+    /// An integer range `start..stop[:step]`. `kind` records the operator (`..`/`..<`/`..>`); a
+    /// `None` step defaults to ±1 at lowering. Its type is [`PinpType::Range`].
+    Range {
+        start: ExprId,
+        stop: ExprId,
+        step: Option<ExprId>,
+        kind: RangeKind,
+    },
+    /// `value in range` — a `Bool` membership test.
+    Membership {
+        value: ExprId,
+        range: ExprId,
+    },
+}
+
+/// The operator that introduced a [`Node::Range`]: `..` keeps both bounds, `..<`/`..>` drop the
+/// stop bound (ascending / descending).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RangeKind {
+    Inclusive,     // ..
+    UpExclusive,   // ..<
+    DownExclusive, // ..>
 }
 
 /// One `if`/`elif` arm: a condition and the body taken when it holds.
@@ -160,6 +183,12 @@ pub enum Stmt {
         body: Block,
         cond: ExprId,
         until: bool,
+    },
+    /// `for var in range <body>` — iterates `var` (an `Int`, read-only and body-local) over a range.
+    For {
+        var: SymId,
+        range: ExprId,
+        body: Block,
     },
 }
 
@@ -335,6 +364,25 @@ const COMPARISON_BP: u8 = 45;
 // (the right operand is parsed at this same power), giving `a if p else b if q else c` =
 // `a if p else (b if q else c)`. Handled apart from `infix`, like the comparison chain.
 const CONDITIONAL_BP: u8 = 10;
+
+// Binding power of the range operators `.. ..< ..>`. Above the comparison band (45) yet below
+// additive (60), so `a+1..b-1` is `(a+1)..(b-1)`; the bounds are parsed one power above this, so a
+// range never nests directly inside another (`1..2..3` is rejected by sema, not silently chained).
+const RANGE_BP: u8 = 50;
+
+// Binding power of `in` membership. It shares the comparison band's looseness (it yields a `Bool`
+// like a comparison) and does not chain — its range operand is parsed one power above.
+const MEMBERSHIP_BP: u8 = 45;
+
+// The range operator a token introduces, if any.
+fn range_kind(kind: TokenKind) -> Option<RangeKind> {
+    Some(match kind {
+        TokenKind::DotDot => RangeKind::Inclusive,
+        TokenKind::DotDotLt => RangeKind::UpExclusive,
+        TokenKind::DotDotGt => RangeKind::DownExclusive,
+        _ => return None,
+    })
+}
 
 // Maximum parse-nesting depth (parenthesised expressions, ternaries, and `if`/`while`/`loop`
 // bodies). Real programs nest a few dozen levels at most; the limit exists only so adversarial
@@ -840,6 +888,7 @@ impl<'src> Parser<'src> {
         match self.peek().kind {
             TokenKind::KwWhile => return self.parse_while(),
             TokenKind::KwLoop => return self.parse_loop(),
+            TokenKind::KwFor => return self.parse_for(),
             _ => {}
         }
         // Otherwise parse as Python does: one or more comma-separated lists joined by `=`. A single
@@ -998,6 +1047,21 @@ impl<'src> Parser<'src> {
                 lhs = self.parse_comparison_chain(lhs)?;
                 continue;
             }
+            // A range operator turns the operand so far into the range's `start`; like the
+            // comparison band, its result is not an ordinary `Bin`, so it lives outside `infix`.
+            if let Some(kind) = range_kind(self.peek().kind)
+                && RANGE_BP >= min_bp
+            {
+                lhs = self.parse_range_tail(lhs, kind)?;
+                continue;
+            }
+            // `value in range` — membership, yielding `Bool`.
+            if self.peek().kind == TokenKind::KwIn && MEMBERSHIP_BP >= min_bp {
+                self.advance(); // 'in'
+                let range = self.parse_expr(MEMBERSHIP_BP + 1)?;
+                lhs = self.ast.push(Node::Membership { value: lhs, range });
+                continue;
+            }
             let Some((left_bp, right_bp, op)) = infix(self.peek().kind) else {
                 break;
             };
@@ -1042,6 +1106,36 @@ impl<'src> Parser<'src> {
         }
         check_monotonic(&operators)?;
         Ok(result.expect("a chain is only started when a comparison operator is next"))
+    }
+
+    // Tail of a range, entered at the range operator with `start` already parsed. The stop bound
+    // (and the optional `:step`) bind one power above `RANGE_BP`, so neither swallows a following
+    // range, comparison, or `in`.
+    fn parse_range_tail(&mut self, start: ExprId, kind: RangeKind) -> Result<ExprId, ParseError> {
+        self.advance(); // '..' / '..<' / '..>'
+        let stop = self.parse_expr(RANGE_BP + 1)?;
+        let step = if self.peek().kind == TokenKind::Colon {
+            self.advance(); // ':'
+            Some(self.parse_expr(RANGE_BP + 1)?)
+        } else {
+            None
+        };
+        Ok(self.ast.push(Node::Range {
+            start,
+            stop,
+            step,
+            kind,
+        }))
+    }
+
+    fn parse_for(&mut self) -> Result<Stmt, ParseError> {
+        self.advance(); // 'for'
+        let name = self.expect(TokenKind::Identifier)?.text;
+        let var = self.ast.intern(name);
+        self.expect(TokenKind::KwIn)?;
+        let range = self.parse_expr(0)?;
+        let body = self.parse_block()?;
+        Ok(Stmt::For { var, range, body })
     }
 
     fn parse_prefix(&mut self) -> Result<ExprId, ParseError> {
@@ -1238,6 +1332,94 @@ mod tests {
         };
         assert_eq!(*ast.node(lhs), Node::Int(2));
         assert!(matches!(ast.node(rhs), Node::Bin { op: BinOp::Mul, .. }));
+    }
+
+    // --- ranges, for, membership ---------------------------------------------------------
+
+    #[test]
+    fn plain_range_is_inclusive_with_no_step() {
+        let ast = parse_ok("1..10");
+        let Node::Range {
+            start,
+            stop,
+            step,
+            kind,
+        } = *ast.node(root(&ast))
+        else {
+            panic!("Expected a Range node at the root.");
+        };
+        assert_eq!(kind, RangeKind::Inclusive);
+        assert_eq!(*ast.node(start), Node::Int(1));
+        assert_eq!(*ast.node(stop), Node::Int(10));
+        assert!(step.is_none());
+    }
+
+    #[test]
+    fn range_operator_selects_the_kind() {
+        for (src, expected) in [
+            ("1..<10", RangeKind::UpExclusive),
+            ("5..>1", RangeKind::DownExclusive),
+        ] {
+            let ast = parse_ok(src);
+            let Node::Range { kind, .. } = *ast.node(root(&ast)) else {
+                panic!("Expected a Range node for `{src}`.");
+            };
+            assert_eq!(kind, expected);
+        }
+    }
+
+    #[test]
+    fn range_carries_a_step() {
+        let ast = parse_ok("1..10:2");
+        let Node::Range { step, .. } = *ast.node(root(&ast)) else {
+            panic!("Expected a Range node.");
+        };
+        assert_eq!(*ast.node(step.expect("a step")), Node::Int(2));
+    }
+
+    #[test]
+    fn range_bounds_bind_below_arithmetic() {
+        // `1+1..2*2` is `(1+1)..(2*2)`: additive/multiplicative bind tighter than `..`.
+        let ast = parse_ok("1+1..2*2");
+        let Node::Range { start, stop, .. } = *ast.node(root(&ast)) else {
+            panic!("Expected a Range node at the root.");
+        };
+        assert!(matches!(ast.node(start), Node::Bin { op: BinOp::Add, .. }));
+        assert!(matches!(ast.node(stop), Node::Bin { op: BinOp::Mul, .. }));
+    }
+
+    #[test]
+    fn range_sits_in_a_multi_assignment_value_slot() {
+        // No comma form survives, so the middle value is one `Range` and the arity is 3.
+        let ast = parse_ok("a, r, b = 1, 2..8:2, 3");
+        let TopLevel::Stmt(Stmt::Assign { values, .. }) = ast.top_level.last().unwrap() else {
+            panic!("Expected an assignment.");
+        };
+        assert_eq!(values.len(), 3);
+        assert!(matches!(ast.node(values[1]), Node::Range { .. }));
+    }
+
+    #[test]
+    fn for_in_is_a_statement() {
+        let ast = parse_ok(indoc! {"
+            for idx in 1..5
+                idx
+        "});
+        let TopLevel::Stmt(Stmt::For { range, body, .. }) = &ast.top_level[0] else {
+            panic!("Expected a for statement.");
+        };
+        assert!(matches!(ast.node(*range), Node::Range { .. }));
+        assert!(body.result.is_some());
+    }
+
+    #[test]
+    fn membership_is_an_expression() {
+        let ast = parse_ok("x in 1..9");
+        let Node::Membership { value, range } = *ast.node(root(&ast)) else {
+            panic!("Expected a Membership node at the root.");
+        };
+        assert!(matches!(ast.node(value), Node::Var(_)));
+        assert!(matches!(ast.node(range), Node::Range { .. }));
     }
 
     #[test]

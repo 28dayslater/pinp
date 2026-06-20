@@ -10,6 +10,7 @@
 
 use std::ffi::{CStr, CString};
 
+use inkwell::IntPredicate;
 use inkwell::basic_block::BasicBlock;
 use inkwell::builder::Builder;
 use inkwell::context::Context;
@@ -24,19 +25,37 @@ use inkwell::llvm_sys::orc2::{
 };
 use inkwell::module::{Linkage, Module};
 use inkwell::targets::{InitializationConfig, Target};
-use inkwell::types::{BasicMetadataTypeEnum, BasicType, BasicTypeEnum, FloatType, IntType};
+use inkwell::types::{
+    BasicMetadataTypeEnum, BasicType, BasicTypeEnum, FloatType, IntType, StructType,
+};
 use inkwell::values::{
-    BasicMetadataValueEnum, BasicValueEnum, FunctionValue, PointerValue, ValueKind,
+    BasicMetadataValueEnum, BasicValueEnum, FunctionValue, IntValue, PointerValue, ValueKind,
 };
 use rustc_hash::FxHashMap;
 
 use crate::parser::{
-    Ast, BinOp, ExprId, Node, PinpType, Place, Stmt, SymId, TopLevel, UnOp, parse,
+    Ast, BinOp, ExprId, Node, PinpType, Place, RangeKind, Stmt, SymId, TopLevel, UnOp, parse,
 };
 use crate::sema::analyze;
 
 /// Name of the synthetic entry function [`CodeGen`] emits for the top-level program.
 const ENTRY: &str = "__pinp_main";
+
+/// Name of the module global that carries a runtime-error code out to the host (`0` means none).
+const RUNTIME_ERROR_SYMBOL: &str = "__pinp_runtime_error";
+
+/// Runtime-error codes stored in [`RUNTIME_ERROR_SYMBOL`]. pinp has no runtime yet, so an error is
+/// reported by code: the generated program records one and returns, and [`PinpJit::run`] maps it to
+/// a message. Codes start at 1 so the initial `0` means "no error".
+const RUNTIME_ERROR_ZERO_STEP: i64 = 1;
+
+/// The message for a runtime-error code recorded in [`RUNTIME_ERROR_SYMBOL`].
+fn runtime_error_message(code: i64) -> String {
+    match code {
+        RUNTIME_ERROR_ZERO_STEP => "Range step cannot be zero.".to_string(),
+        other => format!("Unknown runtime error ({other})."),
+    }
+}
 
 // ---------------------------------------------------------------------------
 // ORCv2 JIT wrapper
@@ -233,19 +252,75 @@ impl<'ctx, 'ast> CodeGen<'ctx, 'ast> {
         self.context.bool_type() // i1
     }
 
+    // A range value is the aggregate `{ start, stop, step, inclusive }`: three `i64`s and an `i1`.
+    // The operator's direction/inclusivity is baked into these fields at construction, so iteration
+    // and membership read a uniform shape.
+    fn range_type(&self) -> StructType<'ctx> {
+        let int = self.int_type().into();
+        let bool = self.bool_type().into();
+        self.context.struct_type(&[int, int, int, bool], false)
+    }
+
     fn basic_type(&self, pinp_type: PinpType) -> BasicTypeEnum<'ctx> {
         match pinp_type {
             PinpType::Bool => self.bool_type().into(),
             PinpType::Int => self.int_type().into(),
             PinpType::Float => self.float_type().into(),
             PinpType::Void => unreachable!("Void is not a storable value type."),
+            PinpType::Range => self.range_type().into(),
         }
+    }
+
+    /// Builds a range value from its already-evaluated fields.
+    fn build_range(
+        &self,
+        start: IntValue<'ctx>,
+        stop: IntValue<'ctx>,
+        step: IntValue<'ctx>,
+        inclusive: IntValue<'ctx>,
+    ) -> Result<BasicValueEnum<'ctx>, String> {
+        let mut range = self.range_type().get_undef();
+        for (index, field) in [start, stop, step, inclusive].into_iter().enumerate() {
+            range = self
+                .builder
+                .build_insert_value(range, field, index as u32, "range")
+                .map_err(err)?
+                .into_struct_value();
+        }
+        Ok(range.into())
+    }
+
+    /// Pulls the four fields `(start, stop, step, inclusive)` out of a range value.
+    fn extract_range(
+        &self,
+        range: BasicValueEnum<'ctx>,
+    ) -> Result<
+        (
+            IntValue<'ctx>,
+            IntValue<'ctx>,
+            IntValue<'ctx>,
+            IntValue<'ctx>,
+        ),
+        String,
+    > {
+        let range = range.into_struct_value();
+        let field = |index| -> Result<IntValue<'ctx>, String> {
+            Ok(self
+                .builder
+                .build_extract_value(range, index, "field")
+                .map_err(err)?
+                .into_int_value())
+        };
+        Ok((field(0)?, field(1)?, field(2)?, field(3)?))
     }
 
     /// Emits the whole program and returns the type of its final expression.
     fn generate(&mut self) -> Result<PinpType, String> {
         self.declare_globals();
         self.declare_functions();
+        // Declare the runtime-error slot up front so [`PinpJit::run`] can always read it, even for a
+        // program that builds no range.
+        self.runtime_error_global();
         for item in &self.ast.top_level {
             if let TopLevel::Func(func) = item {
                 self.gen_function(func)?;
@@ -355,6 +430,9 @@ impl<'ctx, 'ast> CodeGen<'ctx, 'ast> {
             }
             _ => PinpType::Void,
         };
+        if result_type == PinpType::Range {
+            return Err("A program cannot evaluate to a range.".into());
+        }
 
         let fn_type = match result_type {
             PinpType::Void => self.context.void_type().fn_type(&[], false),
@@ -462,6 +540,59 @@ impl<'ctx, 'ast> CodeGen<'ctx, 'ast> {
                 self.builder.position_at_end(exit);
                 Ok(None)
             }
+            Stmt::For { var, range, body } => {
+                let range = self.expect_value(*range)?;
+                let (start, stop, step, inclusive) = self.extract_range(range)?;
+                let function = self.current_function();
+
+                // The counter lives in an entry-block slot so its alloca is not re-run each pass.
+                let counter = self.alloca_at_entry(PinpType::Int)?;
+                self.builder.build_store(counter, start).map_err(err)?;
+                let zero = self.int_type().const_zero();
+                let going_up = self
+                    .builder
+                    .build_int_compare(IntPredicate::SGT, step, zero, "going_up")
+                    .map_err(err)?;
+
+                let header = self.context.append_basic_block(function, "for_header");
+                let body_bb = self.context.append_basic_block(function, "for_body");
+                let exit = self.context.append_basic_block(function, "for_exit");
+                self.builder
+                    .build_unconditional_branch(header)
+                    .map_err(err)?;
+
+                // Header: continue while the counter has not passed `stop`, in the step's direction.
+                // The step is non-zero (a zero step traps when the range is built), so the counter
+                // always advances and the loop terminates.
+                self.builder.position_at_end(header);
+                let current = self.load_counter(counter)?;
+                let cond = self.range_continue(current, stop, inclusive, going_up)?;
+                self.builder
+                    .build_conditional_branch(cond, body_bb, exit)
+                    .map_err(err)?;
+
+                // Body: the loop variable reads the counter slot; the latch advances it by the step.
+                self.builder.position_at_end(body_bb);
+                self.push_scope();
+                self.locals
+                    .last_mut()
+                    .unwrap()
+                    .insert(*var, (counter, PinpType::Int));
+                self.gen_block(body)?;
+                self.pop_scope();
+                let current = self.load_counter(counter)?;
+                let next = self
+                    .builder
+                    .build_int_add(current, step, "next")
+                    .map_err(err)?;
+                self.builder.build_store(counter, next).map_err(err)?;
+                self.builder
+                    .build_unconditional_branch(header)
+                    .map_err(err)?;
+
+                self.builder.position_at_end(exit);
+                Ok(None)
+            }
         }
     }
 
@@ -554,6 +685,8 @@ impl<'ctx, 'ast> CodeGen<'ctx, 'ast> {
             Node::Bin { op, lhs, rhs } => self.gen_bin(expr_id, *op, *lhs, *rhs)?,
             Node::Call { callee, args } => return self.gen_call(*callee, args),
             Node::If { .. } => return self.gen_if(expr_id),
+            Node::Range { .. } => self.gen_range(expr_id)?,
+            Node::Membership { .. } => self.gen_membership(expr_id)?,
         };
         Ok(Some(value))
     }
@@ -636,6 +769,229 @@ impl<'ctx, 'ast> CodeGen<'ctx, 'ast> {
         let end = self.builder.get_insert_block().expect("an active block");
         incomings.push((value, end));
         Ok(())
+    }
+
+    // Build a range value `{start, stop, step, inclusive}`, defaulting an omitted step to ±1. A
+    // zero step never advances, so building such a range traps — every range thereafter has a
+    // non-zero step, which the `for`/`in` lowerings rely on.
+    fn gen_range(&mut self, expr_id: ExprId) -> Result<BasicValueEnum<'ctx>, String> {
+        let Node::Range {
+            start,
+            stop,
+            step,
+            kind,
+        } = self.ast.node(expr_id)
+        else {
+            unreachable!("gen_range on a non-Range node")
+        };
+        let (start, stop, step, kind) = (*start, *stop, *step, *kind);
+        let start_value = self.as_int(start)?;
+        let stop_value = self.as_int(stop)?;
+        let step_value = match step {
+            Some(step_id) => self.as_int(step_id)?,
+            None => self.default_step(kind, start_value, stop_value)?,
+        };
+        self.guard_zero_step(step_value)?;
+        let inclusive = self
+            .bool_type()
+            .const_int((kind == RangeKind::Inclusive) as u64, false);
+        self.build_range(start_value, stop_value, step_value, inclusive)
+    }
+
+    // Raise a runtime error if `step` is zero. A literal zero is already a sema error, so this only
+    // fires for a variable step that is zero at run time — a range that could never advance.
+    fn guard_zero_step(&self, step: IntValue<'ctx>) -> Result<(), String> {
+        let zero = self.int_type().const_zero();
+        let is_zero = self
+            .builder
+            .build_int_compare(IntPredicate::EQ, step, zero, "zero_step")
+            .map_err(err)?;
+        let function = self.current_function();
+        let error_bb = self.context.append_basic_block(function, "range_zero_step");
+        let ok_bb = self.context.append_basic_block(function, "range_ok");
+        self.builder
+            .build_conditional_branch(is_zero, error_bb, ok_bb)
+            .map_err(err)?;
+
+        self.builder.position_at_end(error_bb);
+        self.raise_runtime_error(RUNTIME_ERROR_ZERO_STEP)?;
+
+        self.builder.position_at_end(ok_bb);
+        Ok(())
+    }
+
+    // The module global holding the runtime-error code (`0` = none), read back by [`PinpJit::run`].
+    // It has external linkage so the JIT exposes it for lookup; declared on demand and reused.
+    fn runtime_error_global(&self) -> PointerValue<'ctx> {
+        if let Some(global) = self.module.get_global(RUNTIME_ERROR_SYMBOL) {
+            return global.as_pointer_value();
+        }
+        let global = self
+            .module
+            .add_global(self.int_type(), None, RUNTIME_ERROR_SYMBOL);
+        global.set_initializer(&self.int_type().const_zero());
+        global.as_pointer_value()
+    }
+
+    // Records `code` in the runtime-error global and returns from the current function with a
+    // throwaway value: pinp has no unwinding, so execution stops by falling back out to the host,
+    // which sees the recorded code and turns it into an `Err` instead of using the result.
+    fn raise_runtime_error(&self, code: i64) -> Result<(), String> {
+        let global = self.runtime_error_global();
+        self.builder
+            .build_store(global, self.int_type().const_int(code as u64, true))
+            .map_err(err)?;
+        let function = self.current_function();
+        match function.get_type().get_return_type() {
+            None => self.builder.build_return(None).map_err(err)?,
+            Some(return_type) => {
+                let throwaway = self.llvm_zero(return_type);
+                self.builder.build_return(Some(&throwaway)).map_err(err)?
+            }
+        };
+        Ok(())
+    }
+
+    fn llvm_zero(&self, basic_type: BasicTypeEnum<'ctx>) -> BasicValueEnum<'ctx> {
+        match basic_type {
+            BasicTypeEnum::IntType(int_type) => int_type.const_zero().into(),
+            BasicTypeEnum::FloatType(float_type) => float_type.const_zero().into(),
+            other => unreachable!("Unexpected function return type {other:?}."),
+        }
+    }
+
+    // The step for an `start..stop` with no `:step`: +1 / -1 for the exclusive forms, and for the
+    // inclusive form the direction is taken from the bounds (up when `stop >= start`).
+    fn default_step(
+        &self,
+        kind: RangeKind,
+        start: IntValue<'ctx>,
+        stop: IntValue<'ctx>,
+    ) -> Result<IntValue<'ctx>, String> {
+        let one = self.int_type().const_int(1, true);
+        let neg_one = self.int_type().const_int((-1i64) as u64, true);
+        Ok(match kind {
+            RangeKind::UpExclusive => one,
+            RangeKind::DownExclusive => neg_one,
+            RangeKind::Inclusive => {
+                let up = self
+                    .builder
+                    .build_int_compare(IntPredicate::SGE, stop, start, "rng_up")
+                    .map_err(err)?;
+                self.builder
+                    .build_select(up, one, neg_one, "rng_step")
+                    .map_err(err)?
+                    .into_int_value()
+            }
+        })
+    }
+
+    fn load_counter(&self, counter: PointerValue<'ctx>) -> Result<IntValue<'ctx>, String> {
+        Ok(self
+            .builder
+            .build_load(self.int_type(), counter, "idx")
+            .map_err(err)?
+            .into_int_value())
+    }
+
+    // The `for` continue test: ascending wants `counter <= stop` (inclusive) or `< stop`; descending
+    // the mirror. `going_up` picks the side, so the two directions share one header.
+    fn range_continue(
+        &self,
+        current: IntValue<'ctx>,
+        stop: IntValue<'ctx>,
+        inclusive: IntValue<'ctx>,
+        going_up: IntValue<'ctx>,
+    ) -> Result<IntValue<'ctx>, String> {
+        let le = self
+            .builder
+            .build_int_compare(IntPredicate::SLE, current, stop, "le")
+            .map_err(err)?;
+        let lt = self
+            .builder
+            .build_int_compare(IntPredicate::SLT, current, stop, "lt")
+            .map_err(err)?;
+        let ge = self
+            .builder
+            .build_int_compare(IntPredicate::SGE, current, stop, "ge")
+            .map_err(err)?;
+        let gt = self
+            .builder
+            .build_int_compare(IntPredicate::SGT, current, stop, "gt")
+            .map_err(err)?;
+        let up = self
+            .builder
+            .build_select(inclusive, le, lt, "up")
+            .map_err(err)?
+            .into_int_value();
+        let down = self
+            .builder
+            .build_select(inclusive, ge, gt, "down")
+            .map_err(err)?
+            .into_int_value();
+        Ok(self
+            .builder
+            .build_select(going_up, up, down, "for_cond")
+            .map_err(err)?
+            .into_int_value())
+    }
+
+    // `value in range` as closed-form arithmetic: on-step, in-bounds (direction-aware), and a
+    // non-zero step (an empty range is never a member). No branches, no runtime calls.
+    fn gen_membership(&mut self, expr_id: ExprId) -> Result<BasicValueEnum<'ctx>, String> {
+        let Node::Membership { value, range } = self.ast.node(expr_id) else {
+            unreachable!("gen_membership on a non-Membership node")
+        };
+        let (value, range) = (*value, *range);
+        let value = self.as_int(value)?;
+        let range = self.expect_value(range)?;
+        let (start, stop, step, inclusive) = self.extract_range(range)?;
+
+        let zero = self.int_type().const_zero();
+        // `(value - start)` must be a multiple of step. The step is non-zero (a zero step traps when
+        // the range is built), so the `srem` is well-defined.
+        let diff = self
+            .builder
+            .build_int_sub(value, start, "diff")
+            .map_err(err)?;
+        let remainder = self
+            .builder
+            .build_int_signed_rem(diff, step, "rem")
+            .map_err(err)?;
+        let on_step = self
+            .builder
+            .build_int_compare(IntPredicate::EQ, remainder, zero, "on_step")
+            .map_err(err)?;
+
+        let going_up = self
+            .builder
+            .build_int_compare(IntPredicate::SGT, step, zero, "going_up")
+            .map_err(err)?;
+        let within_stop = self.range_continue(value, stop, inclusive, going_up)?;
+        // `range_continue` covers the stop side; membership also needs the start side.
+        let ge_start = self
+            .builder
+            .build_int_compare(IntPredicate::SGE, value, start, "ge_start")
+            .map_err(err)?;
+        let le_start = self
+            .builder
+            .build_int_compare(IntPredicate::SLE, value, start, "le_start")
+            .map_err(err)?;
+        let from_start = self
+            .builder
+            .build_select(going_up, ge_start, le_start, "from_start")
+            .map_err(err)?
+            .into_int_value();
+
+        let member = self
+            .builder
+            .build_and(on_step, within_stop, "member")
+            .map_err(err)?;
+        let member = self
+            .builder
+            .build_and(member, from_start, "member")
+            .map_err(err)?;
+        Ok(member.into())
     }
 
     fn load_var(&self, sym_id: SymId, global: bool) -> Result<BasicValueEnum<'ctx>, String> {
@@ -933,6 +1289,7 @@ impl<'ctx, 'ast> CodeGen<'ctx, 'ast> {
             PinpType::Int => self.int_type().const_zero().into(),
             PinpType::Float => self.float_type().const_zero().into(),
             PinpType::Void => unreachable!("Void has no zero value."),
+            PinpType::Range => self.range_type().const_zero().into(),
         }
     }
 
@@ -1000,12 +1357,13 @@ impl PinpJit {
         })
     }
 
-    /// Executes the program and returns its result.
+    /// Executes the program and returns its result, or a runtime error the program raised (e.g. a
+    /// range built with a zero step).
     pub fn run(&self) -> Result<PinpValue, String> {
         // SAFETY: the entry function's ABI matches the looked-up signature, chosen
         // from the program's statically inferred result type.
-        unsafe {
-            Ok(match self.result_type {
+        let value = unsafe {
+            match self.result_type {
                 PinpType::Bool => {
                     // The entry returns `i1`; read it through `u8` and mask the low bit, since an
                     // `i1` return is not guaranteed to zero-extend its upper bits.
@@ -1025,8 +1383,25 @@ impl PinpJit {
                     f();
                     PinpValue::Void
                 }
-            })
+                PinpType::Range => unreachable!("a program cannot evaluate to a range"),
+            }
+        };
+        // The program runs to completion (pinp has no unwinding); a raised error is recorded in a
+        // global, so it is read here — after execution — and reported instead of the value.
+        match self.runtime_error()? {
+            Some(message) => Err(message),
+            None => Ok(value),
         }
+    }
+
+    /// The runtime error the last run recorded, if any.
+    fn runtime_error(&self) -> Result<Option<String>, String> {
+        // SAFETY: the symbol resolves to the `i64` runtime-error global declared in the module.
+        let code = unsafe {
+            let slot: *const i64 = self.jit.lookup(RUNTIME_ERROR_SYMBOL)?;
+            *slot
+        };
+        Ok((code != 0).then(|| runtime_error_message(code)))
     }
 
     /// Convenience: compile and run `src` in one call.
