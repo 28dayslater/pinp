@@ -53,7 +53,7 @@ r = 42..<1:5     // Error: A descending range must use ..>.
 ```
 
 Where the bounds or step are variables, these checks cannot be performed ahead of run time. A range whose parameters are inconsistent at run time — for instance `start..<stop` with `start` at or beyond `stop` — yields an empty range.
-No dedicated notation for an empty range is provided yet. This will be added later.1
+No dedicated notation for an empty range is provided yet. This will be added later.
 
 A range is built from the values its bounds and step hold at that moment; the values are captured then, so a later change to a variable a range was built from does not reshape the range.
 

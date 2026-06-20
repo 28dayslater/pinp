@@ -5,6 +5,9 @@ use logos::Logos;
 // Raw lexemes straight from logos.
 #[derive(Logos, Debug, PartialEq)]
 #[logos(skip r"[ \t]+")]
+// A comment runs from `#` to just before the newline, so the line boundary survives for the
+// indentation logic; the comment text itself is discarded.
+#[logos(skip("#[^\n]*", allow_greedy = true))]
 enum Lexeme {
     // newline followed by the line's leading spaces; the count drives indent/dedent
     #[regex(r"\n *", |lex| lex.slice().len() - 1)]
@@ -201,6 +204,13 @@ pub fn lex(src: &str) -> Result<Vec<Token<'_>>, LexError> {
     let mut out = Vec::new();
     let mut indents = vec![0];
     let mut paren_depth: usize = 0;
+    // A newline is not turned into tokens the moment it is seen; it waits here until a line with
+    // real content follows. Blank and comment-only lines keep overwriting this record, so they
+    // collapse away and only the newline before a content line survives — with that line's indent.
+    let mut pending_newline: Option<(usize, u32, u32)> = None;
+    // Stays false until the first real token, so a content-free run at the start of the file —
+    // blank or comment lines with no statement yet to terminate — leaves no leading separator.
+    let mut emitted_content = false;
     let mut lexer = Lexeme::lexer(src);
 
     while let Some(lexeme_result) = lexer.next() {
@@ -214,11 +224,10 @@ pub fn lex(src: &str) -> Result<Vec<Token<'_>>, LexError> {
 
         let kind = match lexeme {
             Lexeme::NewlineIndent(indent) => {
-                // Inside `( … )` a newline is implicit line-joining: emit nothing, so the
+                // Inside `( … )` a newline is implicit line-joining: record nothing, so the
                 // indent stack only ever reacts to real block indentation.
                 if paren_depth == 0 {
-                    out.push(synthetic(TokenKind::Newline, line, col));
-                    emit_indent(&mut out, &mut indents, indent, line, col)?;
+                    pending_newline = Some((indent, line, col));
                 }
                 continue;
             }
@@ -278,14 +287,27 @@ pub fn lex(src: &str) -> Result<Vec<Token<'_>>, LexError> {
             Lexeme::DotDotLt => TokenKind::DotDotLt,
             Lexeme::DotDotGt => TokenKind::DotDotGt,
         };
+        // A content token has arrived: realise the recorded newline as the boundary before it,
+        // unless nothing has been emitted yet — a leading separator has nothing to separate.
+        if emitted_content {
+            flush_pending_newline(&mut out, &mut indents, &mut pending_newline)?;
+        } else {
+            pending_newline = None;
+        }
         out.push(Token {
             kind,
             text: token_text,
             line,
             col,
         });
+        emitted_content = true;
     }
 
+    // A newline still pending at end of input terminates the final statement, as a trailing
+    // newline always did. (A file of only blank/comment lines emitted nothing, so there is none.)
+    if emitted_content {
+        flush_pending_newline(&mut out, &mut indents, &mut pending_newline)?;
+    }
     let (line, col) = locate(src.len());
     while indents.len() > 1 {
         indents.pop();
@@ -315,6 +337,20 @@ fn synthetic(kind: TokenKind, line: u32, col: u32) -> Token<'static> {
         line,
         col,
     }
+}
+
+// Emit the `Newline` and any indent change recorded for a line boundary, once a content-bearing
+// line has been confirmed to follow. Does nothing if no newline is pending.
+fn flush_pending_newline(
+    out: &mut Vec<Token<'_>>,
+    indents: &mut Vec<usize>,
+    pending: &mut Option<(usize, u32, u32)>,
+) -> Result<(), LexError> {
+    if let Some((indent, line, col)) = pending.take() {
+        out.push(synthetic(TokenKind::Newline, line, col));
+        emit_indent(out, indents, indent, line, col)?;
+    }
+    Ok(())
 }
 
 fn emit_indent(
@@ -548,5 +584,71 @@ mod tests {
         let toks = lex("g = 12_000_321").unwrap();
         assert_eq!(toks[0].text, "g");
         assert_eq!(toks[2].text, "12_000_321");
+    }
+
+    #[test]
+    fn trailing_comment_is_ignored() {
+        use TokenKind::*;
+        // A comment after code leaves the code untouched and the line's newline intact.
+        assert_eq!(
+            kinds("a = 1  # the answer\n"),
+            vec![Identifier, Equal, Int, Newline, Eof]
+        );
+    }
+
+    #[test]
+    fn comment_only_line_emits_nothing() {
+        use TokenKind::*;
+        let src = indoc! {"
+            # leading note
+            a = 1
+            # trailing note
+        "};
+        assert_eq!(kinds(src), vec![Identifier, Equal, Int, Newline, Eof]);
+    }
+
+    #[test]
+    fn blank_lines_do_not_break_a_block() {
+        use TokenKind::*;
+        // A blank line at the left margin inside an indented block must not be read as the
+        // block ending; the indent stack only reacts to lines that carry content.
+        let src = indoc! {"
+            a = 1
+                b = 2
+
+                c = 3
+            d = 4
+        "};
+        assert_eq!(
+            kinds(src),
+            vec![
+                Identifier, Equal, Int, Newline, Indent, // a = 1, then indent
+                Identifier, Equal, Int, Newline, // b = 2 (blank line below skipped)
+                Identifier, Equal, Int, Newline, Dedent, // c = 3, then back out
+                Identifier, Equal, Int, Newline, // d = 4
+                Eof
+            ]
+        );
+    }
+
+    #[test]
+    fn comment_only_line_is_transparent_regardless_of_indent() {
+        use TokenKind::*;
+        // An over-indented comment line inside a block contributes no Indent/Dedent.
+        let src = indoc! {"
+            a = 1
+                b = 2
+                        # an over-indented remark
+                c = 3
+        "};
+        assert_eq!(
+            kinds(src),
+            vec![
+                Identifier, Equal, Int, Newline, Indent, // a = 1, then indent
+                Identifier, Equal, Int, Newline, // b = 2
+                Identifier, Equal, Int, Newline, Dedent, // c = 3, then back out
+                Eof
+            ]
+        );
     }
 }
