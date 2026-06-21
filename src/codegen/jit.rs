@@ -5,11 +5,12 @@ use std::ffi::{CStr, CString};
 use inkwell::llvm_sys::error::{LLVMDisposeErrorMessage, LLVMErrorRef, LLVMGetErrorMessage};
 use inkwell::llvm_sys::orc2::lljit::{
     LLVMOrcCreateLLJIT, LLVMOrcDisposeLLJIT, LLVMOrcLLJITAddLLVMIRModule,
-    LLVMOrcLLJITGetMainJITDylib, LLVMOrcLLJITLookup, LLVMOrcLLJITRef,
+    LLVMOrcLLJITGetGlobalPrefix, LLVMOrcLLJITGetMainJITDylib, LLVMOrcLLJITLookup, LLVMOrcLLJITRef,
 };
 use inkwell::llvm_sys::orc2::{
-    LLVMOrcCreateNewThreadSafeContext, LLVMOrcCreateNewThreadSafeModule,
-    LLVMOrcDisposeThreadSafeContext, LLVMOrcExecutorAddress,
+    LLVMOrcCreateDynamicLibrarySearchGeneratorForProcess, LLVMOrcCreateNewThreadSafeContext,
+    LLVMOrcCreateNewThreadSafeModule, LLVMOrcDefinitionGeneratorRef,
+    LLVMOrcDisposeThreadSafeContext, LLVMOrcExecutorAddress, LLVMOrcJITDylibAddGenerator,
 };
 use inkwell::module::Module;
 use inkwell::targets::{InitializationConfig, Target};
@@ -33,6 +34,26 @@ impl Jit {
         // SAFETY: a null builder asks ORC for a default LLJIT; on success it writes
         // the instance into `jit`, otherwise it returns a non-null error.
         unsafe { check_error(LLVMOrcCreateLLJIT(&mut jit, std::ptr::null_mut()))? };
+
+        // Let the main dylib resolve symbols against the host process. Symbols that
+        // JIT-compiled pinp code references but does not define are satisfied this way:
+        // the `pinp_*` runtime allocator linked into the binary (build.rs), and host
+        // libc as later features need it.
+        // SAFETY: `jit` is the LLJIT just created; the generator is built with the JIT's
+        // own global-symbol prefix and a null filter (admit every symbol), then handed to
+        // the main dylib, which takes ownership of it.
+        unsafe {
+            let global_prefix = LLVMOrcLLJITGetGlobalPrefix(jit);
+            let mut generator: LLVMOrcDefinitionGeneratorRef = std::ptr::null_mut();
+            check_error(LLVMOrcCreateDynamicLibrarySearchGeneratorForProcess(
+                &mut generator,
+                global_prefix,
+                None,
+                std::ptr::null_mut(),
+            ))?;
+            LLVMOrcJITDylibAddGenerator(LLVMOrcLLJITGetMainJITDylib(jit), generator);
+        }
+
         Ok(Jit { jit })
     }
 
