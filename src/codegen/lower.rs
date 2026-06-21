@@ -131,6 +131,8 @@ impl<'ctx, 'ast> CodeGen<'ctx, 'ast> {
             PinpType::Float => self.float_type().into(),
             PinpType::Void => unreachable!("Void is not a storable value type."),
             PinpType::Range => self.range_type().into(),
+            // An array variable holds a heap pointer (opaque ptr, 64-bit on all targets we support).
+            PinpType::Array(_, _) => self.context.ptr_type(AddressSpace::default()).into(),
         }
     }
 
@@ -185,9 +187,6 @@ impl<'ctx, 'ast> CodeGen<'ctx, 'ast> {
     pub(super) fn generate(&mut self) -> Result<PinpType, String> {
         self.declare_globals();
         self.declare_functions();
-        // Declare the runtime-error slot up front so [`PinpJit::run`] can always read it, even for a
-        // program that builds no range.
-        self.runtime_error_global();
         for item in &self.ast.top_level {
             if let TopLevel::Func(func) = item {
                 self.gen_function(func)?;
@@ -288,8 +287,11 @@ impl<'ctx, 'ast> CodeGen<'ctx, 'ast> {
         Ok(())
     }
 
-    /// Emits the `ENTRY` function from the top-level statements; its return value
-    /// is the program's final expression (or void if it ends in a definition).
+    /// Emits the `ENTRY` function from the top-level statements. The entry always has the uniform
+    /// signature `void __pinp_main(ptr result_ptr)`: the caller (pinp_run) passes an 8-byte buffer
+    /// for the scalar result; the entry writes into it when non-void, then returns void. This lets
+    /// the C trampoline hold the setjmp frame and call any program with a single function pointer
+    /// type, regardless of the program's result type.
     fn gen_entry(&mut self) -> Result<PinpType, String> {
         let result_type = match self.ast.top_level.last() {
             Some(TopLevel::Stmt(Stmt::Expr(e))) => self.ast.type_of(*e),
@@ -302,10 +304,8 @@ impl<'ctx, 'ast> CodeGen<'ctx, 'ast> {
             return Err("A program cannot evaluate to a range.".into());
         }
 
-        let fn_type = match result_type {
-            PinpType::Void => self.context.void_type().fn_type(&[], false),
-            ty => self.basic_type(ty).fn_type(&[], false),
-        };
+        let ptr_type = self.context.ptr_type(AddressSpace::default());
+        let fn_type = self.context.void_type().fn_type(&[ptr_type.into()], false);
         let entry_fn = self.module.add_function(ENTRY, fn_type, None);
         let block = self.context.append_basic_block(entry_fn, "entry");
         self.builder.position_at_end(block);
@@ -325,13 +325,17 @@ impl<'ctx, 'ast> CodeGen<'ctx, 'ast> {
             }
         }
 
-        match result_type {
-            PinpType::Void => self.builder.build_return(None).map_err(err)?,
-            _ => {
-                let value = result.expect("A non-void program must yield a value.");
-                self.builder.build_return(Some(&value)).map_err(err)?
-            }
-        };
+        if result_type != PinpType::Void {
+            let result_value = result.expect("A non-void program must yield a value.");
+            let result_ptr = entry_fn
+                .get_first_param()
+                .expect("result pointer parameter")
+                .into_pointer_value();
+            self.builder
+                .build_store(result_ptr, result_value)
+                .map_err(err)?;
+        }
+        self.builder.build_return(None).map_err(err)?;
         Ok(result_type)
     }
 

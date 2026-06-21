@@ -82,6 +82,10 @@ const MAX_IF_ARMS: usize = 256;
 // `!`, so `not a == b` is `(not a) == b`.
 const UNARY_MINUS_BP: u8 = 75;
 
+// Postfix operators `arr[i]` and `obj.member` bind tighter than everything else — their left binding
+// power is above exponentiation (80) so `-arr[0]` is `-(arr[0])` and `a^b[0]` is `a^(b[0])`.
+const POSTFIX_BP: u8 = 90;
+
 // The "direction" of a comparison operator. A chain of more than one comparison must keep a single
 // direction so the relation is transitive and reads across the chain (`a < b <= c`), as in maths.
 // `!=` is non-transitive (`a != b != c` is not "all distinct"), so it has no direction and never
@@ -317,6 +321,25 @@ impl<'src> Parser<'src> {
                 lhs = self.ast.push(Node::Membership { value: lhs, range });
                 continue;
             }
+            // Postfix `lhs[index]` — element access.
+            if self.peek().kind == TokenKind::LBracket && POSTFIX_BP >= min_bp {
+                self.advance(); // '['
+                let index = self.parse_expr(0)?;
+                self.expect(TokenKind::RBracket)?;
+                lhs = self.ast.push(Node::Index { array: lhs, index });
+                continue;
+            }
+            // Postfix `lhs.member` — built-in member access (`.len`, etc.).
+            if self.peek().kind == TokenKind::Dot && POSTFIX_BP >= min_bp {
+                self.advance(); // '.'
+                let member_name = self.expect(TokenKind::Identifier)?.text;
+                let member = self.ast.intern(member_name);
+                lhs = self.ast.push(Node::Member {
+                    object: lhs,
+                    member,
+                });
+                continue;
+            }
             let Some((left_bp, right_bp, op)) = infix(self.peek().kind) else {
                 break;
             };
@@ -442,10 +465,64 @@ impl<'src> Parser<'src> {
                 self.expect(TokenKind::RParen)?;
                 Ok(expr_id)
             }
+            TokenKind::LBracket => self.parse_array_or_comprehension(),
             other => Err(ParseError::Unexpected(format!(
                 "Unexpected token {other:?}."
             ))),
         }
+    }
+
+    // `[…]` — a 1D array literal or an array comprehension.
+    //
+    // Literal: `[e0, e1, …]` — a comma-separated list of elements (trailing comma allowed).
+    // Comprehension: `[element for var[:type] in source]` — the `for` keyword after the first
+    // element is the discriminator. The `:type` annotation promotes the loop variable; without it
+    // the variable type defaults to `Int` (the range's native element type).
+    fn parse_array_or_comprehension(&mut self) -> Result<ExprId, ParseError> {
+        self.advance(); // '['
+
+        // Empty `[]` is always an error — a zero-length array literal has no deducible element type.
+        if self.peek().kind == TokenKind::RBracket {
+            return Err(ParseError::Unexpected(
+                "Array literal cannot be empty.".into(),
+            ));
+        }
+
+        let first = self.parse_expr(0)?;
+
+        // Comprehension: `[element for var[:type] in source]`.
+        if self.peek().kind == TokenKind::KwFor {
+            self.advance(); // 'for'
+            let var_name = self.expect(TokenKind::Identifier)?.text;
+            let var = self.ast.intern(var_name);
+            let var_type = if self.peek().kind == TokenKind::Colon {
+                self.advance(); // ':'
+                self.parse_type()?
+            } else {
+                PinpType::Int
+            };
+            self.expect(TokenKind::KwIn)?;
+            let source = self.parse_expr(0)?;
+            self.expect(TokenKind::RBracket)?;
+            return Ok(self.ast.push(Node::Comprehension {
+                element: first,
+                var,
+                var_type,
+                source,
+            }));
+        }
+
+        // Array literal: `[e0, e1, …]`.
+        let mut elements = vec![first];
+        while self.peek().kind == TokenKind::Comma {
+            self.advance(); // ','
+            if self.peek().kind == TokenKind::RBracket {
+                break; // trailing comma
+            }
+            elements.push(self.parse_expr(0)?);
+        }
+        self.expect(TokenKind::RBracket)?;
+        Ok(self.ast.push(Node::ArrayLiteral { elements }))
     }
 
     // `<name>(<args>)` — a function call.

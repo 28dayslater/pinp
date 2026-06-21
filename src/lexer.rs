@@ -90,6 +90,10 @@ enum Lexeme {
     LParen,
     #[token(")")]
     RParen,
+    #[token("[")]
+    LBracket,
+    #[token("]")]
+    RBracket,
     #[token("::")]
     ColonColon,
     #[token(":")]
@@ -106,6 +110,11 @@ enum Lexeme {
     DotDotLt,
     #[token("..>")]
     DotDotGt,
+
+    // Single dot for member access (`.len`, etc.). Longest-match ensures `..` and float `.5`
+    // are not disturbed: logos picks `..` over `.`, and the float regex requires a digit after `.`.
+    #[token(".")]
+    Dot,
 }
 
 /// The kind of a lexical token the parser consumes. Beyond literals, identifiers, and operators,
@@ -137,9 +146,12 @@ pub enum TokenKind {
     ModEq,
     LParen,
     RParen,
+    LBracket,
+    RBracket,
     Colon,
     ColonColon,
     Comma,
+    Dot,
     DotDot,
     DotDotLt,
     DotDotGt,
@@ -280,9 +292,18 @@ pub fn lex(src: &str) -> Result<Vec<Token<'_>>, LexError> {
                 paren_depth = paren_depth.saturating_sub(1);
                 TokenKind::RParen
             }
+            Lexeme::LBracket => {
+                paren_depth += 1;
+                TokenKind::LBracket
+            }
+            Lexeme::RBracket => {
+                paren_depth = paren_depth.saturating_sub(1);
+                TokenKind::RBracket
+            }
             Lexeme::ColonColon => TokenKind::ColonColon,
             Lexeme::Colon => TokenKind::Colon,
             Lexeme::Comma => TokenKind::Comma,
+            Lexeme::Dot => TokenKind::Dot,
             Lexeme::DotDot => TokenKind::DotDot,
             Lexeme::DotDotLt => TokenKind::DotDotLt,
             Lexeme::DotDotGt => TokenKind::DotDotGt,
@@ -456,6 +477,29 @@ mod tests {
                 Int, DotDot, Int, Int, DotDotLt, Int, Int, DotDotGt, Int, KwFor, Identifier, KwIn,
                 Eof
             ]
+        );
+    }
+
+    #[test]
+    fn bracket_and_dot_tokens() {
+        use TokenKind::*;
+        // `[` and `]` are their own tokens.
+        assert_eq!(
+            kinds("[1, 2]"),
+            vec![LBracket, Int, Comma, Int, RBracket, Eof]
+        );
+        // `.len` is Dot + Identifier; `.5` stays a float; `..` is still DotDot.
+        assert_eq!(kinds("arr.len"), vec![Identifier, Dot, Identifier, Eof]);
+        assert_eq!(kinds(".5"), vec![Float, Eof]);
+        assert_eq!(kinds("1..5"), vec![Int, DotDot, Int, Eof]);
+        // Brackets join lines just like parentheses.
+        let src = indoc! {"
+            [1,
+             2]
+        "};
+        assert_eq!(
+            kinds(src),
+            vec![LBracket, Int, Comma, Int, RBracket, Newline, Eof]
         );
     }
 

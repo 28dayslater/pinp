@@ -23,3 +23,15 @@ The code is a teaching showcase — favor clear, explicit names over terse ones.
 
 - **Error messages** are capitalized and end with a period; keep them short.
 - **Doc-comment public items** (`///`); on private internals, comment the *why*, not the *what*.
+
+## Unit test policy
+
+Implementation must start with generating unit and e2e test coverage and presented to the user,
+before any code is written.
+It is of utmost importance to generate as many "adversarial" tests as reasonably possible.
+Those should cover as much of the code as possible, including internal code.
+Tests covering corner cases of internal functionality in a file, should be placed in that file.
+`#[cfg(test)] mod tests` blocks inside a module file cover that module's internal contract;
+`tests/*.rs` files cover higher-level end-to-end behavior via `PinpJit`.
+
+Every new feature requires an **extensive** test suite of the sema layer.

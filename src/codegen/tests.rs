@@ -66,6 +66,51 @@ fn and_or_short_circuit() {
     );
 }
 
+/// Mirrors `pinp_mem_info` from runtime/pinp_runtime.h.
+#[repr(C)]
+#[derive(Default)]
+struct MemInfo {
+    outstanding_bytes: i64,
+    allocation_count: i64,
+    free_count: i64,
+}
+
+#[test]
+fn runtime_allocator_is_reachable_from_the_jit() {
+    // The runtime (mimalloc + shim) is linked into the binary, and the JIT's
+    // process-symbol generator resolves its `pinp_*` surface — the same path
+    // JIT-compiled pinp code will take. Its bookkeeping is byte-exact: an
+    // allocation is charged its usable size, a free credits it back, and we end
+    // with nothing outstanding.
+    let jit = Jit::new().unwrap();
+
+    // SAFETY: each signature matches its symbol's ABI in runtime/pinp_runtime.h.
+    unsafe {
+        let alloc: extern "C" fn(usize) -> *mut u8 = jit.lookup("pinp_alloc").unwrap();
+        let free: extern "C" fn(*mut u8) = jit.lookup("pinp_free").unwrap();
+        let memory_info: extern "C" fn(*mut MemInfo) = jit.lookup("pinp_memory_info").unwrap();
+
+        let read_info = || {
+            let mut info = MemInfo::default();
+            memory_info(&mut info);
+            info
+        };
+
+        let pointer = alloc(64);
+        assert!(!pointer.is_null());
+        let after_alloc = read_info();
+        assert_eq!(after_alloc.allocation_count, 1);
+        assert_eq!(after_alloc.free_count, 0);
+        assert!(after_alloc.outstanding_bytes >= 64);
+
+        free(pointer);
+        let after_free = read_info();
+        assert_eq!(after_free.allocation_count, 1);
+        assert_eq!(after_free.free_count, 1);
+        assert_eq!(after_free.outstanding_bytes, 0);
+    }
+}
+
 #[test]
 fn syntax_error_is_reported_before_codegen() {
     // A malformed parameter list (missing `:`) fails in the parser, so the flow

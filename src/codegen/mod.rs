@@ -8,13 +8,14 @@
 //! the two together: source string in, executed, [`PinpValue`] out. This is the
 //! harness pinp's runtime tests are written against.
 
+use inkwell::AddressSpace;
 use inkwell::builder::Builder;
 use inkwell::context::Context;
 use inkwell::module::Module;
 use inkwell::values::{BasicValueEnum, FunctionValue, PointerValue, ValueKind};
 use rustc_hash::FxHashMap;
 
-use crate::parser::{Ast, PinpType, Place, SymId, parse};
+use crate::parser::{ArrayElementType, Ast, PinpType, Place, SymId, parse};
 use crate::sema::analyze;
 
 mod expr;
@@ -33,22 +34,6 @@ pub use jit::Jit;
 
 /// Name of the synthetic entry function `CodeGen` emits for the top-level program.
 const ENTRY: &str = "__pinp_main";
-
-/// Name of the module global that carries a runtime-error code out to the host (`0` means none).
-const RUNTIME_ERROR_SYMBOL: &str = "__pinp_runtime_error";
-
-/// Runtime-error codes stored in [`RUNTIME_ERROR_SYMBOL`]. pinp has no runtime yet, so an error is
-/// reported by code: the generated program records one and returns, and [`PinpJit::run`] maps it to
-/// a message. Codes start at 1 so the initial `0` means "no error".
-const RUNTIME_ERROR_ZERO_STEP: i64 = 1;
-
-/// The message for a runtime-error code recorded in [`RUNTIME_ERROR_SYMBOL`].
-fn runtime_error_message(code: i64) -> String {
-    match code {
-        RUNTIME_ERROR_ZERO_STEP => "Range step cannot be zero.".to_string(),
-        other => format!("Unknown runtime error ({other})."),
-    }
-}
 
 // ---------------------------------------------------------------------------
 // Code generator
@@ -99,12 +84,13 @@ fn err(e: inkwell::builder::BuilderError) -> String {
 // ---------------------------------------------------------------------------
 
 /// The value a pinp program evaluates to.
-#[derive(Debug, Clone, Copy, PartialEq)]
+#[derive(Debug, Clone, PartialEq)]
 pub enum PinpValue {
     Bool(bool),
     Int(i64),
     Float(f64),
     Void,
+    Array(Vec<PinpValue>),
 }
 
 /// Compiles a pinp source string and JIT-executes it, the test harness for the
@@ -138,48 +124,62 @@ impl PinpJit {
     /// Executes the program and returns its result, or a runtime error the program raised (e.g. a
     /// range built with a zero step).
     pub fn run(&self) -> Result<PinpValue, String> {
-        // SAFETY: the entry function's ABI matches the looked-up signature, chosen
-        // from the program's statically inferred result type.
-        let value = unsafe {
-            match self.result_type {
-                PinpType::Bool => {
-                    // The entry returns `i1`; read it through `u8` and mask the low bit, since an
-                    // `i1` return is not guaranteed to zero-extend its upper bits.
-                    let f: extern "C" fn() -> u8 = self.jit.lookup(ENTRY)?;
-                    PinpValue::Bool(f() & 1 != 0)
-                }
-                PinpType::Int => {
-                    let f: extern "C" fn() -> i64 = self.jit.lookup(ENTRY)?;
-                    PinpValue::Int(f())
-                }
-                PinpType::Float => {
-                    let f: extern "C" fn() -> f64 = self.jit.lookup(ENTRY)?;
-                    PinpValue::Float(f())
-                }
-                PinpType::Void => {
-                    let f: extern "C" fn() = self.jit.lookup(ENTRY)?;
-                    f();
-                    PinpValue::Void
-                }
-                PinpType::Range => unreachable!("a program cannot evaluate to a range"),
-            }
-        };
-        // The program runs to completion (pinp has no unwinding); a raised error is recorded in a
-        // global, so it is read here — after execution — and reported instead of the value.
-        match self.runtime_error()? {
-            Some(message) => Err(message),
-            None => Ok(value),
+        unsafe extern "C" {
+            // The C trampoline that holds the setjmp frame: calls entry(result_buf) and catches
+            // any pinp_runtime_error longjmp, writing the error string to *error_out.
+            fn pinp_run(
+                entry: unsafe extern "C" fn(*mut u8),
+                result: *mut u8,
+                error_out: *mut *const std::ffi::c_char,
+            );
         }
-    }
 
-    /// The runtime error the last run recorded, if any.
-    fn runtime_error(&self) -> Result<Option<String>, String> {
-        // SAFETY: the symbol resolves to the `i64` runtime-error global declared in the module.
-        let code = unsafe {
-            let slot: *const i64 = self.jit.lookup(RUNTIME_ERROR_SYMBOL)?;
-            *slot
-        };
-        Ok((code != 0).then(|| runtime_error_message(code)))
+        // SAFETY: the entry is always `void (*)(void*)` now — the uniform out-pointer ABI.
+        let entry: unsafe extern "C" fn(*mut u8) = unsafe { self.jit.lookup(ENTRY)? };
+        // Use `u64` (not `[u8; 8]`) so the buffer has 8-byte alignment. LLVM emits `align 8`
+        // stores for i64/f64 and pointer-sized values; a misaligned target is UB in LLVM's model.
+        let mut result_buf: u64 = 0;
+        let result_ptr = (&raw mut result_buf).cast::<u8>();
+        let mut error: *const std::ffi::c_char = std::ptr::null();
+
+        unsafe { pinp_run(entry, result_ptr, &mut error) };
+
+        if !error.is_null() {
+            let msg = unsafe { std::ffi::CStr::from_ptr(error) }
+                .to_string_lossy()
+                .into_owned();
+            return Err(msg);
+        }
+
+        Ok(match self.result_type {
+            PinpType::Bool => PinpValue::Bool(result_buf as u8 & 1 != 0),
+            PinpType::Int => PinpValue::Int(result_buf as i64),
+            PinpType::Float => PinpValue::Float(f64::from_bits(result_buf)),
+            PinpType::Void => PinpValue::Void,
+            PinpType::Range => unreachable!("a program cannot evaluate to a range"),
+            PinpType::Array(elem_type, n) => {
+                // The entry wrote the heap pointer into result_buf (already a `u64`).
+                let array_ptr = result_buf as *const u8;
+                let mut elements = Vec::with_capacity(n);
+                for i in 0..n {
+                    let element = match elem_type {
+                        ArrayElementType::Bool => {
+                            PinpValue::Bool(unsafe { *array_ptr.add(i) } & 1 != 0)
+                        }
+                        ArrayElementType::Int => {
+                            let ptr = unsafe { array_ptr.add(i * 8) } as *const i64;
+                            PinpValue::Int(unsafe { *ptr })
+                        }
+                        ArrayElementType::Float => {
+                            let ptr = unsafe { array_ptr.add(i * 8) } as *const f64;
+                            PinpValue::Float(unsafe { *ptr })
+                        }
+                    };
+                    elements.push(element);
+                }
+                PinpValue::Array(elements)
+            }
+        })
     }
 
     /// Convenience: compile and run `src` in one call.

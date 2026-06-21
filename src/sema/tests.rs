@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: MIT
 
 use super::*;
-use crate::parser::{Ast, BinOp, Node, PinpType, Stmt, TopLevel, parse};
+use crate::parser::{ArrayElementType, Ast, BinOp, Node, PinpType, Stmt, TopLevel, parse};
 use indoc::indoc;
 
 /// Parse + analyze, returning the typed AST (panicking on any error).
@@ -556,4 +556,837 @@ fn global_access_and_compound_assign() {
             "}),
         PinpType::Int
     );
+}
+
+// --- arrays: literal type inference --------------------------------------------------
+
+#[test]
+fn int_array_literal_type() {
+    assert_eq!(
+        root_type("[1, 2, 3]"),
+        PinpType::Array(ArrayElementType::Int, 3)
+    );
+}
+
+#[test]
+fn float_array_literal_type() {
+    assert_eq!(
+        root_type("[1.5, 2.5]"),
+        PinpType::Array(ArrayElementType::Float, 2)
+    );
+}
+
+#[test]
+fn bool_array_literal_type() {
+    assert_eq!(
+        root_type("[true, false, true]"),
+        PinpType::Array(ArrayElementType::Bool, 3)
+    );
+}
+
+#[test]
+fn int_bool_elements_join_to_int_array() {
+    // bool promotes to int under the join lattice.
+    assert_eq!(
+        root_type("[1, true, 3]"),
+        PinpType::Array(ArrayElementType::Int, 3)
+    );
+}
+
+#[test]
+fn int_float_elements_join_to_float_array() {
+    assert_eq!(
+        root_type("[1, 2, 3.5]"),
+        PinpType::Array(ArrayElementType::Float, 3)
+    );
+}
+
+#[test]
+fn bool_float_elements_join_to_float_array() {
+    // bool → int → float: full three-way promotion in one literal.
+    assert_eq!(
+        root_type("[true, 2, 3.5]"),
+        PinpType::Array(ArrayElementType::Float, 3)
+    );
+}
+
+#[test]
+fn range_element_mixed_with_scalar_is_error() {
+    // A Range and an Int have no common type in the join lattice.
+    assert!(matches!(sema_error("[1, 1..5]"), SemaError::Type(_)));
+}
+
+#[test]
+fn single_element_array_literal_type() {
+    assert_eq!(root_type("[42]"), PinpType::Array(ArrayElementType::Int, 1));
+}
+
+// --- arrays: index expression --------------------------------------------------------
+
+#[test]
+fn index_of_int_array_is_int() {
+    assert_eq!(
+        root_type(indoc! {"
+                a = [1, 2, 3]
+                a[0]
+            "}),
+        PinpType::Int
+    );
+}
+
+#[test]
+fn index_of_float_array_is_float() {
+    assert_eq!(
+        root_type(indoc! {"
+                a = [1.5, 2.5]
+                a[0]
+            "}),
+        PinpType::Float
+    );
+}
+
+#[test]
+fn index_of_bool_array_is_bool() {
+    assert_eq!(
+        root_type(indoc! {"
+                a = [true, false]
+                a[0]
+            "}),
+        PinpType::Bool
+    );
+}
+
+#[test]
+fn index_on_non_array_is_error() {
+    assert!(matches!(
+        sema_error(indoc! {"
+                a = 5
+                a[0]
+            "}),
+        SemaError::Type(_)
+    ));
+}
+
+#[test]
+fn float_index_is_error() {
+    assert!(matches!(
+        sema_error(indoc! {"
+                a = [1, 2, 3]
+                a[1.5]
+            "}),
+        SemaError::Type(_)
+    ));
+}
+
+#[test]
+fn index_on_int_scalar_is_error() {
+    assert!(matches!(
+        sema_error(indoc! {"
+            a = 5
+            a[0]
+        "}),
+        SemaError::Type(_)
+    ));
+}
+
+#[test]
+fn index_on_float_scalar_is_error() {
+    assert!(matches!(
+        sema_error(indoc! {"
+            a = 3.14
+            a[0]
+        "}),
+        SemaError::Type(_)
+    ));
+}
+
+#[test]
+fn index_on_bool_scalar_is_error() {
+    assert!(matches!(
+        sema_error(indoc! {"
+            a = true
+            a[0]
+        "}),
+        SemaError::Type(_)
+    ));
+}
+
+#[test]
+fn bool_index_is_accepted() {
+    // bool is int_like, so it is a valid index.
+    assert_eq!(
+        root_type(indoc! {"
+                a = [10, 20, 30]
+                a[true]
+            "}),
+        PinpType::Int
+    );
+}
+
+#[test]
+fn double_index_on_scalar_result_is_error() {
+    // a[0] is Int; indexing an Int is not valid.
+    assert!(matches!(
+        sema_error(indoc! {"
+                a = [1, 2, 3]
+                a[0][1]
+            "}),
+        SemaError::Type(_)
+    ));
+}
+
+#[test]
+fn index_of_comprehension_result_is_element_type() {
+    // The comprehension type is Array(Int, 5); indexing it yields Int.
+    assert_eq!(root_type("[x for x in 1..5][2]"), PinpType::Int);
+}
+
+// --- arrays: member access -----------------------------------------------------------
+
+#[test]
+fn len_of_int_array_is_int() {
+    assert_eq!(
+        root_type(indoc! {"
+                a = [1, 2, 3]
+                a.len
+            "}),
+        PinpType::Int
+    );
+}
+
+#[test]
+fn len_of_float_array_is_int() {
+    assert_eq!(
+        root_type(indoc! {"
+                a = [1.0, 2.0, 3.0, 4.0]
+                a.len
+            "}),
+        PinpType::Int
+    );
+}
+
+#[test]
+fn member_on_int_scalar_is_error() {
+    assert!(matches!(
+        sema_error(indoc! {"
+                a = 5
+                a.len
+            "}),
+        SemaError::Type(_)
+    ));
+}
+
+#[test]
+fn member_on_float_scalar_is_error() {
+    assert!(matches!(
+        sema_error(indoc! {"
+                a = 3.14
+                a.len
+            "}),
+        SemaError::Type(_)
+    ));
+}
+
+#[test]
+fn unknown_member_name_is_error() {
+    assert!(matches!(
+        sema_error(indoc! {"
+                a = [1, 2, 3]
+                a.foo
+            "}),
+        SemaError::Type(_)
+    ));
+}
+
+#[test]
+fn len_usable_as_range_bound() {
+    // a.len is Int, so it can appear as a range bound (variable bound, runtime-evaluated).
+    assert_eq!(
+        root_type(indoc! {"
+                a = [10, 20, 30]
+                0..<a.len
+            "}),
+        PinpType::Range
+    );
+}
+
+// --- arrays: comprehension -----------------------------------------------------------
+
+#[test]
+fn comprehension_int_var_type() {
+    assert_eq!(
+        root_type("[x for x in 1..5]"),
+        PinpType::Array(ArrayElementType::Int, 5)
+    );
+}
+
+#[test]
+fn comprehension_float_var_type() {
+    assert_eq!(
+        root_type("[x for x:float in 1..3]"),
+        PinpType::Array(ArrayElementType::Float, 3)
+    );
+}
+
+#[test]
+fn comprehension_element_expr_promotes_to_float() {
+    // x is Int; x * 2.0 promotes to Float, so the resulting array is Float.
+    assert_eq!(
+        root_type("[x * 2.0 for x in 1..3]"),
+        PinpType::Array(ArrayElementType::Float, 3)
+    );
+}
+
+#[test]
+fn comprehension_squared_element_stays_int() {
+    assert_eq!(
+        root_type("[x * x for x in 1..4]"),
+        PinpType::Array(ArrayElementType::Int, 4)
+    );
+}
+
+#[test]
+fn comprehension_exclusive_range_count() {
+    assert_eq!(
+        root_type("[x for x in 0..<10]"),
+        PinpType::Array(ArrayElementType::Int, 10)
+    );
+}
+
+#[test]
+fn comprehension_stepped_range_count() {
+    assert_eq!(
+        root_type("[x for x in 0..9:3]"),
+        PinpType::Array(ArrayElementType::Int, 4)
+    );
+}
+
+#[test]
+fn comprehension_bool_var_is_error() {
+    assert!(matches!(
+        sema_error("[x for x:bool in 1..5]"),
+        SemaError::Type(_)
+    ));
+}
+
+#[test]
+fn comprehension_source_must_be_range() {
+    assert!(matches!(sema_error("[x for x in 5]"), SemaError::Type(_)));
+}
+
+#[test]
+fn comprehension_variable_bounds_are_rejected() {
+    // Non-literal bounds make the array length unknown at compile time.
+    assert!(matches!(
+        sema_error(indoc! {"
+                a = 5
+                b = 10
+                [x for x in a..b]
+            "}),
+        SemaError::Type(_)
+    ));
+}
+
+#[test]
+fn comprehension_empty_up_exclusive_range_is_error() {
+    let err = sema_error("[x for x in 1..<1]");
+    assert!(matches!(&err, SemaError::Type(msg) if msg.contains("empty")));
+}
+
+#[test]
+fn comprehension_empty_down_exclusive_range_is_error() {
+    let err = sema_error("[x for x in 1..>1]");
+    assert!(matches!(&err, SemaError::Type(msg) if msg.contains("empty")));
+}
+
+// A plain empty exclusive range as a `for` source is NOT a sema error — the body just never runs.
+#[test]
+fn empty_exclusive_range_in_for_loop_is_valid() {
+    assert_eq!(
+        root_type(indoc! {"
+                total = 0
+                for x in 1..<1
+                    total += x
+                total
+            "}),
+        PinpType::Int
+    );
+}
+
+// --- arrays: range-init --------------------------------------------------------------
+
+#[test]
+fn range_init_inclusive_type() {
+    assert_eq!(
+        root_type("[1..5]"),
+        PinpType::Array(ArrayElementType::Int, 5)
+    );
+}
+
+#[test]
+fn range_init_exclusive_type() {
+    assert_eq!(
+        root_type("[0..<4]"),
+        PinpType::Array(ArrayElementType::Int, 4)
+    );
+}
+
+#[test]
+fn range_init_stepped_type() {
+    assert_eq!(
+        root_type("[0..10:2]"),
+        PinpType::Array(ArrayElementType::Int, 6)
+    );
+}
+
+#[test]
+fn range_init_descending_inclusive_type() {
+    assert_eq!(
+        root_type("[5..1]"),
+        PinpType::Array(ArrayElementType::Int, 5)
+    );
+}
+
+#[test]
+fn range_init_descending_exclusive_type() {
+    assert_eq!(
+        root_type("[5..>1]"),
+        PinpType::Array(ArrayElementType::Int, 4)
+    );
+}
+
+#[test]
+fn range_init_single_element_equal_bounds() {
+    // Inclusive range with start == stop yields exactly one element.
+    assert_eq!(
+        root_type("[3..3]"),
+        PinpType::Array(ArrayElementType::Int, 1)
+    );
+}
+
+#[test]
+fn range_init_empty_up_exclusive_is_error() {
+    let err = sema_error("[1..<1]");
+    assert!(matches!(&err, SemaError::Type(msg) if msg.contains("empty")));
+}
+
+#[test]
+fn range_init_empty_down_exclusive_is_error() {
+    let err = sema_error("[1..>1]");
+    assert!(matches!(&err, SemaError::Type(msg) if msg.contains("empty")));
+}
+
+#[test]
+fn range_init_variable_bound_is_error() {
+    assert!(matches!(
+        sema_error(indoc! {"
+                a = 5
+                [a..10]
+            "}),
+        SemaError::Type(_)
+    ));
+}
+
+// --- arrays: indexed assignment ------------------------------------------------------
+
+#[test]
+fn indexed_assign_int_to_float_array_promotes() {
+    // Int is assignable to Float, so this must not error.
+    analyzed(indoc! {"
+            a = [1.0, 2.0, 3.0]
+            a[0] = 5
+        "});
+}
+
+#[test]
+fn indexed_assign_float_to_int_array_is_error() {
+    assert!(matches!(
+        sema_error(indoc! {"
+                a = [1, 2, 3]
+                a[0] = 1.5
+            "}),
+        SemaError::Type(_)
+    ));
+}
+
+#[test]
+fn indexed_assign_bool_to_int_array_is_ok() {
+    // bool promotes to int.
+    analyzed(indoc! {"
+            a = [1, 2, 3]
+            a[0] = true
+        "});
+}
+
+#[test]
+fn indexed_assign_to_non_array_is_error() {
+    assert!(matches!(
+        sema_error(indoc! {"
+                a = 5
+                a[0] = 1
+            "}),
+        SemaError::Type(_)
+    ));
+}
+
+#[test]
+fn indexed_assign_float_index_is_error() {
+    assert!(matches!(
+        sema_error(indoc! {"
+                a = [1, 2, 3]
+                a[1.5] = 99
+            "}),
+        SemaError::Type(_)
+    ));
+}
+
+#[test]
+fn indexed_assign_bool_index_is_accepted() {
+    analyzed(indoc! {"
+            a = [1, 2, 3]
+            a[true] = 99
+        "});
+}
+
+#[test]
+fn indexed_assign_to_undeclared_name_is_unknown_symbol() {
+    assert!(matches!(
+        sema_error("a[0] = 1"),
+        SemaError::UnknownSymbol(_)
+    ));
+}
+
+#[test]
+fn indexed_assign_range_value_is_error() {
+    assert!(matches!(
+        sema_error(indoc! {"
+                a = [1, 2, 3]
+                a[0] = 1..5
+            "}),
+        SemaError::Type(_)
+    ));
+}
+
+#[test]
+fn array_cannot_be_passed_as_scalar_argument() {
+    // Functions accept only scalar types; an Array is not assignable to Int.
+    assert!(matches!(
+        sema_error(indoc! {"
+                sq(x: int): int is x * x
+                a = [1, 2, 3]
+                sq(a)
+            "}),
+        SemaError::Type(_)
+    ));
+}
+
+// --- slices: access ------------------------------------------------------------------
+
+#[test]
+fn slice_of_int_array_type() {
+    assert_eq!(
+        root_type(indoc! {"
+                a = [10, 20, 30, 40, 50]
+                a[1..3]
+            "}),
+        PinpType::Array(ArrayElementType::Int, 3)
+    );
+}
+
+#[test]
+fn slice_of_float_array_type() {
+    assert_eq!(
+        root_type(indoc! {"
+                a = [1.5, 2.5, 3.5, 4.5]
+                a[0..1]
+            "}),
+        PinpType::Array(ArrayElementType::Float, 2)
+    );
+}
+
+#[test]
+fn slice_of_bool_array_type() {
+    assert_eq!(
+        root_type(indoc! {"
+                a = [true, false, true, false]
+                a[0..2]
+            "}),
+        PinpType::Array(ArrayElementType::Bool, 3)
+    );
+}
+
+#[test]
+fn exclusive_slice_type() {
+    assert_eq!(
+        root_type(indoc! {"
+                a = [10, 20, 30, 40, 50]
+                a[1..<4]
+            "}),
+        PinpType::Array(ArrayElementType::Int, 3)
+    );
+}
+
+#[test]
+fn single_element_slice_type() {
+    // Inclusive range with start == stop is a one-element slice.
+    assert_eq!(
+        root_type(indoc! {"
+                a = [10, 20, 30]
+                a[1..1]
+            "}),
+        PinpType::Array(ArrayElementType::Int, 1)
+    );
+}
+
+#[test]
+fn slice_spanning_whole_array() {
+    assert_eq!(
+        root_type(indoc! {"
+                a = [10, 20, 30]
+                a[0..2]
+            "}),
+        PinpType::Array(ArrayElementType::Int, 3)
+    );
+}
+
+#[test]
+fn slice_stop_at_last_valid_index_is_ok() {
+    assert_eq!(
+        root_type(indoc! {"
+                a = [10, 20, 30, 40, 50]
+                a[2..4]
+            "}),
+        PinpType::Array(ArrayElementType::Int, 3)
+    );
+}
+
+#[test]
+fn slice_stop_equals_len_inclusive_is_error() {
+    // Inclusive stop == len is out of bounds (valid indices are 0..len-1).
+    assert!(matches!(
+        sema_error(indoc! {"
+                a = [10, 20, 30]
+                a[0..3]
+            "}),
+        SemaError::Type(_)
+    ));
+}
+
+#[test]
+fn exclusive_slice_stop_equals_len_is_ok() {
+    // Exclusive stop == len is valid: up to but not including index len.
+    assert_eq!(
+        root_type(indoc! {"
+                a = [10, 20, 30]
+                a[0..<3]
+            "}),
+        PinpType::Array(ArrayElementType::Int, 3)
+    );
+}
+
+#[test]
+fn exclusive_slice_stop_exceeds_len_is_error() {
+    assert!(matches!(
+        sema_error(indoc! {"
+                a = [10, 20, 30]
+                a[0..<4]
+            "}),
+        SemaError::Type(_)
+    ));
+}
+
+#[test]
+fn slice_negative_start_is_error() {
+    assert!(matches!(
+        sema_error(indoc! {"
+                a = [10, 20, 30]
+                a[-1..1]
+            "}),
+        SemaError::Type(_)
+    ));
+}
+
+#[test]
+fn slice_with_step_is_error() {
+    assert!(matches!(
+        sema_error(indoc! {"
+                a = [10, 20, 30, 40, 50]
+                a[0..4:2]
+            "}),
+        SemaError::Type(_)
+    ));
+}
+
+#[test]
+fn slice_with_variable_start_is_error() {
+    assert!(matches!(
+        sema_error(indoc! {"
+                a = [10, 20, 30]
+                n = 1
+                a[n..2]
+            "}),
+        SemaError::Type(_)
+    ));
+}
+
+#[test]
+fn slice_with_variable_stop_is_error() {
+    assert!(matches!(
+        sema_error(indoc! {"
+                a = [10, 20, 30]
+                n = 2
+                a[0..n]
+            "}),
+        SemaError::Type(_)
+    ));
+}
+
+#[test]
+fn slice_descending_operator_is_error() {
+    assert!(matches!(
+        sema_error(indoc! {"
+                a = [10, 20, 30, 40, 50]
+                a[4..>1]
+            "}),
+        SemaError::Type(_)
+    ));
+}
+
+#[test]
+fn slice_empty_exclusive_equal_bounds_is_error() {
+    // 1..<1 is an empty slice (0 elements) — rejected.
+    assert!(matches!(
+        sema_error(indoc! {"
+                a = [10, 20, 30]
+                a[1..<1]
+            "}),
+        SemaError::Type(_)
+    ));
+}
+
+#[test]
+fn slice_on_int_scalar_is_error() {
+    assert!(matches!(
+        sema_error(indoc! {"
+                a = 5
+                a[0..1]
+            "}),
+        SemaError::Type(_)
+    ));
+}
+
+#[test]
+fn slice_result_is_indexable() {
+    // A slice is an Array; indexing it yields the element type.
+    assert_eq!(
+        root_type(indoc! {"
+                a = [10, 20, 30, 40, 50]
+                a[1..3][0]
+            "}),
+        PinpType::Int
+    );
+}
+
+#[test]
+fn slice_result_has_len() {
+    assert_eq!(
+        root_type(indoc! {"
+                a = [10, 20, 30, 40, 50]
+                a[1..3].len
+            "}),
+        PinpType::Int
+    );
+}
+
+// --- slices: assign ------------------------------------------------------------------
+
+#[test]
+fn slice_assign_scalar_to_int_array_is_ok() {
+    analyzed(indoc! {"
+            a = [1, 2, 3, 4, 5]
+            a[1..3] = 0
+        "});
+}
+
+#[test]
+fn slice_assign_bool_to_int_array_is_ok() {
+    analyzed(indoc! {"
+            a = [1, 2, 3, 4, 5]
+            a[1..3] = true
+        "});
+}
+
+#[test]
+fn slice_assign_int_to_float_array_promotes() {
+    analyzed(indoc! {"
+            a = [1.0, 2.0, 3.0, 4.0, 5.0]
+            a[1..3] = 0
+        "});
+}
+
+#[test]
+fn slice_assign_float_to_int_array_is_error() {
+    assert!(matches!(
+        sema_error(indoc! {"
+                a = [1, 2, 3, 4, 5]
+                a[1..3] = 1.5
+            "}),
+        SemaError::Type(_)
+    ));
+}
+
+#[test]
+fn slice_assign_with_step_is_error() {
+    assert!(matches!(
+        sema_error(indoc! {"
+                a = [1, 2, 3, 4, 5]
+                a[0..4:2] = 0
+            "}),
+        SemaError::Type(_)
+    ));
+}
+
+#[test]
+fn slice_assign_oob_is_error() {
+    assert!(matches!(
+        sema_error(indoc! {"
+                a = [1, 2, 3]
+                a[0..3] = 0
+            "}),
+        SemaError::Type(_)
+    ));
+}
+
+#[test]
+fn slice_assign_variable_bounds_is_error() {
+    assert!(matches!(
+        sema_error(indoc! {"
+                a = [1, 2, 3]
+                n = 2
+                a[0..n] = 0
+            "}),
+        SemaError::Type(_)
+    ));
+}
+
+#[test]
+fn slice_assign_to_non_array_is_error() {
+    assert!(matches!(
+        sema_error(indoc! {"
+                a = 5
+                a[0..1] = 0
+            "}),
+        SemaError::Type(_)
+    ));
+}
+
+#[test]
+fn slice_assign_negative_start_is_error() {
+    assert!(matches!(
+        sema_error(indoc! {"
+                a = [1, 2, 3, 4, 5]
+                a[-1..2] = 0
+            "}),
+        SemaError::Type(_)
+    ));
 }
