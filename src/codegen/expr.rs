@@ -5,7 +5,7 @@ use super::*;
 use inkwell::IntPredicate;
 use inkwell::values::BasicMetadataValueEnum;
 
-use crate::parser::{BinOp, ExprId, Node, UnOp};
+use crate::parser::{ArrayElementType, BinOp, ExprId, Node, RangeKind, UnOp};
 
 impl<'ctx, 'ast> CodeGen<'ctx, 'ast> {
     // -------------------------------------------------------------------------
@@ -58,6 +58,10 @@ impl<'ctx, 'ast> CodeGen<'ctx, 'ast> {
             Node::If { .. } => return self.gen_if(expr_id),
             Node::Range { .. } => self.gen_range(expr_id)?,
             Node::Membership { .. } => self.gen_membership(expr_id)?,
+            Node::ArrayLiteral { .. } => self.gen_array_literal(expr_id)?,
+            Node::Index { .. } => self.gen_index(expr_id)?,
+            Node::Member { .. } => self.gen_member(expr_id)?,
+            Node::Comprehension { .. } => self.gen_comprehension(expr_id)?,
         };
         Ok(Some(value))
     }
@@ -419,6 +423,481 @@ impl<'ctx, 'ast> CodeGen<'ctx, 'ast> {
         }
     }
 
+    // -------------------------------------------------------------------------
+    // Array helpers
+    // -------------------------------------------------------------------------
+
+    // The LLVM element type for an `ArrayElementType`.
+    fn element_llvm_type(&self, elem: ArrayElementType) -> inkwell::types::BasicTypeEnum<'ctx> {
+        match elem {
+            ArrayElementType::Bool => self.bool_type().into(),
+            ArrayElementType::Int => self.int_type().into(),
+            ArrayElementType::Float => self.float_type().into(),
+        }
+    }
+
+    // Size in bytes of one array element on the target (64-bit x86_64 assumed).
+    fn element_byte_size(elem: ArrayElementType) -> u64 {
+        match elem {
+            ArrayElementType::Bool => 1,
+            ArrayElementType::Int => 8,
+            ArrayElementType::Float => 8,
+        }
+    }
+
+    // Get or declare the `pinp_alloc(i64 size) -> ptr` external function.
+    fn declare_pinp_alloc(&self) -> inkwell::values::FunctionValue<'ctx> {
+        if let Some(f) = self.module.get_function("pinp_alloc") {
+            return f;
+        }
+        let ptr_type = self.context.ptr_type(AddressSpace::default());
+        let fn_type = ptr_type.fn_type(&[self.int_type().into()], false);
+        self.module.add_function("pinp_alloc", fn_type, None)
+    }
+
+    // Call `pinp_alloc(byte_count)` and return the resulting pointer.
+    fn build_pinp_alloc(
+        &self,
+        byte_count: inkwell::values::IntValue<'ctx>,
+    ) -> Result<inkwell::values::PointerValue<'ctx>, String> {
+        let alloc_fn = self.declare_pinp_alloc();
+        let call = self
+            .builder
+            .build_call(alloc_fn, &[byte_count.into()], "alloc")
+            .map_err(err)?;
+        Ok(basic_value(call.try_as_basic_value()).into_pointer_value())
+    }
+
+    // Build a GEP pointer to element `index` in an array starting at `base`.
+    pub(super) fn build_element_ptr(
+        &self,
+        elem: ArrayElementType,
+        base: inkwell::values::PointerValue<'ctx>,
+        index: inkwell::values::IntValue<'ctx>,
+    ) -> Result<inkwell::values::PointerValue<'ctx>, String> {
+        let elem_type = self.element_llvm_type(elem);
+        unsafe {
+            self.builder
+                .build_gep(elem_type, base, &[index], "elem_ptr")
+                .map_err(err)
+        }
+    }
+
+    // Emit a bounds check for `index` into an array of `length` elements. Emits a runtime error
+    // call + unreachable on the out-of-bounds path; on the ok path returns a GEP (LLVM
+    // `getelementptr`) — the address of element `index` within the heap buffer, computed by
+    // scaling `index` by the element byte size and adding it to the base pointer.
+    pub(super) fn bounds_check_and_gep(
+        &mut self,
+        elem: ArrayElementType,
+        base: inkwell::values::PointerValue<'ctx>,
+        index: inkwell::values::IntValue<'ctx>,
+        length: usize,
+    ) -> Result<inkwell::values::PointerValue<'ctx>, String> {
+        let n = self.int_type().const_int(length as u64, false);
+        let zero = self.int_type().const_zero();
+        let too_low = self
+            .builder
+            .build_int_compare(IntPredicate::SLT, index, zero, "too_low")
+            .map_err(err)?;
+        let too_high = self
+            .builder
+            .build_int_compare(IntPredicate::SGE, index, n, "too_high")
+            .map_err(err)?;
+        let oob = self
+            .builder
+            .build_or(too_low, too_high, "oob")
+            .map_err(err)?;
+        let function = self.current_function();
+        let err_bb = self.context.append_basic_block(function, "arr_oob");
+        let ok_bb = self.context.append_basic_block(function, "arr_ok");
+        self.builder
+            .build_conditional_branch(oob, err_bb, ok_bb)
+            .map_err(err)?;
+        self.builder.position_at_end(err_bb);
+        self.gen_runtime_error_call("Array index out of bounds.")?;
+        self.builder.position_at_end(ok_bb);
+        self.build_element_ptr(elem, base, index)
+    }
+
+    // -------------------------------------------------------------------------
+    // Array expression emitters
+    // -------------------------------------------------------------------------
+
+    // `[e0, e1, …]` — allocate `n * elem_size` bytes, store each promoted element.
+    // A single-element list whose sole element is a `Range` node is range-init syntax
+    // (`[start..stop[:step]]`); that case is routed to `gen_array_from_range`.
+    fn gen_array_literal(&mut self, expr_id: ExprId) -> Result<BasicValueEnum<'ctx>, String> {
+        let PinpType::Array(elem_type, n) = self.ast.type_of(expr_id) else {
+            unreachable!("ArrayLiteral has Array type")
+        };
+        let Node::ArrayLiteral { elements } = self.ast.node(expr_id).clone() else {
+            unreachable!("gen_array_literal on wrong node")
+        };
+        if elements.len() == 1 && matches!(self.ast.node(elements[0]), Node::Range { .. }) {
+            return self.gen_array_from_range(elements[0], elem_type, n);
+        }
+        let byte_count = self
+            .int_type()
+            .const_int(n as u64 * Self::element_byte_size(elem_type), false);
+        let array_ptr = self.build_pinp_alloc(byte_count)?;
+        let elem_pinp_type = PinpType::from(elem_type);
+        for (i, elem_id) in elements.iter().enumerate() {
+            let raw = self.expect_value(*elem_id)?;
+            let promoted = self.promote(raw, self.ast.type_of(*elem_id), elem_pinp_type);
+            let index = self.int_type().const_int(i as u64, false);
+            let ptr = self.build_element_ptr(elem_type, array_ptr, index)?;
+            self.builder.build_store(ptr, promoted).map_err(err)?;
+        }
+        Ok(array_ptr.into())
+    }
+
+    // `[start..stop[:step]]` — allocate `n` elements and fill with the integer sequence via a
+    // counted loop. `n` is already computed at sema time; the loop bound is a compile-time constant.
+    // Range-init always produces `Int` elements (ranges are integer sequences).
+    fn gen_array_from_range(
+        &mut self,
+        range_id: ExprId,
+        elem_type: ArrayElementType,
+        n: usize,
+    ) -> Result<BasicValueEnum<'ctx>, String> {
+        let byte_count = self
+            .int_type()
+            .const_int(n as u64 * Self::element_byte_size(elem_type), false);
+        let array_ptr = self.build_pinp_alloc(byte_count)?;
+
+        // Generate the range value — this gives us the (start, step) pair as LLVM values.
+        let range_val = self.gen_range(range_id)?;
+        let (start, _stop, step, _inclusive) = self.extract_range(range_val)?;
+
+        // Counter slot: current range value. GEP index slot: current write position.
+        let counter = self.alloca_at_entry(PinpType::Int)?;
+        let gep_slot = self.alloca_at_entry(PinpType::Int)?;
+        self.builder.build_store(counter, start).map_err(err)?;
+        self.builder
+            .build_store(gep_slot, self.int_type().const_zero())
+            .map_err(err)?;
+
+        let function = self.current_function();
+        let header_bb = self.context.append_basic_block(function, "rinit_header");
+        let body_bb = self.context.append_basic_block(function, "rinit_body");
+        let exit_bb = self.context.append_basic_block(function, "rinit_exit");
+
+        self.builder
+            .build_unconditional_branch(header_bb)
+            .map_err(err)?;
+
+        // Header: iterate `n` times.
+        self.builder.position_at_end(header_bb);
+        let gep_idx = self.load_counter(gep_slot)?;
+        let n_val = self.int_type().const_int(n as u64, false);
+        let cond = self
+            .builder
+            .build_int_compare(IntPredicate::SLT, gep_idx, n_val, "rinit_cond")
+            .map_err(err)?;
+        self.builder
+            .build_conditional_branch(cond, body_bb, exit_bb)
+            .map_err(err)?;
+
+        // Body: store the current counter value and advance both counters.
+        self.builder.position_at_end(body_bb);
+        let cur_val = self.load_counter(counter)?;
+        let gep_idx_body = self.load_counter(gep_slot)?;
+        let elem_ptr = self.build_element_ptr(elem_type, array_ptr, gep_idx_body)?;
+        let promoted = self.promote(cur_val.into(), PinpType::Int, PinpType::from(elem_type));
+        self.builder.build_store(elem_ptr, promoted).map_err(err)?;
+        let next_counter = self
+            .builder
+            .build_int_add(cur_val, step, "next_counter")
+            .map_err(err)?;
+        self.builder
+            .build_store(counter, next_counter)
+            .map_err(err)?;
+        let one = self.int_type().const_int(1, false);
+        let next_gep = self
+            .builder
+            .build_int_add(gep_idx_body, one, "next_gep")
+            .map_err(err)?;
+        self.builder.build_store(gep_slot, next_gep).map_err(err)?;
+        self.builder
+            .build_unconditional_branch(header_bb)
+            .map_err(err)?;
+
+        self.builder.position_at_end(exit_bb);
+        Ok(array_ptr.into())
+    }
+
+    // `array[index]` — scalar index: bounds-check then load one element.
+    // `array[start..stop]` — slice index: allocate a new array and copy the sub-range.
+    fn gen_index(&mut self, expr_id: ExprId) -> Result<BasicValueEnum<'ctx>, String> {
+        let Node::Index {
+            array: array_id,
+            index: index_id,
+        } = self.ast.node(expr_id)
+        else {
+            unreachable!("gen_index on wrong node")
+        };
+        let (array_id, index_id) = (*array_id, *index_id);
+        if matches!(self.ast.node(index_id), Node::Range { .. }) {
+            return self.gen_slice(expr_id, array_id, index_id);
+        }
+        let PinpType::Array(elem_type, n) = self.ast.type_of(array_id) else {
+            unreachable!("Index object has Array type")
+        };
+        let array_ptr = self.expect_value(array_id)?.into_pointer_value();
+        let index = self.as_int(index_id)?;
+        let elem_ptr = self.bounds_check_and_gep(elem_type, array_ptr, index, n)?;
+        self.builder
+            .build_load(self.element_llvm_type(elem_type), elem_ptr, "load_elem")
+            .map_err(err)
+    }
+
+    // `array[start..stop]` — allocate a new `count`-element array and copy elements
+    // `src[start .. start+count]` into it. Both bounds are literal integers (sema-enforced), so
+    // the copy count and start offset fold to constants. LLVM's loop-idiom pass replaces a
+    // fixed-count copy loop with a `memcpy` at `-O1`+.
+    fn gen_slice(
+        &mut self,
+        expr_id: ExprId,
+        array_id: ExprId,
+        range_id: ExprId,
+    ) -> Result<BasicValueEnum<'ctx>, String> {
+        let PinpType::Array(elem_type, count) = self.ast.type_of(expr_id) else {
+            unreachable!("slice result has Array type")
+        };
+        let (start_lit, _, _) = self.read_slice_range(range_id);
+        let array_ptr = self.expect_value(array_id)?.into_pointer_value();
+        let start_offset = self.int_type().const_int(start_lit as u64, false);
+        let byte_count = self
+            .int_type()
+            .const_int(count as u64 * Self::element_byte_size(elem_type), false);
+        let dst_ptr = self.build_pinp_alloc(byte_count)?;
+
+        let n_val = self.int_type().const_int(count as u64, false);
+        let counter = self.alloca_at_entry(PinpType::Int)?;
+        self.builder
+            .build_store(counter, self.int_type().const_zero())
+            .map_err(err)?;
+
+        let function = self.current_function();
+        let header = self.context.append_basic_block(function, "slice_hdr");
+        let body = self.context.append_basic_block(function, "slice_body");
+        let exit = self.context.append_basic_block(function, "slice_exit");
+
+        self.builder
+            .build_unconditional_branch(header)
+            .map_err(err)?;
+
+        self.builder.position_at_end(header);
+        let idx = self.load_counter(counter)?;
+        let cond = self
+            .builder
+            .build_int_compare(IntPredicate::SLT, idx, n_val, "slice_cond")
+            .map_err(err)?;
+        self.builder
+            .build_conditional_branch(cond, body, exit)
+            .map_err(err)?;
+
+        self.builder.position_at_end(body);
+        let src_idx = self
+            .builder
+            .build_int_add(idx, start_offset, "src_idx")
+            .map_err(err)?;
+        let src_ptr = self.build_element_ptr(elem_type, array_ptr, src_idx)?;
+        let val = self
+            .builder
+            .build_load(self.element_llvm_type(elem_type), src_ptr, "elem")
+            .map_err(err)?;
+        let dst_ep = self.build_element_ptr(elem_type, dst_ptr, idx)?;
+        self.builder.build_store(dst_ep, val).map_err(err)?;
+        let one = self.int_type().const_int(1, false);
+        let next = self.builder.build_int_add(idx, one, "next").map_err(err)?;
+        self.builder.build_store(counter, next).map_err(err)?;
+        self.builder
+            .build_unconditional_branch(header)
+            .map_err(err)?;
+
+        self.builder.position_at_end(exit);
+        Ok(dst_ptr.into())
+    }
+
+    // Extract the literal (start, stop, kind) from a slice Range node. Sema guarantees both bounds
+    // are integer literals and the kind is Inclusive or UpExclusive.
+    pub(super) fn read_slice_range(&self, range_id: ExprId) -> (i64, i64, RangeKind) {
+        let (start_id, stop_id, kind) = match self.ast.node(range_id) {
+            Node::Range {
+                start, stop, kind, ..
+            } => (*start, *stop, *kind),
+            _ => unreachable!(),
+        };
+        let start_val = match self.ast.node(start_id) {
+            Node::Int(val) => *val,
+            _ => unreachable!("slice start is always a literal int"),
+        };
+        let stop_val = match self.ast.node(stop_id) {
+            Node::Int(val) => *val,
+            _ => unreachable!("slice stop is always a literal int"),
+        };
+        (start_val, stop_val, kind)
+    }
+
+    // `array.len` — returns the compile-time-known length as an `i64` constant.
+    fn gen_member(&self, expr_id: ExprId) -> Result<BasicValueEnum<'ctx>, String> {
+        let Node::Member {
+            object: object_id, ..
+        } = self.ast.node(expr_id)
+        else {
+            unreachable!("gen_member on wrong node")
+        };
+        let object_id = *object_id;
+        let PinpType::Array(_, n) = self.ast.type_of(object_id) else {
+            unreachable!("Member object has Array type")
+        };
+        // Sema already validated the member name is `len`.
+        Ok(self.int_type().const_int(n as u64, false).into())
+    }
+
+    // `[element for var[:type] in source]` — allocate array, loop over the range, store each
+    // element. The range must have literal bounds (enforced by sema), so the loop bound is a
+    // compile-time constant.
+    fn gen_comprehension(&mut self, expr_id: ExprId) -> Result<BasicValueEnum<'ctx>, String> {
+        let Node::Comprehension {
+            element,
+            var,
+            var_type,
+            source,
+        } = self.ast.node(expr_id)
+        else {
+            unreachable!("gen_comprehension on wrong node")
+        };
+        let (element, var, var_type, source) = (*element, *var, *var_type, *source);
+        let PinpType::Array(elem_type, n) = self.ast.type_of(expr_id) else {
+            unreachable!("Comprehension has Array type")
+        };
+
+        // Allocate the result array.
+        let byte_count = self
+            .int_type()
+            .const_int(n as u64 * Self::element_byte_size(elem_type), false);
+        let array_ptr = self.build_pinp_alloc(byte_count)?;
+
+        // Generate the range (fires guard_zero_step if needed).
+        let range_val = self.gen_range(source)?;
+        let (start, _stop, step, _inclusive) = self.extract_range(range_val)?;
+
+        // Allocate the range variable slot and the GEP index counter.
+        let range_var_slot = self.alloca_at_entry(var_type)?;
+        let gep_counter = self.alloca_at_entry(PinpType::Int)?;
+
+        // Initialise: range variable ← start (promoted if Float), GEP counter ← 0.
+        let init_var_val: BasicValueEnum = match var_type {
+            PinpType::Float => self
+                .builder
+                .build_signed_int_to_float(start, self.float_type(), "init_float")
+                .map_err(err)?
+                .into(),
+            _ => start.into(),
+        };
+        self.builder
+            .build_store(range_var_slot, init_var_val)
+            .map_err(err)?;
+        self.builder
+            .build_store(gep_counter, self.int_type().const_zero())
+            .map_err(err)?;
+
+        // Expose `var` in the local scope so the element expression can read it.
+        self.push_scope();
+        self.locals
+            .last_mut()
+            .unwrap()
+            .insert(var, (range_var_slot, var_type));
+
+        let function = self.current_function();
+        let header_bb = self.context.append_basic_block(function, "compr_header");
+        let body_bb = self.context.append_basic_block(function, "compr_body");
+        let exit_bb = self.context.append_basic_block(function, "compr_exit");
+
+        self.builder
+            .build_unconditional_branch(header_bb)
+            .map_err(err)?;
+
+        // Header: loop while GEP counter < n.
+        self.builder.position_at_end(header_bb);
+        let gep_idx = self.load_counter(gep_counter)?;
+        let n_val = self.int_type().const_int(n as u64, false);
+        let cond = self
+            .builder
+            .build_int_compare(IntPredicate::SLT, gep_idx, n_val, "compr_cond")
+            .map_err(err)?;
+        self.builder
+            .build_conditional_branch(cond, body_bb, exit_bb)
+            .map_err(err)?;
+
+        // Body: evaluate element, GEP, store; then advance both counters.
+        self.builder.position_at_end(body_bb);
+        let raw = self.expect_value(element)?;
+        let promoted = self.promote(raw, self.ast.type_of(element), PinpType::from(elem_type));
+        let gep_idx_body = self.load_counter(gep_counter)?;
+        let elem_ptr = self.build_element_ptr(elem_type, array_ptr, gep_idx_body)?;
+        self.builder.build_store(elem_ptr, promoted).map_err(err)?;
+
+        // Advance GEP counter.
+        let one = self.int_type().const_int(1, false);
+        let next_gep = self
+            .builder
+            .build_int_add(gep_idx_body, one, "next_gep")
+            .map_err(err)?;
+        self.builder
+            .build_store(gep_counter, next_gep)
+            .map_err(err)?;
+
+        // Advance range variable.
+        match var_type {
+            PinpType::Float => {
+                let cur_float = self
+                    .builder
+                    .build_load(self.float_type(), range_var_slot, "cur_float")
+                    .map_err(err)?
+                    .into_float_value();
+                let float_step = self
+                    .builder
+                    .build_signed_int_to_float(step, self.float_type(), "float_step")
+                    .map_err(err)?;
+                let next_float = self
+                    .builder
+                    .build_float_add(cur_float, float_step, "next_float")
+                    .map_err(err)?;
+                self.builder
+                    .build_store(range_var_slot, next_float)
+                    .map_err(err)?;
+            }
+            _ => {
+                let cur_int = self
+                    .builder
+                    .build_load(self.int_type(), range_var_slot, "cur_int")
+                    .map_err(err)?
+                    .into_int_value();
+                let next_int = self
+                    .builder
+                    .build_int_add(cur_int, step, "next_int")
+                    .map_err(err)?;
+                self.builder
+                    .build_store(range_var_slot, next_int)
+                    .map_err(err)?;
+            }
+        }
+
+        self.builder
+            .build_unconditional_branch(header_bb)
+            .map_err(err)?;
+
+        // Exit: clean up scope and return the allocated pointer.
+        self.builder.position_at_end(exit_bb);
+        self.pop_scope();
+
+        Ok(array_ptr.into())
+    }
+
     pub(super) fn zero(&self, pinp_type: PinpType) -> BasicValueEnum<'ctx> {
         match pinp_type {
             PinpType::Bool => self.bool_type().const_zero().into(),
@@ -426,6 +905,12 @@ impl<'ctx, 'ast> CodeGen<'ctx, 'ast> {
             PinpType::Float => self.float_type().const_zero().into(),
             PinpType::Void => unreachable!("Void has no zero value."),
             PinpType::Range => self.range_type().const_zero().into(),
+            // A null pointer is the zero for an array slot (never valid; must be overwritten before use).
+            PinpType::Array(_, _) => self
+                .context
+                .ptr_type(AddressSpace::default())
+                .const_null()
+                .into(),
         }
     }
 }

@@ -1,7 +1,9 @@
 // SPDX-License-Identifier: MIT
 
 use super::*;
-use crate::parser::{BinOp, Block, ExprId, FuncDef, Place, RangeKind, Stmt, UnOp};
+use crate::parser::{
+    ArrayElementType, BinOp, Block, ExprId, FuncDef, Place, RangeKind, Stmt, UnOp,
+};
 
 impl Analyzer<'_, '_> {
     // -------------------------------------------------------------------------
@@ -111,6 +113,14 @@ impl Analyzer<'_, '_> {
                 self.analyze_block(body)?;
                 self.loop_vars.pop();
                 self.scopes.pop();
+                Ok(())
+            }
+            Stmt::IndexedAssign {
+                target,
+                index,
+                value,
+            } => {
+                self.indexed_assign_check(*target, *index, *value)?;
                 Ok(())
             }
         }
@@ -225,6 +235,15 @@ impl Analyzer<'_, '_> {
                 kind,
             } => self.range_type(start, stop, step, kind)?,
             Node::Membership { value, range } => self.membership_type(value, range)?,
+            Node::ArrayLiteral { elements } => self.array_literal_type(&elements)?,
+            Node::Index { array, index } => self.index_type(array, index)?,
+            Node::Member { object, member } => self.member_type(object, member)?,
+            Node::Comprehension {
+                element,
+                var,
+                var_type,
+                source,
+            } => self.comprehension_type(element, var, var_type, source)?,
         };
         self.types[expr_id.value()] = inferred;
         Ok(inferred)
@@ -350,12 +369,13 @@ impl Analyzer<'_, '_> {
                 }
             }
             RangeKind::UpExclusive => {
-                if start_value >= stop_value {
+                // `start == stop` is an empty range (zero iterations), not a direction error.
+                if start_value > stop_value {
                     return Err(SemaError::Type("A descending range must use ..>.".into()));
                 }
             }
             RangeKind::DownExclusive => {
-                if start_value <= stop_value {
+                if start_value < stop_value {
                     return Err(SemaError::Type("An ascending range must use ..<.".into()));
                 }
             }
@@ -379,6 +399,335 @@ impl Analyzer<'_, '_> {
             )));
         }
         Ok(PinpType::Bool)
+    }
+
+    /// Types an array literal: all elements are analysed and must share a common type.
+    /// A single `Range` element is range-init syntax (`[start..stop[:step]]`); sema routes it
+    /// to `array_from_range_type` rather than treating the range as a scalar element.
+    fn array_literal_type(&mut self, elements: &[ExprId]) -> Result<PinpType, SemaError> {
+        // The parser already rejects `[]`; this guard is a safety net.
+        if elements.is_empty() {
+            return Err(SemaError::Type("Array literal cannot be empty.".into()));
+        }
+        // Range-init: `[literal-range]` — the sole element is a Range node, not a scalar.
+        if elements.len() == 1 && matches!(self.nodes[elements[0].value()], Node::Range { .. }) {
+            return self.array_from_range_type(elements[0]);
+        }
+        let mut common = self.analyze_expr(elements[0])?;
+        for &elem_id in &elements[1..] {
+            let elem = self.analyze_expr(elem_id)?;
+            common = join(common, elem)
+                .ok_or_else(|| SemaError::Type("Array elements have incompatible types.".into()))?;
+        }
+        Ok(PinpType::Array(
+            self.to_array_element_type(common)?,
+            elements.len(),
+        ))
+    }
+
+    /// Types a range-init `[literal-range]`. Every range bound must be an integer literal (so the
+    /// element count is compile-time constant); the result is always `Array(Int, len)`.
+    fn array_from_range_type(&mut self, range_id: ExprId) -> Result<PinpType, SemaError> {
+        // Analyse the range so its sub-expressions get types — needed for codegen.
+        self.analyze_expr(range_id)?;
+        let count = self.literal_range_length(range_id).map_err(|err| {
+            // Re-word the comprehension-centric message for the range-init context.
+            match err {
+                SemaError::Type(msg) => SemaError::Type(
+                    msg.replace("Comprehension range", "Array range initialisation")
+                        .replace("Comprehension source", "Array range initialisation"),
+                ),
+                other => other,
+            }
+        })?;
+        if count == 0 {
+            return Err(SemaError::Type(
+                "Array range initialisation yields an empty array.".into(),
+            ));
+        }
+        Ok(PinpType::Array(ArrayElementType::Int, count))
+    }
+
+    /// Types an index expression `array[index]`: the object must be an array. A scalar `Int`-like
+    /// index yields the element type; a `Range` index (a slice) yields a sub-array.
+    fn index_type(&mut self, array: ExprId, index: ExprId) -> Result<PinpType, SemaError> {
+        let array_type = self.analyze_expr(array)?;
+        let PinpType::Array(elem_type, array_len) = array_type else {
+            return Err(SemaError::Type(format!(
+                "Index requires an array, got {array_type:?}."
+            )));
+        };
+        if matches!(self.nodes[index.value()], Node::Range { .. }) {
+            return self.slice_type(index, elem_type, array_len);
+        }
+        let index_type = self.analyze_expr(index)?;
+        if !int_like(index_type) {
+            return Err(SemaError::Type(format!(
+                "Array index must be Int, got {index_type:?}."
+            )));
+        }
+        Ok(PinpType::from(elem_type))
+    }
+
+    /// Types a slice expression `array[start..stop]` or `array[start..<stop]`. The range must be
+    /// ascending (`..` or `..<`), literal-bound (no variables), non-empty, and in-bounds for the
+    /// array. Returns `Array(elem_type, count)`.
+    fn slice_type(
+        &mut self,
+        range_id: ExprId,
+        elem_type: ArrayElementType,
+        array_len: usize,
+    ) -> Result<PinpType, SemaError> {
+        let (start, stop, step, kind) = match self.nodes[range_id.value()] {
+            Node::Range {
+                start,
+                stop,
+                step,
+                kind,
+            } => (start, stop, step, kind),
+            _ => unreachable!(),
+        };
+        if step.is_some() {
+            return Err(SemaError::Type(
+                "Array slices do not support a step.".into(),
+            ));
+        }
+        if kind == RangeKind::DownExclusive {
+            return Err(SemaError::Type(
+                "Array slices must be ascending; use `..` or `..<`.".into(),
+            ));
+        }
+        let start_val = self
+            .int_literal(start)
+            .ok_or_else(|| SemaError::Type("Slice bounds must be integer literals.".into()))?;
+        let stop_val = self
+            .int_literal(stop)
+            .ok_or_else(|| SemaError::Type("Slice bounds must be integer literals.".into()))?;
+        // Analyze sub-expressions so their types are recorded for codegen.
+        self.analyze_expr(start)?;
+        self.analyze_expr(stop)?;
+        self.types[range_id.value()] = PinpType::Range;
+        if start_val < 0 {
+            return Err(SemaError::Type("Slice start must not be negative.".into()));
+        }
+        let count = match kind {
+            RangeKind::Inclusive => {
+                if stop_val < start_val {
+                    return Err(SemaError::Type(
+                        "Slice stop must not be less than start.".into(),
+                    ));
+                }
+                (stop_val - start_val + 1) as usize
+            }
+            RangeKind::UpExclusive => {
+                if stop_val <= start_val {
+                    return Err(SemaError::Type(
+                        "Empty slice (start >= stop with `..<`).".into(),
+                    ));
+                }
+                (stop_val - start_val) as usize
+            }
+            RangeKind::DownExclusive => unreachable!(),
+        };
+        let out_of_bounds = match kind {
+            RangeKind::Inclusive => stop_val >= array_len as i64,
+            RangeKind::UpExclusive => stop_val > array_len as i64,
+            RangeKind::DownExclusive => unreachable!(),
+        };
+        if out_of_bounds {
+            return Err(SemaError::Type(format!(
+                "Slice is out of bounds for array of length {array_len}."
+            )));
+        }
+        Ok(PinpType::Array(elem_type, count))
+    }
+
+    /// Types a member access `object.member`. Currently only `.len` on arrays is valid.
+    fn member_type(&mut self, object: ExprId, member: SymId) -> Result<PinpType, SemaError> {
+        let object_type = self.analyze_expr(object)?;
+        match object_type {
+            PinpType::Array(_, _) => {}
+            other => {
+                return Err(SemaError::Type(format!(
+                    "`.{}` is not valid on {other:?}.",
+                    self.name(member)
+                )));
+            }
+        }
+        match self.name(member) {
+            "len" => Ok(PinpType::Int),
+            other => Err(SemaError::Type(format!("Unknown member `.{other}`."))),
+        }
+    }
+
+    /// Types a comprehension `[element for var[:type] in source]`. The source must be a range with
+    /// all literal bounds (so the array length is known at compile time); the loop variable is in
+    /// scope while the element expression is typed.
+    fn comprehension_type(
+        &mut self,
+        element: ExprId,
+        var: SymId,
+        var_type: PinpType,
+        source: ExprId,
+    ) -> Result<PinpType, SemaError> {
+        // Only upward promotions are valid for the loop variable.
+        // `Int` and `Float` are accepted; `Bool` is rejected because the range counter is an `i64`
+        // and narrowing it to `i1` is not a meaningful promotion.
+        if var_type == PinpType::Bool {
+            return Err(SemaError::Type(
+                "Cannot promote range variable to bool.".into(),
+            ));
+        }
+        let source_type = self.analyze_expr(source)?;
+        if source_type != PinpType::Range {
+            return Err(SemaError::Type(
+                "Comprehension source must be a range.".into(),
+            ));
+        }
+        let count = self.literal_range_length(source)?;
+        if count == 0 {
+            return Err(SemaError::Type(
+                "Comprehension over an empty range produces no elements.".into(),
+            ));
+        }
+        // Type the element expression with `var` in scope.
+        self.scopes.push(FxHashMap::default());
+        self.scopes.last_mut().unwrap().insert(var, var_type);
+        let elem_pinp_type = self.analyze_expr(element)?;
+        self.scopes.pop();
+        Ok(PinpType::Array(
+            self.to_array_element_type(elem_pinp_type)?,
+            count,
+        ))
+    }
+
+    /// Checks `arr[index] = value`: `target` must be a bound array. A scalar index requires
+    /// `Int`-like; a range index (slice assign) fills the sub-range with a scalar broadcast.
+    fn indexed_assign_check(
+        &mut self,
+        target: Place,
+        index: ExprId,
+        value: ExprId,
+    ) -> Result<(), SemaError> {
+        let target_type = match target {
+            Place::Local(sym_id) => self.lookup_assign_target(sym_id).ok_or_else(|| {
+                SemaError::UnknownSymbol(format!("Unknown array `{}`.", self.name(sym_id)))
+            })?,
+            Place::Global(sym_id) => self.lookup_global(sym_id)?,
+        };
+        let PinpType::Array(elem_type, array_len) = target_type else {
+            return Err(SemaError::Type(
+                "Indexed assignment requires an array target.".into(),
+            ));
+        };
+        if matches!(self.nodes[index.value()], Node::Range { .. }) {
+            self.slice_type(index, elem_type, array_len)?;
+            let value_type = self.analyze_expr(value)?;
+            let elem_pinp_type = PinpType::from(elem_type);
+            return if assignable(value_type, elem_pinp_type) {
+                Ok(())
+            } else {
+                Err(SemaError::Type(format!(
+                    "Cannot assign {value_type:?} to array element of type {elem_pinp_type:?}."
+                )))
+            };
+        }
+        let index_type = self.analyze_expr(index)?;
+        if !int_like(index_type) {
+            return Err(SemaError::Type(format!(
+                "Array index must be Int, got {index_type:?}."
+            )));
+        }
+        let value_type = self.analyze_expr(value)?;
+        let elem_pinp_type = PinpType::from(elem_type);
+        if !assignable(value_type, elem_pinp_type) {
+            return Err(SemaError::Type(format!(
+                "Cannot assign {value_type:?} to array element of type {elem_pinp_type:?}."
+            )));
+        }
+        Ok(())
+    }
+
+    /// Converts a scalar `PinpType` to its `ArrayElementType` counterpart. Non-scalar types
+    /// (Void, Range, Array) cannot be array element types.
+    fn to_array_element_type(&self, pinp_type: PinpType) -> Result<ArrayElementType, SemaError> {
+        match pinp_type {
+            PinpType::Bool => Ok(ArrayElementType::Bool),
+            PinpType::Int => Ok(ArrayElementType::Int),
+            PinpType::Float => Ok(ArrayElementType::Float),
+            other => Err(SemaError::Type(format!(
+                "{other:?} cannot be an array element type."
+            ))),
+        }
+    }
+
+    /// Returns the number of elements a literal-bound range produces. Requires all bounds (start,
+    /// stop, and any step) to be integer literals; a variable bound is a compile-time error for
+    /// comprehensions.
+    fn literal_range_length(&self, source: ExprId) -> Result<usize, SemaError> {
+        let Node::Range {
+            start,
+            stop,
+            step,
+            kind,
+        } = self.nodes[source.value()]
+        else {
+            return Err(SemaError::Type(
+                "Comprehension source must be a range expression.".into(),
+            ));
+        };
+        let (start, stop, step, kind) = (start, stop, step, kind);
+        let start_val = self.int_literal(start).ok_or_else(|| {
+            SemaError::Type("Comprehension range start must be a literal.".into())
+        })?;
+        let stop_val = self
+            .int_literal(stop)
+            .ok_or_else(|| SemaError::Type("Comprehension range stop must be a literal.".into()))?;
+        let step_val = match step {
+            Some(step_id) => self.int_literal(step_id).ok_or_else(|| {
+                SemaError::Type("Comprehension range step must be a literal.".into())
+            })?,
+            None => match kind {
+                RangeKind::UpExclusive => 1,
+                RangeKind::DownExclusive => -1,
+                RangeKind::Inclusive => {
+                    if stop_val >= start_val {
+                        1
+                    } else {
+                        -1
+                    }
+                }
+            },
+        };
+        if step_val == 0 {
+            return Err(SemaError::Type("Range step cannot be zero.".into()));
+        }
+        let length = match kind {
+            RangeKind::Inclusive => {
+                if step_val > 0 && stop_val >= start_val {
+                    ((stop_val - start_val) / step_val + 1) as usize
+                } else if step_val < 0 && start_val >= stop_val {
+                    ((start_val - stop_val) / (-step_val) + 1) as usize
+                } else {
+                    0
+                }
+            }
+            RangeKind::UpExclusive => {
+                if stop_val > start_val && step_val > 0 {
+                    ((stop_val - start_val + step_val - 1) / step_val) as usize
+                } else {
+                    0
+                }
+            }
+            RangeKind::DownExclusive => {
+                if start_val > stop_val && step_val < 0 {
+                    ((start_val - stop_val - step_val - 1) / (-step_val)) as usize
+                } else {
+                    0
+                }
+            }
+        };
+        Ok(length)
     }
 
     /// The type of a bare name, resolved outward to the function base.
@@ -405,9 +754,10 @@ impl Analyzer<'_, '_> {
             UnOp::Neg => match operand_type {
                 PinpType::Bool | PinpType::Int => Ok(PinpType::Int),
                 PinpType::Float => Ok(PinpType::Float),
-                PinpType::Void | PinpType::Range => Err(SemaError::Type(format!(
-                    "Unary minus requires a numeric operand, got {operand_type:?}."
-                ))),
+                // TODO: element-wise negation on arrays may be allowed for matrix algebra later.
+                PinpType::Void | PinpType::Range | PinpType::Array(_, _) => Err(SemaError::Type(
+                    format!("Unary minus requires a numeric operand, got {operand_type:?}."),
+                )),
             },
             UnOp::Not => {
                 if operand_type == PinpType::Bool {

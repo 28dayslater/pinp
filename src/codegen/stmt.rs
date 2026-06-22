@@ -2,12 +2,12 @@
 
 use super::*;
 
+use inkwell::AddressSpace;
 use inkwell::IntPredicate;
 use inkwell::basic_block::BasicBlock;
-use inkwell::types::BasicTypeEnum;
 use inkwell::values::IntValue;
 
-use crate::parser::{ExprId, Node, RangeKind, Stmt};
+use crate::parser::{ArrayElementType, ExprId, Node, RangeKind, Stmt};
 
 impl<'ctx, 'ast> CodeGen<'ctx, 'ast> {
     // -------------------------------------------------------------------------
@@ -138,6 +138,48 @@ impl<'ctx, 'ast> CodeGen<'ctx, 'ast> {
                     .map_err(err)?;
 
                 self.builder.position_at_end(exit);
+                Ok(None)
+            }
+            Stmt::IndexedAssign {
+                target,
+                index,
+                value,
+            } => {
+                // Look up the array variable's alloca slot and confirm it is an array.
+                let (slot_ptr, array_pinp_type) = match *target {
+                    Place::Local(sym_id) => {
+                        if let Some(slot) = self.find_local(sym_id) {
+                            slot
+                        } else {
+                            self.globals[&sym_id]
+                        }
+                    }
+                    Place::Global(sym_id) => self.globals[&sym_id],
+                };
+                let PinpType::Array(elem_type, n) = array_pinp_type else {
+                    unreachable!("IndexedAssign target is always an array")
+                };
+                // The slot holds the heap pointer; load it.
+                let array_ptr = self
+                    .builder
+                    .build_load(
+                        self.context.ptr_type(AddressSpace::default()),
+                        slot_ptr,
+                        "arr_ptr",
+                    )
+                    .map_err(err)?
+                    .into_pointer_value();
+                // Dispatch to slice fill when the index is a range.
+                if matches!(self.ast.node(*index), Node::Range { .. }) {
+                    return self.gen_slice_assign(elem_type, array_ptr, *index, *value);
+                }
+                // Bounds-check and locate the element.
+                let index_val = self.as_int(*index)?;
+                let elem_ptr = self.bounds_check_and_gep(elem_type, array_ptr, index_val, n)?;
+                // Evaluate, promote to element type, and store.
+                let val = self.expect_value(*value)?;
+                let val = self.promote(val, self.ast.type_of(*value), PinpType::from(elem_type));
+                self.builder.build_store(elem_ptr, val).map_err(err)?;
                 Ok(None)
             }
         }
@@ -322,51 +364,34 @@ impl<'ctx, 'ast> CodeGen<'ctx, 'ast> {
             .map_err(err)?;
 
         self.builder.position_at_end(error_bb);
-        self.raise_runtime_error(RUNTIME_ERROR_ZERO_STEP)?;
+        self.gen_runtime_error_call("Range step cannot be zero.")?;
 
         self.builder.position_at_end(ok_bb);
         Ok(())
     }
 
-    // The module global holding the runtime-error code (`0` = none), read back by [`PinpJit::run`].
-    // It has external linkage so the JIT exposes it for lookup; declared on demand and reused.
-    pub(super) fn runtime_error_global(&self) -> PointerValue<'ctx> {
-        if let Some(global) = self.module.get_global(RUNTIME_ERROR_SYMBOL) {
-            return global.as_pointer_value();
-        }
-        let global = self
+    // Calls the native `pinp_runtime_error` with `message` and emits `unreachable`. This longjmps
+    // back to `pinp_run` in the host, so it truly never returns — hence the unreachable terminator.
+    pub(super) fn gen_runtime_error_call(&self, message: &str) -> Result<(), String> {
+        let ptr_type = self.context.ptr_type(AddressSpace::default());
+        let fn_type = self.context.void_type().fn_type(&[ptr_type.into()], false);
+        let error_fn = self
             .module
-            .add_global(self.int_type(), None, RUNTIME_ERROR_SYMBOL);
-        global.set_initializer(&self.int_type().const_zero());
-        global.as_pointer_value()
-    }
-
-    // Records `code` in the runtime-error global and returns from the current function with a
-    // throwaway value: pinp has no unwinding, so execution stops by falling back out to the host,
-    // which sees the recorded code and turns it into an `Err` instead of using the result.
-    fn raise_runtime_error(&self, code: i64) -> Result<(), String> {
-        let global = self.runtime_error_global();
+            .get_function("pinp_runtime_error")
+            .unwrap_or_else(|| {
+                self.module
+                    .add_function("pinp_runtime_error", fn_type, None)
+            });
+        let msg_ptr = self
+            .builder
+            .build_global_string_ptr(message, "err_msg")
+            .map_err(err)?
+            .as_pointer_value();
         self.builder
-            .build_store(global, self.int_type().const_int(code as u64, true))
+            .build_call(error_fn, &[msg_ptr.into()], "")
             .map_err(err)?;
-        let function = self.current_function();
-        match function.get_type().get_return_type() {
-            None => self.builder.build_return(None).map_err(err)?,
-            Some(return_type) => {
-                let throwaway = self.llvm_zero(return_type);
-                self.builder.build_return(Some(&throwaway)).map_err(err)?
-            }
-        };
+        self.builder.build_unreachable().map_err(err)?;
         Ok(())
-    }
-
-    // The zero of an LLVM scalar return type — the throwaway value returned when a trap fires.
-    fn llvm_zero(&self, basic_type: BasicTypeEnum<'ctx>) -> BasicValueEnum<'ctx> {
-        match basic_type {
-            BasicTypeEnum::IntType(int_type) => int_type.const_zero().into(),
-            BasicTypeEnum::FloatType(float_type) => float_type.const_zero().into(),
-            other => unreachable!("Unexpected function return type {other:?}."),
-        }
     }
 
     // The step for an `start..stop` with no `:step`: +1 / -1 for the exclusive forms, and for the
@@ -396,12 +421,80 @@ impl<'ctx, 'ast> CodeGen<'ctx, 'ast> {
     }
 
     // Load the loop counter from its stack slot.
-    fn load_counter(&self, counter: PointerValue<'ctx>) -> Result<IntValue<'ctx>, String> {
+    pub(super) fn load_counter(
+        &self,
+        counter: PointerValue<'ctx>,
+    ) -> Result<IntValue<'ctx>, String> {
         Ok(self
             .builder
             .build_load(self.int_type(), counter, "idx")
             .map_err(err)?
             .into_int_value())
+    }
+
+    // `array[start..stop] = scalar` — store `value` into every element of the slice. The bounds are
+    // literal integers (sema-enforced), so the loop count and start offset are compile-time constants.
+    fn gen_slice_assign(
+        &mut self,
+        elem_type: ArrayElementType,
+        array_ptr: PointerValue<'ctx>,
+        range_id: ExprId,
+        value_id: ExprId,
+    ) -> Result<Option<BasicValueEnum<'ctx>>, String> {
+        let (start_lit, stop_lit, kind) = self.read_slice_range(range_id);
+        let count = match kind {
+            RangeKind::Inclusive => (stop_lit - start_lit + 1) as usize,
+            RangeKind::UpExclusive => (stop_lit - start_lit) as usize,
+            _ => unreachable!(),
+        };
+        let start_offset = self.int_type().const_int(start_lit as u64, false);
+        let n_val = self.int_type().const_int(count as u64, false);
+
+        // Evaluate the scalar once; promote to the element type.
+        let raw_val = self.expect_value(value_id)?;
+        let elem_pinp_type = PinpType::from(elem_type);
+        let stored_val = self.promote(raw_val, self.ast.type_of(value_id), elem_pinp_type);
+
+        let counter = self.alloca_at_entry(PinpType::Int)?;
+        self.builder
+            .build_store(counter, self.int_type().const_zero())
+            .map_err(err)?;
+
+        let function = self.current_function();
+        let header = self.context.append_basic_block(function, "sla_hdr");
+        let body = self.context.append_basic_block(function, "sla_body");
+        let exit = self.context.append_basic_block(function, "sla_exit");
+
+        self.builder
+            .build_unconditional_branch(header)
+            .map_err(err)?;
+
+        self.builder.position_at_end(header);
+        let idx = self.load_counter(counter)?;
+        let cond = self
+            .builder
+            .build_int_compare(IntPredicate::SLT, idx, n_val, "sla_cond")
+            .map_err(err)?;
+        self.builder
+            .build_conditional_branch(cond, body, exit)
+            .map_err(err)?;
+
+        self.builder.position_at_end(body);
+        let dst_idx = self
+            .builder
+            .build_int_add(idx, start_offset, "dst_idx")
+            .map_err(err)?;
+        let dst_ptr = self.build_element_ptr(elem_type, array_ptr, dst_idx)?;
+        self.builder.build_store(dst_ptr, stored_val).map_err(err)?;
+        let one = self.int_type().const_int(1, false);
+        let next = self.builder.build_int_add(idx, one, "next").map_err(err)?;
+        self.builder.build_store(counter, next).map_err(err)?;
+        self.builder
+            .build_unconditional_branch(header)
+            .map_err(err)?;
+
+        self.builder.position_at_end(exit);
+        Ok(None)
     }
 
     // The `for` continue test: ascending wants `counter <= stop` (inclusive) or `< stop`; descending

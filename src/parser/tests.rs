@@ -821,3 +821,220 @@ fn max_int_literal_is_accepted() {
     let ast = parse_ok("9223372036854775807"); // i64::MAX
     assert_eq!(*ast.node(root(&ast)), Node::Int(i64::MAX));
 }
+
+// --- array literals, comprehensions, index, member, indexed-assign -------------------
+
+#[test]
+fn array_literal_parse_shape() {
+    let ast = parse_ok("[1, 2, 3]");
+    let Node::ArrayLiteral { elements } = ast.node(root(&ast)) else {
+        panic!("Expected ArrayLiteral.");
+    };
+    assert_eq!(elements.len(), 3);
+    assert_eq!(*ast.node(elements[0]), Node::Int(1));
+    assert_eq!(*ast.node(elements[1]), Node::Int(2));
+    assert_eq!(*ast.node(elements[2]), Node::Int(3));
+}
+
+#[test]
+fn single_element_array_parse_shape() {
+    let ast = parse_ok("[42]");
+    let Node::ArrayLiteral { elements } = ast.node(root(&ast)) else {
+        panic!("Expected ArrayLiteral.");
+    };
+    assert_eq!(elements.len(), 1);
+    assert_eq!(*ast.node(elements[0]), Node::Int(42));
+}
+
+#[test]
+fn trailing_comma_in_array_literal_is_ok() {
+    let ast = parse_ok("[1, 2, 3,]");
+    let Node::ArrayLiteral { elements } = ast.node(root(&ast)) else {
+        panic!("Expected ArrayLiteral.");
+    };
+    assert_eq!(elements.len(), 3);
+}
+
+#[test]
+fn empty_array_literal_is_parse_error() {
+    assert!(parse("[]").is_err());
+}
+
+#[test]
+fn comprehension_parse_shape() {
+    let ast = parse_ok("[x for x in 1..5]");
+    let Node::Comprehension { var, var_type, .. } = ast.node(root(&ast)) else {
+        panic!("Expected Comprehension.");
+    };
+    let (var, var_type) = (*var, *var_type);
+    assert_eq!(ast.names[var.value()], "x");
+    assert_eq!(var_type, PinpType::Int);
+}
+
+#[test]
+fn comprehension_with_float_type_annotation() {
+    let ast = parse_ok("[x for x:float in 1..5]");
+    let Node::Comprehension { var_type, .. } = ast.node(root(&ast)) else {
+        panic!("Expected Comprehension.");
+    };
+    assert_eq!(*var_type, PinpType::Float);
+}
+
+#[test]
+fn index_parse_shape() {
+    let ast = parse_ok("a[1]");
+    let Node::Index { array, index } = ast.node(root(&ast)) else {
+        panic!("Expected Index.");
+    };
+    let (array, index) = (*array, *index);
+    assert!(matches!(ast.node(array), Node::Var(_)));
+    assert_eq!(*ast.node(index), Node::Int(1));
+}
+
+#[test]
+fn member_parse_shape() {
+    let ast = parse_ok("a.len");
+    let Node::Member { object, member } = ast.node(root(&ast)) else {
+        panic!("Expected Member.");
+    };
+    let member = *member;
+    assert!(matches!(ast.node(*object), Node::Var(_)));
+    assert_eq!(ast.names[member.value()], "len");
+}
+
+#[test]
+fn postfix_index_binds_tighter_than_unary_minus() {
+    // `-a[0]` must parse as `-(a[0])`, not `(-a)[0]`.
+    let ast = parse_ok("-a[0]");
+    let Node::Unary {
+        op: UnOp::Neg,
+        operand,
+    } = ast.node(root(&ast))
+    else {
+        panic!("Expected Unary Neg.");
+    };
+    assert!(matches!(ast.node(*operand), Node::Index { .. }));
+}
+
+#[test]
+fn postfix_index_binds_tighter_than_exponentiation() {
+    // `a^b[0]` must parse as `a^(b[0])`, not `(a^b)[0]`.
+    let ast = parse_ok("a^b[0]");
+    let Node::Bin {
+        op: BinOp::Pow,
+        lhs,
+        rhs,
+    } = ast.node(root(&ast))
+    else {
+        panic!("Expected Bin Pow.");
+    };
+    let (lhs, rhs) = (*lhs, *rhs);
+    assert!(matches!(ast.node(lhs), Node::Var(_)));
+    assert!(matches!(ast.node(rhs), Node::Index { .. }));
+}
+
+#[test]
+fn chained_postfix_index_and_member() {
+    // `a[0].len` parses as Member { object: Index { array: a, index: 0 }, member: len }.
+    let ast = parse_ok("a[0].len");
+    let Node::Member { object, member } = ast.node(root(&ast)) else {
+        panic!("Expected Member.");
+    };
+    let member = *member;
+    assert!(matches!(ast.node(*object), Node::Index { .. }));
+    assert_eq!(ast.names[member.value()], "len");
+}
+
+#[test]
+fn indexed_assign_parse_shape() {
+    let ast = parse_ok("a[0] = 99");
+    let TopLevel::Stmt(Stmt::IndexedAssign {
+        target,
+        index,
+        value,
+    }) = ast.top_level.last().unwrap()
+    else {
+        panic!("Expected IndexedAssign.");
+    };
+    assert!(matches!(target, Place::Local(_)));
+    assert_eq!(*ast.node(*index), Node::Int(0));
+    assert_eq!(*ast.node(*value), Node::Int(99));
+}
+
+#[test]
+fn slice_parse_shape() {
+    // arr[1..3] parses as Index { array: Var(arr), index: Range(1, 3, Inclusive) }.
+    let ast = parse_ok("arr[1..3]");
+    let Node::Index { array, index } = ast.node(root(&ast)) else {
+        panic!("Expected Index.");
+    };
+    let (array, index) = (*array, *index);
+    assert!(matches!(ast.node(array), Node::Var(_)));
+    assert!(matches!(ast.node(index), Node::Range { .. }));
+}
+
+#[test]
+fn exclusive_slice_parse_shape() {
+    let ast = parse_ok("arr[1..<4]");
+    let Node::Index { index, .. } = ast.node(root(&ast)) else {
+        panic!("Expected Index.");
+    };
+    let Node::Range { kind, .. } = ast.node(*index) else {
+        panic!("Expected Range inside Index.");
+    };
+    assert_eq!(*kind, RangeKind::UpExclusive);
+}
+
+#[test]
+fn slice_assign_parse_shape() {
+    // arr[1..3] = 5 → IndexedAssign { index: Range(1..3), value: Int(5) }.
+    let ast = parse_ok("arr[1..3] = 5");
+    let TopLevel::Stmt(Stmt::IndexedAssign {
+        target,
+        index,
+        value,
+    }) = ast.top_level.last().unwrap()
+    else {
+        panic!("Expected IndexedAssign.");
+    };
+    assert!(matches!(target, Place::Local(_)));
+    assert!(matches!(ast.node(*index), Node::Range { .. }));
+    assert_eq!(*ast.node(*value), Node::Int(5));
+}
+
+#[test]
+fn multiline_array_literal_parses() {
+    // Brackets suppress newlines just like parentheses.
+    let ast = parse_ok(indoc! {"
+            [1,
+             2,
+             3]
+        "});
+    let Node::ArrayLiteral { elements } = ast.node(root(&ast)) else {
+        panic!("Expected ArrayLiteral.");
+    };
+    assert_eq!(elements.len(), 3);
+}
+
+#[test]
+fn range_init_as_array_literal() {
+    // `[1..5]` is an ArrayLiteral with a single Range element (the range-init syntax).
+    let ast = parse_ok("[1..5]");
+    let Node::ArrayLiteral { elements } = ast.node(root(&ast)) else {
+        panic!("Expected ArrayLiteral.");
+    };
+    assert_eq!(elements.len(), 1);
+    assert!(matches!(ast.node(elements[0]), Node::Range { .. }));
+}
+
+#[test]
+fn direct_index_on_array_literal_parses() {
+    // `[10, 20][0]` is valid parser output: Index { array: ArrayLiteral(...), index: Int(0) }.
+    let ast = parse_ok("[10, 20][0]");
+    let Node::Index { array, index } = ast.node(root(&ast)) else {
+        panic!("Expected Index.");
+    };
+    let (array, index) = (*array, *index);
+    assert!(matches!(ast.node(array), Node::ArrayLiteral { .. }));
+    assert_eq!(*ast.node(index), Node::Int(0));
+}

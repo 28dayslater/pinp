@@ -29,4 +29,13 @@ void pinp_free(void *ptr);
 // Writes the current allocation bookkeeping into `out`.
 void pinp_memory_info(pinp_mem_info *out);
 
+// Reports a runtime error and unwinds the JIT call stack via longjmp. Never returns.
+// Must only be called from within a pinp_run invocation.
+void pinp_runtime_error(const char *message);
+
+// Calls `entry(result)` inside a setjmp frame. If `entry` returns normally `*error_out`
+// is left null. If JIT code calls `pinp_runtime_error`, the longjmp lands here and
+// `*error_out` is set to the error message instead.
+void pinp_run(void (*entry)(void *), void *result, const char **error_out);
+
 #endif // PINP_RUNTIME_H

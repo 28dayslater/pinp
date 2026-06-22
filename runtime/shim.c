@@ -7,6 +7,7 @@
 
 #include "pinp_runtime.h"
 #include <mimalloc.h>
+#include <setjmp.h>
 
 // pinp's JIT executes single-threaded, so plain counters are enough — no atomics.
 static int64_t outstanding_bytes = 0;
@@ -36,4 +37,26 @@ void pinp_memory_info(pinp_mem_info *out) {
     out->outstanding_bytes = outstanding_bytes;
     out->allocation_count = allocation_count;
     out->free_count = free_count;
+}
+
+// ---------------------------------------------------------------------------
+// Runtime error recovery
+// ---------------------------------------------------------------------------
+
+static jmp_buf  pinp_jmpbuf;
+static const char *pinp_pending_error = NULL;
+
+void pinp_runtime_error(const char *message) {
+    pinp_pending_error = message;
+    longjmp(pinp_jmpbuf, 1);
+}
+
+void pinp_run(void (*entry)(void *), void *result, const char **error_out) {
+    pinp_pending_error = NULL;
+    *error_out = NULL;
+    if (setjmp(pinp_jmpbuf) == 0) {
+        entry(result);
+    } else {
+        *error_out = pinp_pending_error;
+    }
 }

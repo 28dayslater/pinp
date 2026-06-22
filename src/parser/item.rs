@@ -190,7 +190,7 @@ impl<'src> Parser<'src> {
     }
 
     // A type annotation: `bool` / `int` / `float` / `void`.
-    fn parse_type(&mut self) -> Result<PinpType, ParseError> {
+    pub(super) fn parse_type(&mut self) -> Result<PinpType, ParseError> {
         let token = self.expect(TokenKind::Identifier)?;
         match token.text {
             "bool" => Ok(PinpType::Bool),
@@ -411,6 +411,25 @@ impl<'src> Parser<'src> {
             self.advance(); // the compound operator
             let rhs = self.parse_expr(0)?;
             return Ok(self.finish_compound(place, op, rhs));
+        }
+
+        // `arr[idx] = value` — indexed assignment.
+        if first_group.len() == 1 && self.peek().kind == TokenKind::Equal {
+            let node = self.ast.node(first_group[0]).clone();
+            if let Node::Index { array, index } = node {
+                let target = match self.ast.node(array) {
+                    Node::Var(sym_id) => Place::Local(*sym_id),
+                    Node::Global(sym_id) => Place::Global(*sym_id),
+                    _ => return Err(ParseError::Unexpected("Invalid assignment target.".into())),
+                };
+                self.advance(); // '='
+                let value = self.parse_expr(0)?;
+                return Ok(Stmt::IndexedAssign {
+                    target,
+                    index,
+                    value,
+                });
+            }
         }
 
         if self.peek().kind != TokenKind::Equal {

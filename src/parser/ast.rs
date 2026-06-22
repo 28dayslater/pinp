@@ -6,6 +6,25 @@ use rustc_hash::FxHashMap;
 // Types and interned ids
 // ---------------------------------------------------------------------------
 
+/// The scalar element types that an array may hold. A strict subset of [`PinpType`] so that
+/// `PinpType::Array` stays `Copy` (it stores an `ArrayElementType`, not a boxed `PinpType`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ArrayElementType {
+    Bool,
+    Int,
+    Float,
+}
+
+impl From<ArrayElementType> for PinpType {
+    fn from(element_type: ArrayElementType) -> PinpType {
+        match element_type {
+            ArrayElementType::Bool => PinpType::Bool,
+            ArrayElementType::Int => PinpType::Int,
+            ArrayElementType::Float => PinpType::Float,
+        }
+    }
+}
+
 /// The type of every expression and binding. `Void` is the type of a function with no declared
 /// return type (and of a call to one); a value-typed expression is never `Void`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -15,6 +34,8 @@ pub enum PinpType {
     Float,
     Void,
     Range,
+    /// A 1D array of `n` elements of `ArrayElementType`, heap-allocated via `pinp_alloc`.
+    Array(ArrayElementType, usize),
 }
 
 /// An interned identifier: an index into [`Ast::names`]. `Copy` and cheap to compare; the
@@ -117,9 +138,32 @@ pub enum Node {
         kind: RangeKind,
     },
     /// `value in range` — a `Bool` membership test.
+    // TODO: consider renaming to `ValueInRange` once naming is settled.
     Membership {
         value: ExprId,
         range: ExprId,
+    },
+    /// `[e0, e1, …]` — a 1D array literal; all elements must share a common type.
+    ArrayLiteral {
+        elements: Vec<ExprId>,
+    },
+    /// `array[index]` — read one element of a 1D array.
+    Index {
+        array: ExprId,
+        index: ExprId,
+    },
+    /// `object.member` — a built-in member access (e.g. `.len` on an array).
+    Member {
+        object: ExprId,
+        member: SymId,
+    },
+    /// `[element for var[:type] in source]` — array comprehension.
+    /// `var_type` defaults to the source range's element type; annotating `:float` promotes it.
+    Comprehension {
+        element: ExprId,
+        var: SymId,
+        var_type: PinpType,
+        source: ExprId,
     },
 }
 
@@ -182,6 +226,12 @@ pub enum Stmt {
         var: SymId,
         range: ExprId,
         body: Block,
+    },
+    /// `arr[index] = value` — write one element of a 1D array in place.
+    IndexedAssign {
+        target: Place,
+        index: ExprId,
+        value: ExprId,
     },
 }
 

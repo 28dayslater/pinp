@@ -25,7 +25,13 @@ use std::time::SystemTime;
 
 /// The runtime entry points made visible to the JIT; everything else (mimalloc)
 /// stays out of the dynamic symbol table.
-const EXPORTED_SYMBOLS: [&str; 3] = ["pinp_alloc", "pinp_free", "pinp_memory_info"];
+const EXPORTED_SYMBOLS: [&str; 5] = [
+    "pinp_alloc",
+    "pinp_free",
+    "pinp_memory_info",
+    "pinp_runtime_error",
+    "pinp_run",
+];
 
 fn main() {
     // The runtime is only needed by the LLVM backend.
