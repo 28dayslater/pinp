@@ -100,6 +100,8 @@ enum Lexeme {
     Colon,
     #[token(",")]
     Comma,
+    #[token(";")]
+    Semicolon,
 
     // Range operators. `..` is the inclusive form; `..<`/`..>` exclude the stop bound (longest-match
     // beats `..`). `..` competes with the `Float` regex only where a digit follows the dot, so `.5`
@@ -151,6 +153,7 @@ pub enum TokenKind {
     Colon,
     ColonColon,
     Comma,
+    Semicolon,
     Dot,
     DotDot,
     DotDotLt,
@@ -303,6 +306,7 @@ pub fn lex(src: &str) -> Result<Vec<Token<'_>>, LexError> {
             Lexeme::ColonColon => TokenKind::ColonColon,
             Lexeme::Colon => TokenKind::Colon,
             Lexeme::Comma => TokenKind::Comma,
+            Lexeme::Semicolon => TokenKind::Semicolon,
             Lexeme::Dot => TokenKind::Dot,
             Lexeme::DotDot => TokenKind::DotDot,
             Lexeme::DotDotLt => TokenKind::DotDotLt,
@@ -673,6 +677,22 @@ mod tests {
                 Eof
             ]
         );
+    }
+
+    #[test]
+    fn semicolon_is_a_token() {
+        use TokenKind::*;
+        // `;` is the 2D matrix row separator; it appears inside `[…]` brackets so no
+        // newline logic fires. Here we test it as a bare token and inside brackets.
+        assert_eq!(kinds(";"), vec![Semicolon, Eof]);
+        assert_eq!(
+            kinds("[1, 2; 3, 4]"),
+            vec![
+                LBracket, Int, Comma, Int, Semicolon, Int, Comma, Int, RBracket, Eof
+            ]
+        );
+        // Existing tokens are undisturbed around `;`.
+        assert_eq!(kinds("a; b"), vec![Identifier, Semicolon, Identifier, Eof]);
     }
 
     #[test]
