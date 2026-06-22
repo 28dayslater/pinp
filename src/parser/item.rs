@@ -350,9 +350,9 @@ impl<'src> Parser<'src> {
         let name = self.expect(TokenKind::Identifier)?.text;
         let var = self.ast.intern(name);
         self.expect(TokenKind::KwIn)?;
-        let range = self.parse_expr(0)?;
+        let source = self.parse_expr(0)?;
         let body = self.parse_block()?;
-        Ok(Stmt::For { var, range, body })
+        Ok(Stmt::For { var, source, body })
     }
 
     // -------------------------------------------------------------------------

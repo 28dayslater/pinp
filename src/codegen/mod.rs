@@ -91,6 +91,12 @@ pub enum PinpValue {
     Float(f64),
     Void,
     Array(Vec<PinpValue>),
+    Matrix {
+        rows: usize,
+        cols: usize,
+        /// Elements in row-major order: `elements[row * cols + col]`.
+        elements: Vec<PinpValue>,
+    },
 }
 
 /// Compiles a pinp source string and JIT-executes it, the test harness for the
@@ -157,6 +163,7 @@ impl PinpJit {
             PinpType::Float => PinpValue::Float(f64::from_bits(result_buf)),
             PinpType::Void => PinpValue::Void,
             PinpType::Range => unreachable!("a program cannot evaluate to a range"),
+            PinpType::Matrix(_, _, _) => todo!("Matrix result — implemented in step 19"),
             PinpType::Array(elem_type, n) => {
                 // The entry wrote the heap pointer into result_buf (already a `u64`).
                 let array_ptr = result_buf as *const u8;

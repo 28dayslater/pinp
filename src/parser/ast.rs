@@ -36,6 +36,8 @@ pub enum PinpType {
     Range,
     /// A 1D array of `n` elements of `ArrayElementType`, heap-allocated via `pinp_alloc`.
     Array(ArrayElementType, usize),
+    /// A 2D matrix of `rows × cols` elements of `ArrayElementType`, heap-allocated, row-major.
+    Matrix(ArrayElementType, usize, usize),
 }
 
 /// An interned identifier: an index into [`Ast::names`]. `Copy` and cheap to compare; the
@@ -165,6 +167,23 @@ pub enum Node {
         var_type: PinpType,
         source: ExprId,
     },
+    /// `[r0_e0, r0_e1, …; r1_e0, …; …]` — 2D matrix literal. Each inner `Vec` is one row; all
+    /// rows must have the same length (checked by sema). Element type is deduced from all elements.
+    MatrixLiteral {
+        rows: Vec<Vec<ExprId>>,
+    },
+    /// `matrix[row, col]` — 2D index or slice. Each of `row` and `col` is one of:
+    ///   • a scalar `Int` expression → index that dimension (runtime-checked)
+    ///   • a `Node::Range` with literal bounds → slice that dimension (compile-time checked)
+    ///   • `Node::FullExtent` → full extent of that dimension (`:` syntax, resolved by sema)
+    Index2D {
+        matrix: ExprId,
+        row: ExprId,
+        col: ExprId,
+    },
+    /// `:` in a 2D slice position — the full extent of that dimension. Valid only as the `row`
+    /// or `col` child of `Node::Index2D`; sema resolves it to `0..rows-1` or `0..cols-1`.
+    FullExtent,
 }
 
 /// The operator that introduced a [`Node::Range`]: `..` keeps both bounds, `..<`/`..>` drop the
@@ -221,16 +240,31 @@ pub enum Stmt {
         cond: ExprId,
         until: bool,
     },
-    /// `for var in range <body>` — iterates `var` (an `Int`, read-only and body-local) over a range.
+    /// `for var in source <body>` — single-binder iteration. Source may be a range (`Int`
+    /// loop variable), a 1D array (value only), or a 2D matrix (value only, row-major).
     For {
         var: SymId,
-        range: ExprId,
+        source: ExprId,
+        body: Block,
+    },
+    /// `for binders… in source <body>` — multi-binder array/matrix iteration.
+    /// 2 binders + 1D array → (index, value); 3 binders + 2D matrix → (row, col, value).
+    ForArray {
+        binders: Vec<SymId>,
+        source: ExprId,
         body: Block,
     },
     /// `arr[index] = value` — write one element of a 1D array in place.
     IndexedAssign {
         target: Place,
         index: ExprId,
+        value: ExprId,
+    },
+    /// `mat[row, col] = value` — write one element of a 2D matrix in place.
+    IndexedAssign2D {
+        target: Place,
+        row: ExprId,
+        col: ExprId,
         value: ExprId,
     },
 }

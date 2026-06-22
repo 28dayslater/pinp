@@ -98,11 +98,11 @@ impl Analyzer<'_, '_> {
                 self.check_condition(*cond)?;
                 Ok(())
             }
-            Stmt::For { var, range, body } => {
-                let range_type = self.analyze_expr(*range)?;
-                if range_type != PinpType::Range {
+            Stmt::For { var, source, body } => {
+                let source_type = self.analyze_expr(*source)?;
+                if source_type != PinpType::Range {
                     return Err(SemaError::Type(format!(
-                        "`for` requires a range to iterate, got {range_type:?}."
+                        "`for` requires a range to iterate, got {source_type:?}."
                     )));
                 }
                 // Seed a body frame with the loop counter (`Int`, read-only) before analysing the
@@ -115,6 +115,7 @@ impl Analyzer<'_, '_> {
                 self.scopes.pop();
                 Ok(())
             }
+            Stmt::ForArray { .. } => todo!("ForArray sema — step 11"),
             Stmt::IndexedAssign {
                 target,
                 index,
@@ -123,6 +124,7 @@ impl Analyzer<'_, '_> {
                 self.indexed_assign_check(*target, *index, *value)?;
                 Ok(())
             }
+            Stmt::IndexedAssign2D { .. } => todo!("IndexedAssign2D sema — step 11"),
         }
     }
 
@@ -244,6 +246,9 @@ impl Analyzer<'_, '_> {
                 var_type,
                 source,
             } => self.comprehension_type(element, var, var_type, source)?,
+            Node::MatrixLiteral { .. } => todo!("MatrixLiteral sema — step 7"),
+            Node::Index2D { .. } => todo!("Index2D sema — step 8"),
+            Node::FullExtent => todo!("FullExtent sema — step 8"),
         };
         self.types[expr_id.value()] = inferred;
         Ok(inferred)
@@ -754,10 +759,13 @@ impl Analyzer<'_, '_> {
             UnOp::Neg => match operand_type {
                 PinpType::Bool | PinpType::Int => Ok(PinpType::Int),
                 PinpType::Float => Ok(PinpType::Float),
-                // TODO: element-wise negation on arrays may be allowed for matrix algebra later.
-                PinpType::Void | PinpType::Range | PinpType::Array(_, _) => Err(SemaError::Type(
-                    format!("Unary minus requires a numeric operand, got {operand_type:?}."),
-                )),
+                // TODO: element-wise negation on arrays/matrices may be allowed for matrix algebra later.
+                PinpType::Void
+                | PinpType::Range
+                | PinpType::Array(_, _)
+                | PinpType::Matrix(_, _, _) => Err(SemaError::Type(format!(
+                    "Unary minus requires a numeric operand, got {operand_type:?}."
+                ))),
             },
             UnOp::Not => {
                 if operand_type == PinpType::Bool {

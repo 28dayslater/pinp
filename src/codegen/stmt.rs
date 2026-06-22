@@ -87,8 +87,8 @@ impl<'ctx, 'ast> CodeGen<'ctx, 'ast> {
                 self.builder.position_at_end(exit);
                 Ok(None)
             }
-            Stmt::For { var, range, body } => {
-                let range = self.expect_value(*range)?;
+            Stmt::For { var, source, body } => {
+                let range = self.expect_value(*source)?;
                 let (start, stop, step, inclusive) = self.extract_range(range)?;
                 let function = self.current_function();
 
@@ -182,6 +182,8 @@ impl<'ctx, 'ast> CodeGen<'ctx, 'ast> {
                 self.builder.build_store(elem_ptr, val).map_err(err)?;
                 Ok(None)
             }
+            Stmt::ForArray { .. } => todo!("ForArray codegen — step 17"),
+            Stmt::IndexedAssign2D { .. } => todo!("IndexedAssign2D codegen — step 18"),
         }
     }
 

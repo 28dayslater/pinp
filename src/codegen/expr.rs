@@ -62,6 +62,11 @@ impl<'ctx, 'ast> CodeGen<'ctx, 'ast> {
             Node::Index { .. } => self.gen_index(expr_id)?,
             Node::Member { .. } => self.gen_member(expr_id)?,
             Node::Comprehension { .. } => self.gen_comprehension(expr_id)?,
+            Node::MatrixLiteral { .. } => todo!("MatrixLiteral codegen — step 13"),
+            Node::Index2D { .. } => todo!("Index2D codegen — step 15"),
+            Node::FullExtent => {
+                unreachable!("FullExtent is resolved by sema, never reaches codegen")
+            }
         };
         Ok(Some(value))
     }
@@ -905,8 +910,8 @@ impl<'ctx, 'ast> CodeGen<'ctx, 'ast> {
             PinpType::Float => self.float_type().const_zero().into(),
             PinpType::Void => unreachable!("Void has no zero value."),
             PinpType::Range => self.range_type().const_zero().into(),
-            // A null pointer is the zero for an array slot (never valid; must be overwritten before use).
-            PinpType::Array(_, _) => self
+            // Null pointer is the zero for array/matrix slots (must be overwritten before use).
+            PinpType::Array(_, _) | PinpType::Matrix(_, _, _) => self
                 .context
                 .ptr_type(AddressSpace::default())
                 .const_null()

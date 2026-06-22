@@ -111,7 +111,12 @@ fn for_in_is_a_statement() {
             for idx in 1..5
                 idx
         "});
-    let TopLevel::Stmt(Stmt::For { range, body, .. }) = &ast.top_level[0] else {
+    let TopLevel::Stmt(Stmt::For {
+        source: range,
+        body,
+        ..
+    }) = &ast.top_level[0]
+    else {
         panic!("Expected a for statement.");
     };
     assert!(matches!(ast.node(*range), Node::Range { .. }));
