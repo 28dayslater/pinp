@@ -1032,6 +1032,82 @@ fn range_init_as_array_literal() {
     assert!(matches!(ast.node(elements[0]), Node::Range { .. }));
 }
 
+// --- matrix literals ---------------------------------------------------------------
+
+#[test]
+fn matrix_literal_two_by_two() {
+    let ast = parse_ok("[1, 2; 3, 4]");
+    let Node::MatrixLiteral { rows } = ast.node(root(&ast)) else {
+        panic!("Expected MatrixLiteral.");
+    };
+    assert_eq!(rows.len(), 2);
+    assert_eq!(rows[0].len(), 2);
+    assert_eq!(rows[1].len(), 2);
+    assert_eq!(*ast.node(rows[0][0]), Node::Int(1));
+    assert_eq!(*ast.node(rows[0][1]), Node::Int(2));
+    assert_eq!(*ast.node(rows[1][0]), Node::Int(3));
+    assert_eq!(*ast.node(rows[1][1]), Node::Int(4));
+}
+
+#[test]
+fn matrix_literal_three_rows() {
+    let ast = parse_ok("[1, 2; 3, 4; 5, 6]");
+    let Node::MatrixLiteral { rows } = ast.node(root(&ast)) else {
+        panic!("Expected MatrixLiteral.");
+    };
+    assert_eq!(rows.len(), 3);
+    assert!(rows.iter().all(|row| row.len() == 2));
+}
+
+#[test]
+fn matrix_literal_single_column() {
+    // A column vector (N×1) is a valid matrix literal.
+    let ast = parse_ok("[1; 2; 3]");
+    let Node::MatrixLiteral { rows } = ast.node(root(&ast)) else {
+        panic!("Expected MatrixLiteral.");
+    };
+    assert_eq!(rows.len(), 3);
+    assert!(rows.iter().all(|row| row.len() == 1));
+}
+
+#[test]
+fn matrix_literal_multiline_parses() {
+    let ast = parse_ok(indoc! {"
+        [1, 2, 3;
+         4, 5, 6]
+    "});
+    let Node::MatrixLiteral { rows } = ast.node(root(&ast)) else {
+        panic!("Expected MatrixLiteral.");
+    };
+    assert_eq!(rows.len(), 2);
+    assert_eq!(rows[0].len(), 3);
+    assert_eq!(rows[1].len(), 3);
+}
+
+#[test]
+fn trailing_semicolon_is_parse_error() {
+    assert!(parse("[1, 2;]").is_err());
+}
+
+#[test]
+fn trailing_comma_before_semicolon_is_parse_error() {
+    // `[1, 2,; 3, 4]` — a dangling `,` before a row separator is invalid.
+    assert!(matches!(
+        parse("[1, 2,; 3, 4]"),
+        Err(ParseError::Unexpected(_))
+    ));
+}
+
+#[test]
+fn matrix_multiline_misaligned_row_is_layout_error() {
+    // Row 2 starts at a different column than row 1.
+    let src = indoc! {"
+        [1, 2, 3;
+           4, 5, 6]
+    "};
+    assert!(matches!(parse(src), Err(ParseError::Layout(_))));
+}
+
 #[test]
 fn direct_index_on_array_literal_parses() {
     // `[10, 20][0]` is valid parser output: Index { array: ArrayLiteral(...), index: Int(0) }.

@@ -488,6 +488,8 @@ impl<'src> Parser<'src> {
             ));
         }
 
+        // The column of the first element is the alignment anchor for multi-line matrix rows.
+        let anchor_col = self.peek().col;
         let first = self.parse_expr(0)?;
 
         // Comprehension: `[element for var[:type] in source]`.
@@ -512,17 +514,64 @@ impl<'src> Parser<'src> {
             }));
         }
 
-        // Array literal: `[e0, e1, …]`.
-        let mut elements = vec![first];
+        // Array or matrix literal: parse the first row.
+        let mut first_row = vec![first];
         while self.peek().kind == TokenKind::Comma {
             self.advance(); // ','
             if self.peek().kind == TokenKind::RBracket {
-                break; // trailing comma
+                break; // trailing comma before `]`
             }
-            elements.push(self.parse_expr(0)?);
+            if self.peek().kind == TokenKind::Semicolon {
+                return Err(ParseError::Unexpected(
+                    "Trailing `,` before `;` in matrix row.".into(),
+                ));
+            }
+            first_row.push(self.parse_expr(0)?);
         }
+
+        // Matrix literal: `[r0_e0, …; r1_e0, …; …]` — a `;` follows the first row.
+        if self.peek().kind == TokenKind::Semicolon {
+            let mut rows = vec![first_row];
+            while self.peek().kind == TokenKind::Semicolon {
+                let sep_line = self.peek().line;
+                self.advance(); // ';'
+                if self.peek().kind == TokenKind::RBracket {
+                    return Err(ParseError::Unexpected(
+                        "Trailing `;` in matrix literal.".into(),
+                    ));
+                }
+                // A row that begins on a new line must align its first element with row 0.
+                if self.peek().line != sep_line && self.peek().col != anchor_col {
+                    return Err(ParseError::Layout(format!(
+                        "Matrix row at column {} must align with the first row at column {}.",
+                        self.peek().col,
+                        anchor_col,
+                    )));
+                }
+                let mut row = vec![self.parse_expr(0)?];
+                while self.peek().kind == TokenKind::Comma {
+                    self.advance(); // ','
+                    if self.peek().kind == TokenKind::RBracket {
+                        break; // trailing comma before `]`
+                    }
+                    if self.peek().kind == TokenKind::Semicolon {
+                        return Err(ParseError::Unexpected(
+                            "Trailing `,` before `;` in matrix row.".into(),
+                        ));
+                    }
+                    row.push(self.parse_expr(0)?);
+                }
+                rows.push(row);
+            }
+            self.expect(TokenKind::RBracket)?;
+            return Ok(self.ast.push(Node::MatrixLiteral { rows }));
+        }
+
+        // 1D array literal.
         self.expect(TokenKind::RBracket)?;
-        Ok(self.ast.push(Node::ArrayLiteral { elements }))
+        Ok(self.ast.push(Node::ArrayLiteral {
+            elements: first_row,
+        }))
     }
 
     // `<name>(<args>)` — a function call.
