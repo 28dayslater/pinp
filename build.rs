@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: MIT
 //
 // Builds the pinp runtime — the mimalloc allocator plus our thin `pinp_*` shim
-// (runtime/) — and links it into the pinp binary.
+// (src/runtime/) — and links it into the pinp binary.
 //
 // The allocator runs as native host code, not inside the JIT: mimalloc keeps its
 // per-thread heap in thread-local storage, and TLS accessed from JIT-compiled
@@ -43,8 +43,8 @@ fn main() {
     let mimalloc = PathBuf::from("third_party/mimalloc");
     let mimalloc_src = mimalloc.join("src/static.c");
     let mimalloc_include = mimalloc.join("include");
-    let shim_src = Path::new("runtime/shim.c");
-    let shim_header = Path::new("runtime/pinp_runtime.h");
+    let shim_src = Path::new("src/runtime/shim.c");
+    let shim_header = Path::new("src/runtime/pinp_runtime.h");
 
     // Re-run only when the inputs change.
     for input in [mimalloc_src.as_path(), shim_src, shim_header] {
@@ -71,7 +71,7 @@ fn main() {
     // The shim, calling into mimalloc.
     compile(
         shim_src,
-        &[&mimalloc_include, Path::new("runtime")],
+        &[&mimalloc_include, Path::new("src/runtime")],
         &shim_object,
     );
 

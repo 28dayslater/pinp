@@ -66,7 +66,7 @@ fn and_or_short_circuit() {
     );
 }
 
-/// Mirrors `pinp_mem_info` from runtime/pinp_runtime.h.
+/// Mirrors `pinp_mem_info` from src/runtime/pinp_runtime.h.
 #[repr(C)]
 #[derive(Default)]
 struct MemInfo {
@@ -84,7 +84,7 @@ fn runtime_allocator_is_reachable_from_the_jit() {
     // with nothing outstanding.
     let jit = Jit::new().unwrap();
 
-    // SAFETY: each signature matches its symbol's ABI in runtime/pinp_runtime.h.
+    // SAFETY: each signature matches its symbol's ABI in src/runtime/pinp_runtime.h.
     unsafe {
         let alloc: extern "C" fn(usize) -> *mut u8 = jit.lookup("pinp_alloc").unwrap();
         let free: extern "C" fn(*mut u8) = jit.lookup("pinp_free").unwrap();
