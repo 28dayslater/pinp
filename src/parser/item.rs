@@ -344,19 +344,61 @@ impl<'src> Parser<'src> {
         Ok(Stmt::Loop { body, cond, until })
     }
 
-    // `for <name> in <range> <block>`.
+    // `for <binder>[, <binder>…] in <source> <block>`.
+    // 1 binder → `Stmt::For`; 2–3 binders → `Stmt::ForArray`; 4+ → `ParseError`.
     fn parse_for(&mut self) -> Result<Stmt, ParseError> {
         self.advance(); // 'for'
-        let name = self.expect(TokenKind::Identifier)?.text;
-        let var = self.ast.intern(name);
+        let first_sym = self.expect_binder()?;
+        if self.peek().kind == TokenKind::Comma {
+            let mut binders = vec![first_sym];
+            while self.peek().kind == TokenKind::Comma {
+                self.advance(); // ','
+                binders.push(self.expect_binder()?);
+            }
+            if binders.len() > 3 {
+                return Err(ParseError::Unexpected(
+                    "Too many binders in for loop.".into(),
+                ));
+            }
+            self.expect(TokenKind::KwIn)?;
+            let source = self.parse_expr(0)?;
+            let body = self.parse_block()?;
+            return Ok(Stmt::ForArray {
+                binders,
+                source,
+                body,
+            });
+        }
         self.expect(TokenKind::KwIn)?;
-        let range = self.parse_expr(0)?;
+        let source = self.parse_expr(0)?;
         let body = self.parse_block()?;
-        Ok(Stmt::For { var, range, body })
+        Ok(Stmt::For {
+            var: first_sym,
+            source,
+            body,
+        })
     }
 
     // -------------------------------------------------------------------------
     // Statements and assignment
+    // Consume the next token as a for-loop binder name: either a plain `Identifier` or the
+    // don't-care `_` (`Underscore`). Returns the interned `SymId`; errors on anything else.
+    fn expect_binder(&mut self) -> Result<SymId, ParseError> {
+        let token = self.peek();
+        match token.kind {
+            TokenKind::Identifier | TokenKind::Underscore => {
+                let text = token.text;
+                let sym = self.ast.intern(text);
+                self.advance();
+                Ok(sym)
+            }
+            _ => Err(ParseError::Unexpected(format!(
+                "Expected a binder name or `_`, found `{}`.",
+                token.text
+            ))),
+        }
+    }
+
     // -------------------------------------------------------------------------
 
     // One statement: a control-flow construct (`while`/`loop`/`for`), an expression statement, or a
@@ -407,13 +449,47 @@ impl<'src> Parser<'src> {
         if first_group.len() == 1
             && let Some(op) = compound_assign_op(self.peek().kind)
         {
+            let node = self.ast.node(first_group[0]).clone();
+            // `arr[idx] <op>= rhs` — value is just the RHS; compound_op carries the operator.
+            if let Node::Index { array, index } = node {
+                let target = match self.ast.node(array) {
+                    Node::Var(sym_id) => Place::Local(*sym_id),
+                    Node::Global(sym_id) => Place::Global(*sym_id),
+                    _ => return Err(ParseError::Unexpected("Invalid assignment target.".into())),
+                };
+                self.advance(); // the compound operator
+                let value = self.parse_expr(0)?;
+                return Ok(Stmt::IndexedAssign {
+                    target,
+                    index,
+                    value,
+                    compound_op: Some(op),
+                });
+            }
+            // `mat[row, col] <op>= rhs` — compound_op carries the operator.
+            if let Node::Index2D { matrix, row, col } = node {
+                let target = match self.ast.node(matrix) {
+                    Node::Var(sym_id) => Place::Local(*sym_id),
+                    Node::Global(sym_id) => Place::Global(*sym_id),
+                    _ => return Err(ParseError::Unexpected("Invalid assignment target.".into())),
+                };
+                self.advance(); // the compound operator
+                let value = self.parse_expr(0)?;
+                return Ok(Stmt::IndexedAssign2D {
+                    target,
+                    row,
+                    col,
+                    value,
+                    compound_op: Some(op),
+                });
+            }
             let place = self.expr_as_place(first_group[0])?;
             self.advance(); // the compound operator
             let rhs = self.parse_expr(0)?;
             return Ok(self.finish_compound(place, op, rhs));
         }
 
-        // `arr[idx] = value` — indexed assignment.
+        // `arr[idx] = value` — 1D indexed assignment.
         if first_group.len() == 1 && self.peek().kind == TokenKind::Equal {
             let node = self.ast.node(first_group[0]).clone();
             if let Node::Index { array, index } = node {
@@ -428,6 +504,24 @@ impl<'src> Parser<'src> {
                     target,
                     index,
                     value,
+                    compound_op: None,
+                });
+            }
+            // `mat[row, col] = value` — 2D indexed assignment.
+            if let Node::Index2D { matrix, row, col } = node {
+                let target = match self.ast.node(matrix) {
+                    Node::Var(sym_id) => Place::Local(*sym_id),
+                    Node::Global(sym_id) => Place::Global(*sym_id),
+                    _ => return Err(ParseError::Unexpected("Invalid assignment target.".into())),
+                };
+                self.advance(); // '='
+                let value = self.parse_expr(0)?;
+                return Ok(Stmt::IndexedAssign2D {
+                    target,
+                    row,
+                    col,
+                    value,
+                    compound_op: None,
                 });
             }
         }

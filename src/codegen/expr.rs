@@ -5,7 +5,19 @@ use super::*;
 use inkwell::IntPredicate;
 use inkwell::values::BasicMetadataValueEnum;
 
-use crate::parser::{ArrayElementType, BinOp, ExprId, Node, RangeKind, UnOp};
+use crate::parser::{ArrayElementType, BinOp, BuiltinMember, ExprId, Node, RangeKind, UnOp};
+
+// Classification of one 2D dimension selector, derived by `classify_2d_selector`.
+#[derive(Clone, Copy)]
+struct DimSlice {
+    start: usize,
+    len: usize,
+}
+
+enum DimSel {
+    Scalar,
+    Slice(DimSlice),
+}
 
 impl<'ctx, 'ast> CodeGen<'ctx, 'ast> {
     // -------------------------------------------------------------------------
@@ -54,14 +66,24 @@ impl<'ctx, 'ast> CodeGen<'ctx, 'ast> {
                 self.builder.build_not(value, "not").map_err(err)?.into()
             }
             Node::Bin { op, lhs, rhs } => self.gen_bin(expr_id, *op, *lhs, *rhs)?,
-            Node::Call { callee, args } => return self.gen_call(*callee, args),
+            Node::Call { callee, args } => {
+                if self.ast.names[callee.value()] == "identity" {
+                    return Ok(Some(self.gen_identity(expr_id)?));
+                }
+                return self.gen_call(*callee, args);
+            }
             Node::If { .. } => return self.gen_if(expr_id),
             Node::Range { .. } => self.gen_range(expr_id)?,
             Node::Membership { .. } => self.gen_membership(expr_id)?,
             Node::ArrayLiteral { .. } => self.gen_array_literal(expr_id)?,
             Node::Index { .. } => self.gen_index(expr_id)?,
-            Node::Member { .. } => self.gen_member(expr_id)?,
+            Node::Member { .. } => self.gen_builtin_member(expr_id)?,
             Node::Comprehension { .. } => self.gen_comprehension(expr_id)?,
+            Node::MatrixLiteral { .. } => self.gen_matrix_literal(expr_id)?,
+            Node::Index2D { .. } => self.gen_index2d(expr_id)?,
+            Node::FullExtent => {
+                unreachable!("FullExtent is resolved by sema, never reaches codegen")
+            }
         };
         Ok(Some(value))
     }
@@ -424,11 +446,129 @@ impl<'ctx, 'ast> CodeGen<'ctx, 'ast> {
     }
 
     // -------------------------------------------------------------------------
+    // Compound-assign helpers
+    // -------------------------------------------------------------------------
+
+    // Apply a compound-assignment operator to a pre-loaded element value and an evaluated RHS.
+    // Used by `gen_indexed_assign` and `gen_indexed_assign2d` to avoid evaluating the index
+    // expression twice.
+    pub(super) fn apply_compound_op(
+        &mut self,
+        op: BinOp,
+        current: BasicValueEnum<'ctx>,
+        elem_type: ArrayElementType,
+        rhs_id: ExprId,
+    ) -> Result<BasicValueEnum<'ctx>, String> {
+        let rhs = self.expect_value(rhs_id)?;
+        let rhs_type = self.ast.type_of(rhs_id);
+        let elem_pinp_type = PinpType::from(elem_type);
+        // Determine the result type by the standard bin_type rules.
+        let use_float = matches!(op, BinOp::Div)
+            || elem_pinp_type == PinpType::Float
+            || rhs_type == PinpType::Float;
+        Ok(if use_float {
+            let left = self
+                .promote(current, elem_pinp_type, PinpType::Float)
+                .into_float_value();
+            let right = self
+                .promote(rhs, rhs_type, PinpType::Float)
+                .into_float_value();
+            match op {
+                BinOp::Add => self
+                    .builder
+                    .build_float_add(left, right, "fadd")
+                    .map_err(err)?
+                    .into(),
+                BinOp::Sub => self
+                    .builder
+                    .build_float_sub(left, right, "fsub")
+                    .map_err(err)?
+                    .into(),
+                BinOp::Mul => self
+                    .builder
+                    .build_float_mul(left, right, "fmul")
+                    .map_err(err)?
+                    .into(),
+                BinOp::Div => self
+                    .builder
+                    .build_float_div(left, right, "fdiv")
+                    .map_err(err)?
+                    .into(),
+                BinOp::Pow => {
+                    let pow_fn = self.pow_intrinsic();
+                    let call = self
+                        .builder
+                        .build_call(pow_fn, &[left.into(), right.into()], "pow")
+                        .map_err(err)?;
+                    basic_value(call.try_as_basic_value())
+                }
+                _ => unreachable!("compound op {op:?} does not produce Float"),
+            }
+        } else {
+            let left = self
+                .promote(current, elem_pinp_type, PinpType::Int)
+                .into_int_value();
+            let right = self.promote(rhs, rhs_type, PinpType::Int).into_int_value();
+            match op {
+                BinOp::Add => self
+                    .builder
+                    .build_int_add(left, right, "add")
+                    .map_err(err)?
+                    .into(),
+                BinOp::Sub => self
+                    .builder
+                    .build_int_sub(left, right, "sub")
+                    .map_err(err)?
+                    .into(),
+                BinOp::Mul => self
+                    .builder
+                    .build_int_mul(left, right, "mul")
+                    .map_err(err)?
+                    .into(),
+                BinOp::IntDiv => self
+                    .builder
+                    .build_int_signed_div(left, right, "sdiv")
+                    .map_err(err)?
+                    .into(),
+                BinOp::Mod => self
+                    .builder
+                    .build_int_signed_rem(left, right, "srem")
+                    .map_err(err)?
+                    .into(),
+                BinOp::Pow => {
+                    // Int ^ Int: use float pow then truncate.
+                    let lf = self
+                        .builder
+                        .build_signed_int_to_float(left, self.float_type(), "powi_l")
+                        .map_err(err)?;
+                    let rf = self
+                        .builder
+                        .build_signed_int_to_float(right, self.float_type(), "powi_r")
+                        .map_err(err)?;
+                    let pow_fn = self.pow_intrinsic();
+                    let call = self
+                        .builder
+                        .build_call(pow_fn, &[lf.into(), rf.into()], "pow")
+                        .map_err(err)?;
+                    let result_f = basic_value(call.try_as_basic_value()).into_float_value();
+                    self.builder
+                        .build_float_to_signed_int(result_f, self.int_type(), "powi")
+                        .map_err(err)?
+                        .into()
+                }
+                _ => unreachable!("compound int op {op:?}"),
+            }
+        })
+    }
+
     // Array helpers
     // -------------------------------------------------------------------------
 
     // The LLVM element type for an `ArrayElementType`.
-    fn element_llvm_type(&self, elem: ArrayElementType) -> inkwell::types::BasicTypeEnum<'ctx> {
+    pub(super) fn element_llvm_type(
+        &self,
+        elem: ArrayElementType,
+    ) -> inkwell::types::BasicTypeEnum<'ctx> {
         match elem {
             ArrayElementType::Bool => self.bool_type().into(),
             ArrayElementType::Int => self.int_type().into(),
@@ -487,6 +627,28 @@ impl<'ctx, 'ast> CodeGen<'ctx, 'ast> {
     // call + unreachable on the out-of-bounds path; on the ok path returns a GEP (LLVM
     // `getelementptr`) — the address of element `index` within the heap buffer, computed by
     // scaling `index` by the element byte size and adding it to the base pointer.
+    // `select(i < 0, i + len, i)` — folds away at compile time for literal indices.
+    fn normalize_index(
+        &mut self,
+        index: inkwell::values::IntValue<'ctx>,
+        len: inkwell::values::IntValue<'ctx>,
+    ) -> Result<inkwell::values::IntValue<'ctx>, String> {
+        let zero = self.int_type().const_zero();
+        let is_neg = self
+            .builder
+            .build_int_compare(IntPredicate::SLT, index, zero, "is_neg")
+            .map_err(err)?;
+        let adjusted = self
+            .builder
+            .build_int_add(index, len, "adj_idx")
+            .map_err(err)?;
+        Ok(self
+            .builder
+            .build_select(is_neg, adjusted, index, "eff_idx")
+            .map_err(err)?
+            .into_int_value())
+    }
+
     pub(super) fn bounds_check_and_gep(
         &mut self,
         elem: ArrayElementType,
@@ -495,6 +657,7 @@ impl<'ctx, 'ast> CodeGen<'ctx, 'ast> {
         length: usize,
     ) -> Result<inkwell::values::PointerValue<'ctx>, String> {
         let n = self.int_type().const_int(length as u64, false);
+        let index = self.normalize_index(index, n)?;
         let zero = self.int_type().const_zero();
         let too_low = self
             .builder
@@ -550,6 +713,88 @@ impl<'ctx, 'ast> CodeGen<'ctx, 'ast> {
             self.builder.build_store(ptr, promoted).map_err(err)?;
         }
         Ok(array_ptr.into())
+    }
+
+    // `[r0; r1; …]` — allocate `rows * cols * elem_size` bytes in row-major order, store each
+    // promoted element at flat offset `r * col_count + c`.
+    fn gen_matrix_literal(&mut self, expr_id: ExprId) -> Result<BasicValueEnum<'ctx>, String> {
+        let PinpType::Matrix(elem_type, row_count, col_count) = self.ast.type_of(expr_id) else {
+            unreachable!("MatrixLiteral has Matrix type")
+        };
+        let Node::MatrixLiteral { rows } = self.ast.node(expr_id).clone() else {
+            unreachable!("gen_matrix_literal on wrong node")
+        };
+        let total = row_count * col_count;
+        let byte_count = self
+            .int_type()
+            .const_int(total as u64 * Self::element_byte_size(elem_type), false);
+        let matrix_ptr = self.build_pinp_alloc(byte_count)?;
+        let elem_pinp_type = PinpType::from(elem_type);
+        for (row_idx, row) in rows.iter().enumerate() {
+            for (col_idx, elem_id) in row.iter().enumerate() {
+                let raw = self.expect_value(*elem_id)?;
+                let promoted = self.promote(raw, self.ast.type_of(*elem_id), elem_pinp_type);
+                let flat = self
+                    .int_type()
+                    .const_int((row_idx * col_count + col_idx) as u64, false);
+                let ptr = self.build_element_ptr(elem_type, matrix_ptr, flat)?;
+                self.builder.build_store(ptr, promoted).map_err(err)?;
+            }
+        }
+        Ok(matrix_ptr.into())
+    }
+
+    // `identity(n, type)` — allocate n×n elements; zero the block with memset, then emit n diagonal
+    // stores of 1/1.0. O(n) stores instead of the previous O(n²) — LLVM sees n compile-time
+    // constants rather than n² mixed constant/zero values.
+    fn gen_identity(&mut self, expr_id: ExprId) -> Result<BasicValueEnum<'ctx>, String> {
+        let PinpType::Matrix(elem_type, n, _) = self.ast.type_of(expr_id) else {
+            unreachable!("identity call has Matrix type")
+        };
+        let byte_count = self.int_type().const_int(
+            n as u64 * n as u64 * Self::element_byte_size(elem_type),
+            false,
+        );
+        let matrix_ptr = self.build_pinp_alloc(byte_count)?;
+        // Zero every byte — diagonal elements will be overwritten with 1/1.0 below.
+        let memset_fn = self.declare_memset();
+        let zero_byte = self.context.i32_type().const_zero();
+        self.builder
+            .build_call(
+                memset_fn,
+                &[matrix_ptr.into(), zero_byte.into(), byte_count.into()],
+                "memset",
+            )
+            .map_err(err)?;
+        // Store 1 or 1.0 at each diagonal position i*n + i.
+        let one: BasicValueEnum = match elem_type {
+            ArrayElementType::Int => self.int_type().const_int(1, false).into(),
+            ArrayElementType::Float => self.float_type().const_float(1.0).into(),
+            ArrayElementType::Bool => unreachable!("identity() rejects Bool element type at sema"),
+        };
+        for i in 0..n {
+            let flat = self.int_type().const_int((i * n + i) as u64, false);
+            let ptr = self.build_element_ptr(elem_type, matrix_ptr, flat)?;
+            self.builder.build_store(ptr, one).map_err(err)?;
+        }
+        Ok(matrix_ptr.into())
+    }
+
+    // Get or declare libc's `memset(ptr, i32 value, i64 size) -> ptr` external function.
+    fn declare_memset(&self) -> inkwell::values::FunctionValue<'ctx> {
+        if let Some(f) = self.module.get_function("memset") {
+            return f;
+        }
+        let ptr_type = self.context.ptr_type(AddressSpace::default());
+        let fn_type = ptr_type.fn_type(
+            &[
+                ptr_type.into(),
+                self.context.i32_type().into(),
+                self.int_type().into(),
+            ],
+            false,
+        );
+        self.module.add_function("memset", fn_type, None)
     }
 
     // `[start..stop[:step]]` — allocate `n` elements and fill with the integer sequence via a
@@ -741,8 +986,434 @@ impl<'ctx, 'ast> CodeGen<'ctx, 'ast> {
         (start_val, stop_val, kind)
     }
 
-    // `array.len` — returns the compile-time-known length as an `i64` constant.
-    fn gen_member(&self, expr_id: ExprId) -> Result<BasicValueEnum<'ctx>, String> {
+    // -------------------------------------------------------------------------
+    // 2D indexing and slicing
+    // -------------------------------------------------------------------------
+
+    // `mat[row_sel, col_sel]` — dispatch to scalar read, row slice, col slice, or submatrix
+    // based on the compile-time shape of each selector.
+    fn gen_index2d(&mut self, expr_id: ExprId) -> Result<BasicValueEnum<'ctx>, String> {
+        let Node::Index2D { matrix, row, col } = self.ast.node(expr_id) else {
+            unreachable!("gen_index2d on wrong node")
+        };
+        let (matrix_id, row_id, col_id) = (*matrix, *row, *col);
+        let PinpType::Matrix(elem_type, rows, cols) = self.ast.type_of(matrix_id) else {
+            unreachable!("Index2D matrix has Matrix type")
+        };
+        let matrix_ptr = self.expect_value(matrix_id)?.into_pointer_value();
+        let row_sel = self.classify_2d_selector(row_id, rows);
+        let col_sel = self.classify_2d_selector(col_id, cols);
+        match (row_sel, col_sel) {
+            (DimSel::Scalar, DimSel::Scalar) => {
+                self.gen_index2d_elem(elem_type, matrix_ptr, row_id, col_id, rows, cols)
+            }
+            (DimSel::Scalar, DimSel::Slice(col_slice)) => {
+                self.gen_index2d_row_slice(elem_type, matrix_ptr, row_id, rows, cols, col_slice)
+            }
+            (DimSel::Slice(row_slice), DimSel::Scalar) => {
+                self.gen_index2d_col_slice(elem_type, matrix_ptr, col_id, cols, row_slice)
+            }
+            (DimSel::Slice(row_slice), DimSel::Slice(col_slice)) => {
+                self.gen_index2d_submatrix(elem_type, matrix_ptr, cols, row_slice, col_slice)
+            }
+        }
+    }
+
+    // Classify one dimension selector as scalar (runtime-checked Int) or compile-time slice.
+    // `FullExtent` (`:`) becomes `Slice { start: 0, len: dimension }`.
+    fn classify_2d_selector(&self, sel_id: ExprId, dimension: usize) -> DimSel {
+        match self.ast.node(sel_id) {
+            Node::FullExtent => DimSel::Slice(DimSlice {
+                start: 0,
+                len: dimension,
+            }),
+            Node::Range {
+                start, stop, kind, ..
+            } => {
+                let start_val = match self.ast.node(*start) {
+                    Node::Int(val) => *val as usize,
+                    _ => unreachable!("slice bound is always a literal int"),
+                };
+                let stop_val = match self.ast.node(*stop) {
+                    Node::Int(val) => *val as usize,
+                    _ => unreachable!("slice bound is always a literal int"),
+                };
+                let len = match kind {
+                    RangeKind::Inclusive => stop_val - start_val + 1,
+                    RangeKind::UpExclusive => stop_val - start_val,
+                    RangeKind::DownExclusive => {
+                        unreachable!("sema rejects step ranges in 2D slice position")
+                    }
+                };
+                DimSel::Slice(DimSlice {
+                    start: start_val,
+                    len,
+                })
+            }
+            _ => DimSel::Scalar,
+        }
+    }
+
+    // Bounds-check both dimensions and return a pointer to element `[row, col]`. Shared by the
+    // read path (`gen_index2d_elem`) and the write path (`gen_indexed_assign2d` in stmt.rs).
+    pub(super) fn bounds_check_and_gep_2d(
+        &mut self,
+        elem_type: ArrayElementType,
+        matrix_ptr: PointerValue<'ctx>,
+        row_val: inkwell::values::IntValue<'ctx>,
+        col_val: inkwell::values::IntValue<'ctx>,
+        rows: usize,
+        cols: usize,
+    ) -> Result<PointerValue<'ctx>, String> {
+        let func = self.current_function();
+        let zero = self.int_type().const_zero();
+        let rows_val = self.int_type().const_int(rows as u64, false);
+        let row_val = self.normalize_index(row_val, rows_val)?;
+        let row_lo = self
+            .builder
+            .build_int_compare(IntPredicate::SLT, row_val, zero, "row_lo")
+            .map_err(err)?;
+        let row_hi = self
+            .builder
+            .build_int_compare(IntPredicate::SGE, row_val, rows_val, "row_hi")
+            .map_err(err)?;
+        let row_oob = self
+            .builder
+            .build_or(row_lo, row_hi, "row_oob")
+            .map_err(err)?;
+        let row_err = self.context.append_basic_block(func, "mat_row_err");
+        let row_ok = self.context.append_basic_block(func, "mat_row_ok");
+        self.builder
+            .build_conditional_branch(row_oob, row_err, row_ok)
+            .map_err(err)?;
+        self.builder.position_at_end(row_err);
+        self.gen_runtime_error_call("Array index out of bounds.")?;
+        self.builder.position_at_end(row_ok);
+        let cols_val = self.int_type().const_int(cols as u64, false);
+        let col_val = self.normalize_index(col_val, cols_val)?;
+        let col_lo = self
+            .builder
+            .build_int_compare(IntPredicate::SLT, col_val, zero, "col_lo")
+            .map_err(err)?;
+        let col_hi = self
+            .builder
+            .build_int_compare(IntPredicate::SGE, col_val, cols_val, "col_hi")
+            .map_err(err)?;
+        let col_oob = self
+            .builder
+            .build_or(col_lo, col_hi, "col_oob")
+            .map_err(err)?;
+        let col_err = self.context.append_basic_block(func, "mat_col_err");
+        let col_ok = self.context.append_basic_block(func, "mat_col_ok");
+        self.builder
+            .build_conditional_branch(col_oob, col_err, col_ok)
+            .map_err(err)?;
+        self.builder.position_at_end(col_err);
+        self.gen_runtime_error_call("Array index out of bounds.")?;
+        self.builder.position_at_end(col_ok);
+        let row_scaled = self
+            .builder
+            .build_int_mul(row_val, cols_val, "row_scaled")
+            .map_err(err)?;
+        let flat = self
+            .builder
+            .build_int_add(row_scaled, col_val, "flat_idx")
+            .map_err(err)?;
+        self.build_element_ptr(elem_type, matrix_ptr, flat)
+    }
+
+    // `mat[r, c]` — scalar element read with runtime bounds checks on both dimensions.
+    fn gen_index2d_elem(
+        &mut self,
+        elem_type: ArrayElementType,
+        matrix_ptr: PointerValue<'ctx>,
+        row_id: ExprId,
+        col_id: ExprId,
+        rows: usize,
+        cols: usize,
+    ) -> Result<BasicValueEnum<'ctx>, String> {
+        let row_val = self.as_int(row_id)?;
+        let col_val = self.as_int(col_id)?;
+        let elem_ptr =
+            self.bounds_check_and_gep_2d(elem_type, matrix_ptr, row_val, col_val, rows, cols)?;
+        self.builder
+            .build_load(self.element_llvm_type(elem_type), elem_ptr, "load_elem")
+            .map_err(err)
+    }
+
+    // `mat[r, c1..c1+cl]` — runtime-check row, copy `cl` elements from that row.
+    fn gen_index2d_row_slice(
+        &mut self,
+        elem_type: ArrayElementType,
+        matrix_ptr: PointerValue<'ctx>,
+        row_id: ExprId,
+        rows: usize,
+        cols: usize,
+        col_slice: DimSlice,
+    ) -> Result<BasicValueEnum<'ctx>, String> {
+        let row_val = self.as_int(row_id)?;
+        let func = self.current_function();
+        let rows_val = self.int_type().const_int(rows as u64, false);
+        let zero = self.int_type().const_zero();
+        let row_lo = self
+            .builder
+            .build_int_compare(IntPredicate::SLT, row_val, zero, "row_lo")
+            .map_err(err)?;
+        let row_hi = self
+            .builder
+            .build_int_compare(IntPredicate::SGE, row_val, rows_val, "row_hi")
+            .map_err(err)?;
+        let row_oob = self
+            .builder
+            .build_or(row_lo, row_hi, "row_oob")
+            .map_err(err)?;
+        let err_bb = self.context.append_basic_block(func, "rslice_err");
+        let ok_bb = self.context.append_basic_block(func, "rslice_ok");
+        self.builder
+            .build_conditional_branch(row_oob, err_bb, ok_bb)
+            .map_err(err)?;
+        self.builder.position_at_end(err_bb);
+        self.gen_runtime_error_call("Array index out of bounds.")?;
+        self.builder.position_at_end(ok_bb);
+
+        let byte_count = self.int_type().const_int(
+            col_slice.len as u64 * Self::element_byte_size(elem_type),
+            false,
+        );
+        let dst_ptr = self.build_pinp_alloc(byte_count)?;
+        let cols_val = self.int_type().const_int(cols as u64, false);
+        let c1_val = self.int_type().const_int(col_slice.start as u64, false);
+        let cl_val = self.int_type().const_int(col_slice.len as u64, false);
+        let row_base = self
+            .builder
+            .build_int_mul(row_val, cols_val, "row_base")
+            .map_err(err)?;
+
+        let counter = self.alloca_at_entry(PinpType::Int)?;
+        self.builder.build_store(counter, zero).map_err(err)?;
+        let header = self.context.append_basic_block(func, "rslice_hdr");
+        let body = self.context.append_basic_block(func, "rslice_body");
+        let exit = self.context.append_basic_block(func, "rslice_exit");
+        self.builder
+            .build_unconditional_branch(header)
+            .map_err(err)?;
+
+        self.builder.position_at_end(header);
+        let k = self.load_counter(counter)?;
+        let cond = self
+            .builder
+            .build_int_compare(IntPredicate::SLT, k, cl_val, "rslice_cond")
+            .map_err(err)?;
+        self.builder
+            .build_conditional_branch(cond, body, exit)
+            .map_err(err)?;
+
+        self.builder.position_at_end(body);
+        let src_col = self
+            .builder
+            .build_int_add(k, c1_val, "src_col")
+            .map_err(err)?;
+        let src_flat = self
+            .builder
+            .build_int_add(row_base, src_col, "src_flat")
+            .map_err(err)?;
+        let src_ptr = self.build_element_ptr(elem_type, matrix_ptr, src_flat)?;
+        let val = self
+            .builder
+            .build_load(self.element_llvm_type(elem_type), src_ptr, "elem")
+            .map_err(err)?;
+        let dst_ep = self.build_element_ptr(elem_type, dst_ptr, k)?;
+        self.builder.build_store(dst_ep, val).map_err(err)?;
+        let one = self.int_type().const_int(1, false);
+        let next_k = self.builder.build_int_add(k, one, "next_k").map_err(err)?;
+        self.builder.build_store(counter, next_k).map_err(err)?;
+        self.builder
+            .build_unconditional_branch(header)
+            .map_err(err)?;
+
+        self.builder.position_at_end(exit);
+        Ok(dst_ptr.into())
+    }
+
+    // `mat[r1..r1+rl, c]` — runtime-check col, copy `rl` elements from that column.
+    fn gen_index2d_col_slice(
+        &mut self,
+        elem_type: ArrayElementType,
+        matrix_ptr: PointerValue<'ctx>,
+        col_id: ExprId,
+        cols: usize,
+        row_slice: DimSlice,
+    ) -> Result<BasicValueEnum<'ctx>, String> {
+        let col_val = self.as_int(col_id)?;
+        let func = self.current_function();
+        let cols_val = self.int_type().const_int(cols as u64, false);
+        let zero = self.int_type().const_zero();
+        let col_lo = self
+            .builder
+            .build_int_compare(IntPredicate::SLT, col_val, zero, "col_lo")
+            .map_err(err)?;
+        let col_hi = self
+            .builder
+            .build_int_compare(IntPredicate::SGE, col_val, cols_val, "col_hi")
+            .map_err(err)?;
+        let col_oob = self
+            .builder
+            .build_or(col_lo, col_hi, "col_oob")
+            .map_err(err)?;
+        let err_bb = self.context.append_basic_block(func, "cslice_err");
+        let ok_bb = self.context.append_basic_block(func, "cslice_ok");
+        self.builder
+            .build_conditional_branch(col_oob, err_bb, ok_bb)
+            .map_err(err)?;
+        self.builder.position_at_end(err_bb);
+        self.gen_runtime_error_call("Array index out of bounds.")?;
+        self.builder.position_at_end(ok_bb);
+
+        let byte_count = self.int_type().const_int(
+            row_slice.len as u64 * Self::element_byte_size(elem_type),
+            false,
+        );
+        let dst_ptr = self.build_pinp_alloc(byte_count)?;
+        let r1_val = self.int_type().const_int(row_slice.start as u64, false);
+        let rl_val = self.int_type().const_int(row_slice.len as u64, false);
+
+        let counter = self.alloca_at_entry(PinpType::Int)?;
+        self.builder.build_store(counter, zero).map_err(err)?;
+        let header = self.context.append_basic_block(func, "cslice_hdr");
+        let body = self.context.append_basic_block(func, "cslice_body");
+        let exit = self.context.append_basic_block(func, "cslice_exit");
+        self.builder
+            .build_unconditional_branch(header)
+            .map_err(err)?;
+
+        self.builder.position_at_end(header);
+        let k = self.load_counter(counter)?;
+        let cond = self
+            .builder
+            .build_int_compare(IntPredicate::SLT, k, rl_val, "cslice_cond")
+            .map_err(err)?;
+        self.builder
+            .build_conditional_branch(cond, body, exit)
+            .map_err(err)?;
+
+        self.builder.position_at_end(body);
+        let src_row = self
+            .builder
+            .build_int_add(k, r1_val, "src_row")
+            .map_err(err)?;
+        let src_row_off = self
+            .builder
+            .build_int_mul(src_row, cols_val, "src_row_off")
+            .map_err(err)?;
+        let src_flat = self
+            .builder
+            .build_int_add(src_row_off, col_val, "src_flat")
+            .map_err(err)?;
+        let src_ptr = self.build_element_ptr(elem_type, matrix_ptr, src_flat)?;
+        let val = self
+            .builder
+            .build_load(self.element_llvm_type(elem_type), src_ptr, "elem")
+            .map_err(err)?;
+        let dst_ep = self.build_element_ptr(elem_type, dst_ptr, k)?;
+        self.builder.build_store(dst_ep, val).map_err(err)?;
+        let one = self.int_type().const_int(1, false);
+        let next_k = self.builder.build_int_add(k, one, "next_k").map_err(err)?;
+        self.builder.build_store(counter, next_k).map_err(err)?;
+        self.builder
+            .build_unconditional_branch(header)
+            .map_err(err)?;
+
+        self.builder.position_at_end(exit);
+        Ok(dst_ptr.into())
+    }
+
+    // `mat[r1..r1+rl, c1..c1+cl]` — both dimensions sema-verified; copy `rl×cl` elements
+    // into a new matrix using a single flat counter `k in 0..rl*cl`.
+    fn gen_index2d_submatrix(
+        &mut self,
+        elem_type: ArrayElementType,
+        matrix_ptr: PointerValue<'ctx>,
+        cols: usize,
+        row_slice: DimSlice,
+        col_slice: DimSlice,
+    ) -> Result<BasicValueEnum<'ctx>, String> {
+        let total = row_slice.len * col_slice.len;
+        let byte_count = self
+            .int_type()
+            .const_int(total as u64 * Self::element_byte_size(elem_type), false);
+        let dst_ptr = self.build_pinp_alloc(byte_count)?;
+        let cols_val = self.int_type().const_int(cols as u64, false);
+        let cl_val = self.int_type().const_int(col_slice.len as u64, false);
+        let r1_val = self.int_type().const_int(row_slice.start as u64, false);
+        let c1_val = self.int_type().const_int(col_slice.start as u64, false);
+        let total_val = self.int_type().const_int(total as u64, false);
+        let zero = self.int_type().const_zero();
+
+        let counter = self.alloca_at_entry(PinpType::Int)?;
+        self.builder.build_store(counter, zero).map_err(err)?;
+        let func = self.current_function();
+        let header = self.context.append_basic_block(func, "sub_hdr");
+        let body = self.context.append_basic_block(func, "sub_body");
+        let exit = self.context.append_basic_block(func, "sub_exit");
+        self.builder
+            .build_unconditional_branch(header)
+            .map_err(err)?;
+
+        self.builder.position_at_end(header);
+        let k = self.load_counter(counter)?;
+        let cond = self
+            .builder
+            .build_int_compare(IntPredicate::SLT, k, total_val, "sub_cond")
+            .map_err(err)?;
+        self.builder
+            .build_conditional_branch(cond, body, exit)
+            .map_err(err)?;
+
+        self.builder.position_at_end(body);
+        let sub_row = self
+            .builder
+            .build_int_signed_div(k, cl_val, "sub_row")
+            .map_err(err)?;
+        let sub_col = self
+            .builder
+            .build_int_signed_rem(k, cl_val, "sub_col")
+            .map_err(err)?;
+        let src_row = self
+            .builder
+            .build_int_add(sub_row, r1_val, "src_row")
+            .map_err(err)?;
+        let src_col = self
+            .builder
+            .build_int_add(sub_col, c1_val, "src_col")
+            .map_err(err)?;
+        let src_row_off = self
+            .builder
+            .build_int_mul(src_row, cols_val, "src_row_off")
+            .map_err(err)?;
+        let src_flat = self
+            .builder
+            .build_int_add(src_row_off, src_col, "src_flat")
+            .map_err(err)?;
+        let src_ptr = self.build_element_ptr(elem_type, matrix_ptr, src_flat)?;
+        let val = self
+            .builder
+            .build_load(self.element_llvm_type(elem_type), src_ptr, "elem")
+            .map_err(err)?;
+        let dst_ep = self.build_element_ptr(elem_type, dst_ptr, k)?;
+        self.builder.build_store(dst_ep, val).map_err(err)?;
+        let one = self.int_type().const_int(1, false);
+        let next_k = self.builder.build_int_add(k, one, "next_k").map_err(err)?;
+        self.builder.build_store(counter, next_k).map_err(err)?;
+        self.builder
+            .build_unconditional_branch(header)
+            .map_err(err)?;
+
+        self.builder.position_at_end(exit);
+        Ok(dst_ptr.into())
+    }
+
+    // Compiler built-in pseudo-members like .len, .ndim, etc
+    fn gen_builtin_member(&self, expr_id: ExprId) -> Result<BasicValueEnum<'ctx>, String> {
         let Node::Member {
             object: object_id, ..
         } = self.ast.node(expr_id)
@@ -750,16 +1421,28 @@ impl<'ctx, 'ast> CodeGen<'ctx, 'ast> {
             unreachable!("gen_member on wrong node")
         };
         let object_id = *object_id;
-        let PinpType::Array(_, n) = self.ast.type_of(object_id) else {
-            unreachable!("Member object has Array type")
+        // Sema resolved the member name to a BuiltinMember variant; we match the enum here so
+        // the compiler enforces exhaustiveness — a new variant that compiles in sema but is
+        // unhandled in codegen becomes a compile error, not a silent runtime `unreachable!`.
+        let builtin = self
+            .ast
+            .builtin_member_of(expr_id)
+            .expect("Sema must resolve every Node::Member to a BuiltinMember");
+        let const_val: u64 = match (builtin, self.ast.type_of(object_id)) {
+            (BuiltinMember::Len, PinpType::Array(_, n)) => n as u64,
+            (BuiltinMember::Len, PinpType::Matrix(_, rows, cols)) => (rows * cols) as u64,
+            (BuiltinMember::Ndim, PinpType::Array(..)) => 1,
+            (BuiltinMember::Ndim, PinpType::Matrix(..)) => 2,
+            (BuiltinMember::Rows, PinpType::Matrix(_, rows, _)) => rows as u64,
+            (BuiltinMember::Cols, PinpType::Matrix(_, _, cols)) => cols as u64,
+            _ => unreachable!("Sema rejected invalid (member, type) combination"),
         };
-        // Sema already validated the member name is `len`.
-        Ok(self.int_type().const_int(n as u64, false).into())
+        Ok(self.int_type().const_int(const_val, false).into())
     }
 
     // `[element for var[:type] in source]` — allocate array, loop over the range, store each
     // element. The range must have literal bounds (enforced by sema), so the loop bound is a
-    // compile-time constant.
+    // compile-time constant..0
     fn gen_comprehension(&mut self, expr_id: ExprId) -> Result<BasicValueEnum<'ctx>, String> {
         let Node::Comprehension {
             element,
@@ -905,8 +1588,8 @@ impl<'ctx, 'ast> CodeGen<'ctx, 'ast> {
             PinpType::Float => self.float_type().const_zero().into(),
             PinpType::Void => unreachable!("Void has no zero value."),
             PinpType::Range => self.range_type().const_zero().into(),
-            // A null pointer is the zero for an array slot (never valid; must be overwritten before use).
-            PinpType::Array(_, _) => self
+            // Null pointer is the zero for array/matrix slots (must be overwritten before use).
+            PinpType::Array(_, _) | PinpType::Matrix(_, _, _) => self
                 .context
                 .ptr_type(AddressSpace::default())
                 .const_null()

@@ -14,7 +14,7 @@
 
 use rustc_hash::FxHashMap;
 
-use crate::parser::{Ast, Node, PinpType, SymId, TopLevel};
+use crate::parser::{Ast, BuiltinMember, Node, PinpType, SymId, TopLevel};
 
 mod analyzer;
 
@@ -54,6 +54,14 @@ fn join(left: PinpType, right: PinpType) -> Option<PinpType> {
     }
 }
 
+/// One dimension's selector in a `Node::Index2D` expression after sema classification.
+enum DimSelector {
+    /// A scalar (`Int`/`Bool`) — bounds-checked at runtime.
+    Index,
+    /// A range or FullExtent — compile-time bounds-checked; carries the slice length.
+    Slice(usize),
+}
+
 /// Whether `pinp_type` is a scalar arithmetic/comparison operand — `Bool`/`Int`/`Float`, not `Void`
 /// and not an aggregate like `Range`.
 fn numeric(pinp_type: PinpType) -> bool {
@@ -75,12 +83,14 @@ struct Signature {
     return_type: PinpType,
 }
 
-/// Infers types and checks the semantic rules, filling the AST's `types` arena in place.
+/// Infers types and checks the semantic rules, filling the AST's `types` and `builtin_members`
+/// arenas in place.
 pub fn analyze(ast: &mut Ast) -> Result<(), SemaError> {
-    // Borrow the read-only structure and the writable `types` arena as disjoint fields.
+    // Borrow the read-only structure and the writable arenas as disjoint fields.
     let Ast {
         nodes,
         types,
+        builtin_members,
         top_level,
         names,
         ..
@@ -89,6 +99,7 @@ pub fn analyze(ast: &mut Ast) -> Result<(), SemaError> {
         nodes,
         names,
         types,
+        builtin_members,
         scopes: vec![FxHashMap::default()], // global frame
         fn_base: 0,
         funcs: FxHashMap::default(),
@@ -107,6 +118,9 @@ struct Analyzer<'ast, 'src> {
     nodes: &'ast [Node],
     names: &'ast [&'src str],
     types: &'ast mut Vec<PinpType>,
+    /// Parallel to `nodes`; sema writes the resolved [`BuiltinMember`] for every `Node::Member`
+    /// expression so codegen can pattern-match the enum without repeating string comparisons.
+    builtin_members: &'ast mut Vec<Option<BuiltinMember>>,
     scopes: Vec<FxHashMap<SymId, PinpType>>,
     // Index of the current function's base frame; bare-name resolution searches `scopes[fn_base..]`
     // and never reaches the global frame from inside a function. `0` at the top level, where the

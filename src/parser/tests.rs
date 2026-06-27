@@ -111,11 +111,157 @@ fn for_in_is_a_statement() {
             for idx in 1..5
                 idx
         "});
-    let TopLevel::Stmt(Stmt::For { range, body, .. }) = &ast.top_level[0] else {
+    let TopLevel::Stmt(Stmt::For {
+        source: range,
+        body,
+        ..
+    }) = &ast.top_level[0]
+    else {
         panic!("Expected a for statement.");
     };
     assert!(matches!(ast.node(*range), Node::Range { .. }));
     assert!(body.result.is_some());
+}
+
+#[test]
+fn for_array_two_binders() {
+    let ast = parse_ok(indoc! {"
+        for idx, val in arr
+            val
+    "});
+    let TopLevel::Stmt(Stmt::ForArray {
+        binders, source, ..
+    }) = &ast.top_level[0]
+    else {
+        panic!("Expected ForArray.");
+    };
+    assert_eq!(binders.len(), 2);
+    assert_eq!(ast.names[binders[0].value()], "idx");
+    assert_eq!(ast.names[binders[1].value()], "val");
+    assert!(matches!(ast.node(*source), Node::Var(_)));
+}
+
+#[test]
+fn for_array_three_binders() {
+    let ast = parse_ok(indoc! {"
+        for row, col, val in matrix
+            val
+    "});
+    let TopLevel::Stmt(Stmt::ForArray { binders, .. }) = &ast.top_level[0] else {
+        panic!("Expected ForArray.");
+    };
+    assert_eq!(binders.len(), 3);
+    assert_eq!(ast.names[binders[0].value()], "row");
+    assert_eq!(ast.names[binders[1].value()], "col");
+    assert_eq!(ast.names[binders[2].value()], "val");
+}
+
+#[test]
+fn for_single_binder_still_gives_stmt_for() {
+    let ast = parse_ok(indoc! {"
+        for val in arr
+            val
+    "});
+    assert!(matches!(
+        &ast.top_level[0],
+        TopLevel::Stmt(Stmt::For { .. })
+    ));
+}
+
+#[test]
+fn for_four_binders_is_parse_error() {
+    let src = indoc! {"
+        for a, b, c, d in arr
+            a
+    "};
+    assert!(matches!(parse(src), Err(ParseError::Unexpected(_))));
+}
+
+#[test]
+fn for_array_scalar_source_parses() {
+    // Parser does not validate that the source is an array — that is sema's job.
+    let ast = parse_ok(indoc! {"
+        for idx, val in 42
+            val
+    "});
+    assert!(matches!(
+        &ast.top_level[0],
+        TopLevel::Stmt(Stmt::ForArray { .. })
+    ));
+}
+
+#[test]
+fn for_array_expression_source_parses() {
+    // Source can be any expression (a call, indexing, …).
+    let ast = parse_ok(indoc! {"
+        for idx, val in f(x)
+            val
+    "});
+    let TopLevel::Stmt(Stmt::ForArray { source, .. }) = &ast.top_level[0] else {
+        panic!("Expected ForArray.");
+    };
+    assert!(matches!(ast.node(*source), Node::Call { .. }));
+}
+
+#[test]
+fn for_missing_first_binder_is_parse_error() {
+    // `for , val in arr` — comma before any identifier.
+    let src = indoc! {"
+        for , val in arr
+            val
+    "};
+    assert!(matches!(parse(src), Err(ParseError::Unexpected(_))));
+}
+
+#[test]
+fn for_trailing_binder_comma_is_parse_error() {
+    // `for idx, in arr` — trailing comma, no second identifier.
+    let src = indoc! {"
+        for idx, in arr
+            val
+    "};
+    assert!(matches!(parse(src), Err(ParseError::Unexpected(_))));
+}
+
+#[test]
+fn for_non_identifier_binder_is_parse_error() {
+    // `for idx, 42 in arr` — a literal is not a valid binder name.
+    let src = indoc! {"
+        for idx, 42 in arr
+            val
+    "};
+    assert!(matches!(parse(src), Err(ParseError::Unexpected(_))));
+}
+
+#[test]
+fn indexed_assign2d_full_extent_row_parses() {
+    // `m[:, 1] = 99` is syntactically valid; sema enforces that slice-targets must be scalar.
+    let ast = parse_ok("m[:, 1] = 99");
+    let TopLevel::Stmt(Stmt::IndexedAssign2D { row, .. }) = ast.top_level.last().unwrap() else {
+        panic!("Expected IndexedAssign2D.");
+    };
+    assert_eq!(*ast.node(*row), Node::FullExtent);
+}
+
+#[test]
+fn indexed_assign2d_compound_add_eq_parses() {
+    // `m[0, 1] += 5` → IndexedAssign2D { compound_op: Some(Add), value: Int(5) }.
+    let ast = parse_ok("m[0, 1] += 5");
+    let TopLevel::Stmt(Stmt::IndexedAssign2D {
+        target,
+        row,
+        col,
+        value,
+        compound_op,
+    }) = ast.top_level.last().unwrap()
+    else {
+        panic!("Expected IndexedAssign2D.");
+    };
+    assert!(matches!(target, Place::Local(_)));
+    assert_eq!(*ast.node(*row), Node::Int(0));
+    assert_eq!(*ast.node(*col), Node::Int(1));
+    assert_eq!(*compound_op, Some(BinOp::Add));
+    assert_eq!(*ast.node(*value), Node::Int(5));
 }
 
 #[test]
@@ -952,10 +1098,12 @@ fn indexed_assign_parse_shape() {
         target,
         index,
         value,
+        compound_op,
     }) = ast.top_level.last().unwrap()
     else {
         panic!("Expected IndexedAssign.");
     };
+    assert_eq!(*compound_op, None);
     assert!(matches!(target, Place::Local(_)));
     assert_eq!(*ast.node(*index), Node::Int(0));
     assert_eq!(*ast.node(*value), Node::Int(99));
@@ -993,6 +1141,7 @@ fn slice_assign_parse_shape() {
         target,
         index,
         value,
+        ..
     }) = ast.top_level.last().unwrap()
     else {
         panic!("Expected IndexedAssign.");
@@ -1000,6 +1149,43 @@ fn slice_assign_parse_shape() {
     assert!(matches!(target, Place::Local(_)));
     assert!(matches!(ast.node(*index), Node::Range { .. }));
     assert_eq!(*ast.node(*value), Node::Int(5));
+}
+
+#[test]
+fn indexed_assign2d_parse_shape() {
+    let ast = parse_ok("m[0, 1] = 42");
+    let TopLevel::Stmt(Stmt::IndexedAssign2D {
+        target,
+        row,
+        col,
+        value,
+        ..
+    }) = ast.top_level.last().unwrap()
+    else {
+        panic!("Expected IndexedAssign2D.");
+    };
+    assert!(matches!(target, Place::Local(_)));
+    assert_eq!(*ast.node(*row), Node::Int(0));
+    assert_eq!(*ast.node(*col), Node::Int(1));
+    assert_eq!(*ast.node(*value), Node::Int(42));
+}
+
+#[test]
+fn indexed_assign2d_global_target() {
+    let ast = parse_ok("::m[2, 3] = 99");
+    let TopLevel::Stmt(Stmt::IndexedAssign2D { target, .. }) = ast.top_level.last().unwrap() else {
+        panic!("Expected IndexedAssign2D.");
+    };
+    assert!(matches!(target, Place::Global(_)));
+}
+
+#[test]
+fn indexed_assign2d_non_place_target_is_error() {
+    // A matrix literal is not a valid 2D assign target.
+    assert!(matches!(
+        parse("[1, 2; 3, 4][0, 1] = 5"),
+        Err(ParseError::Unexpected(_))
+    ));
 }
 
 #[test]
@@ -1027,6 +1213,152 @@ fn range_init_as_array_literal() {
     assert!(matches!(ast.node(elements[0]), Node::Range { .. }));
 }
 
+// --- matrix literals ---------------------------------------------------------------
+
+#[test]
+fn matrix_literal_two_by_two() {
+    let ast = parse_ok("[1, 2; 3, 4]");
+    let Node::MatrixLiteral { rows } = ast.node(root(&ast)) else {
+        panic!("Expected MatrixLiteral.");
+    };
+    assert_eq!(rows.len(), 2);
+    assert_eq!(rows[0].len(), 2);
+    assert_eq!(rows[1].len(), 2);
+    assert_eq!(*ast.node(rows[0][0]), Node::Int(1));
+    assert_eq!(*ast.node(rows[0][1]), Node::Int(2));
+    assert_eq!(*ast.node(rows[1][0]), Node::Int(3));
+    assert_eq!(*ast.node(rows[1][1]), Node::Int(4));
+}
+
+#[test]
+fn matrix_literal_three_rows() {
+    let ast = parse_ok("[1, 2; 3, 4; 5, 6]");
+    let Node::MatrixLiteral { rows } = ast.node(root(&ast)) else {
+        panic!("Expected MatrixLiteral.");
+    };
+    assert_eq!(rows.len(), 3);
+    assert!(rows.iter().all(|row| row.len() == 2));
+}
+
+#[test]
+fn matrix_literal_single_column() {
+    // A column vector (N×1) is a valid matrix literal.
+    let ast = parse_ok("[1; 2; 3]");
+    let Node::MatrixLiteral { rows } = ast.node(root(&ast)) else {
+        panic!("Expected MatrixLiteral.");
+    };
+    assert_eq!(rows.len(), 3);
+    assert!(rows.iter().all(|row| row.len() == 1));
+}
+
+#[test]
+fn matrix_literal_multiline_parses() {
+    let ast = parse_ok(indoc! {"
+        [1, 2, 3;
+         4, 5, 6]
+    "});
+    let Node::MatrixLiteral { rows } = ast.node(root(&ast)) else {
+        panic!("Expected MatrixLiteral.");
+    };
+    assert_eq!(rows.len(), 2);
+    assert_eq!(rows[0].len(), 3);
+    assert_eq!(rows[1].len(), 3);
+}
+
+#[test]
+fn trailing_semicolon_is_parse_error() {
+    assert!(parse("[1, 2;]").is_err());
+}
+
+#[test]
+fn trailing_comma_before_semicolon_is_parse_error() {
+    // `[1, 2,; 3, 4]` — a dangling `,` before a row separator is invalid.
+    assert!(matches!(
+        parse("[1, 2,; 3, 4]"),
+        Err(ParseError::Unexpected(_))
+    ));
+}
+
+#[test]
+fn matrix_multiline_misaligned_row_is_layout_error() {
+    // Row 2 starts at a different column than row 1.
+    let src = indoc! {"
+        [1, 2, 3;
+           4, 5, 6]
+    "};
+    assert!(matches!(parse(src), Err(ParseError::Layout(_))));
+}
+
+// --- 2D indexing and slicing -----------------------------------------------------------
+
+#[test]
+fn index2d_scalar_row_and_col() {
+    let ast = parse_ok("m[0, 1]");
+    let Node::Index2D { matrix, row, col } = *ast.node(root(&ast)) else {
+        panic!("Expected Index2D.");
+    };
+    assert!(matches!(ast.node(matrix), Node::Var(_)));
+    assert_eq!(*ast.node(row), Node::Int(0));
+    assert_eq!(*ast.node(col), Node::Int(1));
+}
+
+#[test]
+fn index2d_full_extent_row() {
+    let ast = parse_ok("m[:, 1]");
+    let Node::Index2D { row, col, .. } = *ast.node(root(&ast)) else {
+        panic!("Expected Index2D.");
+    };
+    assert_eq!(*ast.node(row), Node::FullExtent);
+    assert_eq!(*ast.node(col), Node::Int(1));
+}
+
+#[test]
+fn index2d_full_extent_col() {
+    let ast = parse_ok("m[0, :]");
+    let Node::Index2D { row, col, .. } = *ast.node(root(&ast)) else {
+        panic!("Expected Index2D.");
+    };
+    assert_eq!(*ast.node(row), Node::Int(0));
+    assert_eq!(*ast.node(col), Node::FullExtent);
+}
+
+#[test]
+fn index2d_both_full_extent() {
+    let ast = parse_ok("m[:, :]");
+    let Node::Index2D { row, col, .. } = *ast.node(root(&ast)) else {
+        panic!("Expected Index2D.");
+    };
+    assert_eq!(*ast.node(row), Node::FullExtent);
+    assert_eq!(*ast.node(col), Node::FullExtent);
+}
+
+#[test]
+fn index2d_range_row() {
+    let ast = parse_ok("m[0..2, 1]");
+    let Node::Index2D { row, col, .. } = *ast.node(root(&ast)) else {
+        panic!("Expected Index2D.");
+    };
+    assert!(matches!(ast.node(row), Node::Range { .. }));
+    assert_eq!(*ast.node(col), Node::Int(1));
+}
+
+#[test]
+fn index2d_does_not_break_1d_index() {
+    // A plain `a[0]` must still produce a 1D `Node::Index`, not `Index2D`.
+    let ast = parse_ok("a[0]");
+    assert!(matches!(ast.node(root(&ast)), Node::Index { .. }));
+}
+
+#[test]
+fn index2d_three_dimensions_is_parse_error() {
+    assert!(parse("m[0, 1, 2]").is_err());
+}
+
+#[test]
+fn index2d_missing_col_after_comma_is_parse_error() {
+    assert!(parse("m[0,]").is_err());
+}
+
 #[test]
 fn direct_index_on_array_literal_parses() {
     // `[10, 20][0]` is valid parser output: Index { array: ArrayLiteral(...), index: Int(0) }.
@@ -1037,4 +1369,81 @@ fn direct_index_on_array_literal_parses() {
     let (array, index) = (*array, *index);
     assert!(matches!(ast.node(array), Node::ArrayLiteral { .. }));
     assert_eq!(*ast.node(index), Node::Int(0));
+}
+
+// ---- step 20 — loose ends -------------------------------------------------------
+
+#[test]
+fn indexed_assign_1d_compound_add_eq_parses() {
+    // `ary[i] += 1` → IndexedAssign { compound_op: Some(Add), value: Int(1) }.
+    // The index expression appears only once — no embedded re-read of Index(ary, i).
+    let ast = parse_ok("ary[i] += 1");
+    let TopLevel::Stmt(Stmt::IndexedAssign {
+        target,
+        index,
+        value,
+        compound_op,
+    }) = ast.top_level.last().unwrap()
+    else {
+        panic!("Expected IndexedAssign.");
+    };
+    assert!(matches!(target, Place::Local(_)));
+    assert!(matches!(ast.node(*index), Node::Var(_)));
+    assert_eq!(*compound_op, Some(BinOp::Add));
+    assert_eq!(*ast.node(*value), Node::Int(1));
+}
+
+#[test]
+fn indexed_assign_1d_sub_eq_parses() {
+    // `-=` uses a different compound op to cover the mapping function.
+    let ast = parse_ok("ary[i] -= 1");
+    let TopLevel::Stmt(Stmt::IndexedAssign { compound_op, .. }) = ast.top_level.last().unwrap()
+    else {
+        panic!("Expected IndexedAssign.");
+    };
+    assert_eq!(*compound_op, Some(BinOp::Sub));
+}
+
+#[test]
+fn indexed_assign2d_compound_mul_eq_parses() {
+    // `mat[r, c] *= 2` — verifies the 2D compound path with `*=`.
+    let ast = parse_ok("mat[r, c] *= 2");
+    let TopLevel::Stmt(Stmt::IndexedAssign2D {
+        compound_op, value, ..
+    }) = ast.top_level.last().unwrap()
+    else {
+        panic!("Expected IndexedAssign2D.");
+    };
+    assert_eq!(*compound_op, Some(BinOp::Mul));
+    assert_eq!(*ast.node(*value), Node::Int(2));
+}
+
+#[test]
+fn for_array_underscore_index_binder_parses() {
+    // Value binder is kept; index binder discarded via `_`.
+    let ast = parse_ok(indoc! {"
+        for row, _, val in matrix
+            val
+    "});
+    let TopLevel::Stmt(Stmt::ForArray { binders, .. }) = &ast.top_level[0] else {
+        panic!("Expected ForArray.");
+    };
+    assert_eq!(binders.len(), 3);
+    assert_eq!(ast.names[binders[1].value()], "_");
+    assert_eq!(ast.names[binders[2].value()], "val");
+}
+
+#[test]
+fn for_array_both_index_binders_underscore_parses() {
+    // Both index binders discarded — duplicate `_` must not be rejected by the parser.
+    let ast = parse_ok(indoc! {"
+        for _, _, val in matrix
+            val
+    "});
+    let TopLevel::Stmt(Stmt::ForArray { binders, .. }) = &ast.top_level[0] else {
+        panic!("Expected ForArray.");
+    };
+    assert_eq!(binders.len(), 3);
+    assert_eq!(ast.names[binders[0].value()], "_");
+    assert_eq!(ast.names[binders[1].value()], "_");
 }

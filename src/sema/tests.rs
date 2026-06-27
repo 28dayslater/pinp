@@ -712,15 +712,15 @@ fn index_on_bool_scalar_is_error() {
 }
 
 #[test]
-fn bool_index_is_accepted() {
-    // bool is int_like, so it is a valid index.
-    assert_eq!(
-        root_type(indoc! {"
+fn bool_index_is_error() {
+    // Only Int is a valid index; Bool is rejected even though it is int_like.
+    assert!(matches!(
+        sema_error(indoc! {"
                 a = [10, 20, 30]
                 a[true]
             "}),
-        PinpType::Int
-    );
+        SemaError::Type(_)
+    ));
 }
 
 #[test]
@@ -1041,11 +1041,14 @@ fn indexed_assign_float_index_is_error() {
 }
 
 #[test]
-fn indexed_assign_bool_index_is_accepted() {
-    analyzed(indoc! {"
-            a = [1, 2, 3]
-            a[true] = 99
-        "});
+fn indexed_assign_bool_index_is_error() {
+    assert!(matches!(
+        sema_error(indoc! {"
+                a = [1, 2, 3]
+                a[true] = 99
+            "}),
+        SemaError::Type(_)
+    ));
 }
 
 #[test]
@@ -1389,4 +1392,1099 @@ fn slice_assign_negative_start_is_error() {
             "}),
         SemaError::Type(_)
     ));
+}
+
+// --- Matrix type integration (Step 6) -----------------------------------------------
+// `join` and `assignable` already operate on `PinpType`'s derived `PartialEq`.
+// These tests verify the Matrix cases without requiring MatrixLiteral sema (step 7).
+
+#[test]
+fn join_identical_matrix_types() {
+    let matrix = PinpType::Matrix(ArrayElementType::Int, 2, 3);
+    assert_eq!(join(matrix, matrix), Some(matrix));
+}
+
+#[test]
+fn join_different_shape_matrices_is_none() {
+    let m1 = PinpType::Matrix(ArrayElementType::Int, 2, 2);
+    let m2 = PinpType::Matrix(ArrayElementType::Int, 2, 3);
+    assert_eq!(join(m1, m2), None);
+}
+
+#[test]
+fn join_different_element_type_matrices_is_none() {
+    // No promotion across element types for matrices — they are distinct types.
+    let m_int = PinpType::Matrix(ArrayElementType::Int, 2, 2);
+    let m_float = PinpType::Matrix(ArrayElementType::Float, 2, 2);
+    assert_eq!(join(m_int, m_float), None);
+}
+
+#[test]
+fn join_matrix_with_scalar_is_none() {
+    let matrix = PinpType::Matrix(ArrayElementType::Int, 2, 2);
+    assert_eq!(join(matrix, PinpType::Int), None);
+    assert_eq!(join(PinpType::Int, matrix), None);
+}
+
+#[test]
+fn assignable_same_matrix() {
+    let matrix = PinpType::Matrix(ArrayElementType::Float, 3, 3);
+    assert!(assignable(matrix, matrix));
+}
+
+#[test]
+fn assignable_different_shape_matrix_is_false() {
+    let m1 = PinpType::Matrix(ArrayElementType::Int, 2, 2);
+    let m2 = PinpType::Matrix(ArrayElementType::Int, 3, 3);
+    assert!(!assignable(m1, m2));
+}
+
+#[test]
+fn assignable_matrix_to_scalar_is_false() {
+    let matrix = PinpType::Matrix(ArrayElementType::Int, 2, 2);
+    assert!(!assignable(matrix, PinpType::Int));
+    assert!(!assignable(PinpType::Int, matrix));
+    assert!(!assignable(matrix, PinpType::Float));
+}
+
+// --- 2D indexing and slicing (Step 8) -----------------------------------------------
+
+// Sets up a 3×4 Int matrix `m` then appends `expr` as the final expression.
+fn with_matrix(expr: &str) -> String {
+    format!("m = [1, 2, 3, 4; 5, 6, 7, 8; 9, 10, 11, 12]\n{expr}")
+}
+
+#[test]
+fn index2d_scalar_both_yields_scalar() {
+    assert_eq!(root_type(&with_matrix("m[0, 1]")), PinpType::Int);
+}
+
+#[test]
+fn index2d_float_matrix_yields_float_scalar() {
+    assert_eq!(
+        root_type(indoc! {"
+            m = [1.0, 2.0; 3.0, 4.0]
+            m[0, 1]
+        "}),
+        PinpType::Float
+    );
+}
+
+#[test]
+fn index2d_scalar_row_range_col_yields_array() {
+    // m[0..1, 0] — inclusive row slice (2 rows), scalar col → Array(Int, 2)
+    assert_eq!(
+        root_type(&with_matrix("m[0..1, 0]")),
+        PinpType::Array(ArrayElementType::Int, 2)
+    );
+}
+
+#[test]
+fn index2d_scalar_row_range_col_exclusive_yields_array() {
+    // m[0..<2, 0] — exclusive row slice (2 rows) → Array(Int, 2)
+    assert_eq!(
+        root_type(&with_matrix("m[0..<2, 0]")),
+        PinpType::Array(ArrayElementType::Int, 2)
+    );
+}
+
+#[test]
+fn index2d_scalar_row_range_col_yields_correct_length() {
+    // m[0, 1..3] — row 0, cols 1-3 inclusive (3 elements) → Array(Int, 3)
+    assert_eq!(
+        root_type(&with_matrix("m[0, 1..3]")),
+        PinpType::Array(ArrayElementType::Int, 3)
+    );
+}
+
+#[test]
+fn index2d_both_range_yields_matrix() {
+    // m[0..1, 0..2] — 2 rows × 3 cols → Matrix(Int, 2, 3)
+    assert_eq!(
+        root_type(&with_matrix("m[0..1, 0..2]")),
+        PinpType::Matrix(ArrayElementType::Int, 2, 3)
+    );
+}
+
+#[test]
+fn index2d_full_extent_row_yields_array() {
+    // m[:, 0] — all 3 rows, col 0 → Array(Int, 3)
+    assert_eq!(
+        root_type(&with_matrix("m[:, 0]")),
+        PinpType::Array(ArrayElementType::Int, 3)
+    );
+}
+
+#[test]
+fn index2d_full_extent_col_yields_array() {
+    // m[0, :] — row 0, all 4 cols → Array(Int, 4)
+    assert_eq!(
+        root_type(&with_matrix("m[0, :]")),
+        PinpType::Array(ArrayElementType::Int, 4)
+    );
+}
+
+#[test]
+fn index2d_both_full_extent_yields_matrix() {
+    // m[:, :] — all rows × all cols → Matrix(Int, 3, 4)
+    assert_eq!(
+        root_type(&with_matrix("m[:, :]")),
+        PinpType::Matrix(ArrayElementType::Int, 3, 4)
+    );
+}
+
+#[test]
+fn double_index_on_matrix_scalar_result_is_error() {
+    // m[0, 1][0] — result of scalar index is Int, not indexable.
+    assert!(matches!(
+        sema_error(&with_matrix("m[0, 1][0]")),
+        SemaError::Type(_)
+    ));
+}
+
+#[test]
+fn index2d_on_1d_array_is_error() {
+    assert!(matches!(
+        sema_error(indoc! {"
+            a = [1, 2, 3]
+            a[0, 1]
+        "}),
+        SemaError::Type(_)
+    ));
+}
+
+#[test]
+fn index2d_row_slice_out_of_bounds_is_error() {
+    // m[0..3, 0] — inclusive stop=3 on rows=3 → out of bounds
+    assert!(matches!(
+        sema_error(&with_matrix("m[0..3, 0]")),
+        SemaError::Type(_)
+    ));
+}
+
+#[test]
+fn index2d_col_slice_out_of_bounds_is_error() {
+    // m[0, 0..4] — inclusive stop=4 on cols=4 → out of bounds
+    assert!(matches!(
+        sema_error(&with_matrix("m[0, 0..4]")),
+        SemaError::Type(_)
+    ));
+}
+
+#[test]
+fn index2d_variable_slice_bound_is_error() {
+    assert!(matches!(
+        sema_error(indoc! {"
+            m = [1, 2, 3, 4; 5, 6, 7, 8; 9, 10, 11, 12]
+            n = 2
+            m[0, n..3]
+        "}),
+        SemaError::Type(_)
+    ));
+}
+
+#[test]
+fn index2d_stepped_slice_is_error() {
+    assert!(matches!(
+        sema_error(&with_matrix("m[0, 0..2:1]")),
+        SemaError::Type(_)
+    ));
+}
+
+#[test]
+fn index2d_descending_slice_is_error() {
+    assert!(matches!(
+        sema_error(&with_matrix("m[0, 2..>0]")),
+        SemaError::Type(_)
+    ));
+}
+
+#[test]
+fn index2d_negative_slice_start_is_error() {
+    assert!(matches!(
+        sema_error(&with_matrix("m[-1..1, 0]")),
+        SemaError::Type(_)
+    ));
+}
+
+#[test]
+fn full_extent_outside_index2d_is_error() {
+    // `arr[:]` — FullExtent in a 1D index context is invalid.
+    assert!(matches!(
+        sema_error(indoc! {"
+            a = [1, 2, 3]
+            a[:]
+        "}),
+        SemaError::Type(_)
+    ));
+}
+
+#[test]
+fn index2d_empty_exclusive_row_slice_is_error() {
+    // m[0..<0, 0] — equal bounds with `..<` produce an empty slice; must be rejected.
+    assert!(matches!(
+        sema_error(&with_matrix("m[0..<0, 0]")),
+        SemaError::Type(_)
+    ));
+}
+
+#[test]
+fn index2d_empty_exclusive_col_slice_is_error() {
+    // m[0, 1..<1] — same rule applied to the column dimension.
+    assert!(matches!(
+        sema_error(&with_matrix("m[0, 1..<1]")),
+        SemaError::Type(_)
+    ));
+}
+
+// --- Matrix literal sema (Step 7) ---------------------------------------------------
+
+#[test]
+fn matrix_literal_int_type() {
+    assert_eq!(
+        root_type("[1, 2; 3, 4]"),
+        PinpType::Matrix(ArrayElementType::Int, 2, 2)
+    );
+}
+
+#[test]
+fn matrix_literal_float_type() {
+    assert_eq!(
+        root_type("[1.0, 2.0; 3.0, 4.0]"),
+        PinpType::Matrix(ArrayElementType::Float, 2, 2)
+    );
+}
+
+#[test]
+fn matrix_literal_bool_type() {
+    assert_eq!(
+        root_type("[true, false; false, true]"),
+        PinpType::Matrix(ArrayElementType::Bool, 2, 2)
+    );
+}
+
+#[test]
+fn matrix_literal_column_vector() {
+    assert_eq!(
+        root_type("[1; 2; 3]"),
+        PinpType::Matrix(ArrayElementType::Int, 3, 1)
+    );
+}
+
+#[test]
+fn matrix_literal_rectangular() {
+    assert_eq!(
+        root_type("[1, 2, 3; 4, 5, 6]"),
+        PinpType::Matrix(ArrayElementType::Int, 2, 3)
+    );
+}
+
+#[test]
+fn matrix_literal_int_float_promotes_to_float() {
+    assert_eq!(
+        root_type("[1, 2; 3, 4.0]"),
+        PinpType::Matrix(ArrayElementType::Float, 2, 2)
+    );
+}
+
+#[test]
+fn matrix_literal_bool_int_promotes_to_int() {
+    assert_eq!(
+        root_type("[true, false; 0, 1]"),
+        PinpType::Matrix(ArrayElementType::Int, 2, 2)
+    );
+}
+
+#[test]
+fn matrix_literal_jagged_rows_is_error() {
+    assert!(matches!(sema_error("[1, 2; 3, 4, 5]"), SemaError::Type(_)));
+}
+
+#[test]
+fn matrix_literal_short_row_is_error() {
+    assert!(matches!(sema_error("[1, 2; 3]"), SemaError::Type(_)));
+}
+
+#[test]
+fn matrix_literal_inconsistent_element_types_is_error() {
+    // Range is not joinable with Int — the common type cannot be determined.
+    assert!(matches!(sema_error("[1, 2; 3, 1..5]"), SemaError::Type(_)));
+}
+
+// --- Built-in members on Matrix (Step 9) --------------------------------------------
+
+#[test]
+fn ndim_of_1d_array_is_int() {
+    assert_eq!(
+        root_type(indoc! {"
+            a = [1, 2, 3]
+            a.ndim
+        "}),
+        PinpType::Int
+    );
+}
+
+#[test]
+fn ndim_of_2d_matrix_is_int() {
+    assert_eq!(root_type(&with_matrix("m.ndim")), PinpType::Int);
+}
+
+#[test]
+fn ndim_on_scalar_is_error() {
+    assert_eq!(
+        sema_error(indoc! {"
+            a = 5
+            a.ndim
+        "}),
+        SemaError::Type("`.ndim` is not defined on Int.".into())
+    );
+}
+
+#[test]
+fn rows_of_matrix_is_int() {
+    assert_eq!(root_type(&with_matrix("m.rows")), PinpType::Int);
+}
+
+#[test]
+fn cols_of_matrix_is_int() {
+    assert_eq!(root_type(&with_matrix("m.cols")), PinpType::Int);
+}
+
+#[test]
+fn rows_on_1d_array_is_error() {
+    assert_eq!(
+        sema_error(indoc! {"
+            a = [1, 2, 3]
+            a.rows
+        "}),
+        SemaError::Type(".rows is not defined for a 1D array. Use .len.".into())
+    );
+}
+
+#[test]
+fn cols_on_1d_array_is_error() {
+    assert_eq!(
+        sema_error(indoc! {"
+            a = [1, 2, 3]
+            a.cols
+        "}),
+        SemaError::Type(".cols is not defined for a 1D array. Use .len.".into())
+    );
+}
+
+#[test]
+fn len_of_matrix_is_int() {
+    // .len on a 3x4 matrix is valid and returns Int.
+    assert_eq!(root_type(&with_matrix("m.len")), PinpType::Int);
+}
+
+#[test]
+fn unknown_member_on_matrix_is_error() {
+    assert!(matches!(
+        sema_error(&with_matrix("m.foo")),
+        SemaError::Type(_)
+    ));
+}
+
+#[test]
+fn rows_on_scalar_is_error() {
+    assert!(matches!(
+        sema_error(indoc! {"
+            a = 5
+            a.rows
+        "}),
+        SemaError::Type(_)
+    ));
+}
+
+#[test]
+fn cols_on_scalar_is_error() {
+    assert!(matches!(
+        sema_error(indoc! {"
+            a = 5
+            a.cols
+        "}),
+        SemaError::Type(_)
+    ));
+}
+
+#[test]
+fn ndim_on_range_is_error() {
+    assert!(matches!(sema_error("(1..5).ndim"), SemaError::Type(_)));
+}
+
+// --- identity() built-in (Step 10) --------------------------------------------------
+
+#[test]
+fn identity_int_yields_square_int_matrix() {
+    assert_eq!(
+        root_type("identity(3, int)"),
+        PinpType::Matrix(ArrayElementType::Int, 3, 3)
+    );
+}
+
+#[test]
+fn identity_float_yields_square_float_matrix() {
+    assert_eq!(
+        root_type("identity(3, float)"),
+        PinpType::Matrix(ArrayElementType::Float, 3, 3)
+    );
+}
+
+#[test]
+fn identity_size_2_is_minimum_valid() {
+    assert_eq!(
+        root_type("identity(2, int)"),
+        PinpType::Matrix(ArrayElementType::Int, 2, 2)
+    );
+}
+
+#[test]
+fn identity_result_has_member_access() {
+    // .rows/.cols on the result type work because it is a Matrix.
+    assert_eq!(root_type("identity(3, int).rows"), PinpType::Int);
+    assert_eq!(root_type("identity(4, float).cols"), PinpType::Int);
+}
+
+#[test]
+fn identity_size_1_is_error() {
+    assert_eq!(
+        sema_error("identity(1, int)"),
+        SemaError::Type("identity() size must be a literal integer >= 2.".into())
+    );
+}
+
+#[test]
+fn identity_size_0_is_error() {
+    assert_eq!(
+        sema_error("identity(0, int)"),
+        SemaError::Type("identity() size must be a literal integer >= 2.".into())
+    );
+}
+
+#[test]
+fn identity_bool_element_type_is_error() {
+    assert_eq!(
+        sema_error("identity(3, bool)"),
+        SemaError::Type("identity() does not support bool element type.".into())
+    );
+}
+
+#[test]
+fn identity_unknown_type_name_is_error() {
+    assert_eq!(
+        sema_error("identity(3, complex)"),
+        SemaError::Type("identity() type must be int or float.".into())
+    );
+}
+
+#[test]
+fn identity_non_var_type_arg_is_error() {
+    // Second arg must be a type-name identifier, not a literal.
+    assert_eq!(
+        sema_error("identity(3, 5)"),
+        SemaError::Type("identity() type must be int or float.".into())
+    );
+}
+
+#[test]
+fn identity_wrong_arg_count_one_is_error() {
+    assert_eq!(
+        sema_error("identity(3)"),
+        SemaError::Type("identity() takes exactly 2 arguments.".into())
+    );
+}
+
+#[test]
+fn identity_wrong_arg_count_zero_is_error() {
+    assert_eq!(
+        sema_error("identity()"),
+        SemaError::Type("identity() takes exactly 2 arguments.".into())
+    );
+}
+
+#[test]
+fn identity_wrong_arg_count_three_is_error() {
+    assert_eq!(
+        sema_error("identity(3, int, 1)"),
+        SemaError::Type("identity() takes exactly 2 arguments.".into())
+    );
+}
+
+#[test]
+fn identity_variable_size_is_error() {
+    // First arg must be a literal — a variable is not accepted.
+    assert_eq!(
+        sema_error(indoc! {"
+            n = 4
+            identity(n, int)
+        "}),
+        SemaError::Type("identity() size must be a literal integer >= 2.".into())
+    );
+}
+
+#[test]
+fn identity_assignable_to_matrix_slot() {
+    // Result is assignable; re-binding a Matrix slot works when shapes match.
+    analyzed(indoc! {"
+        m = identity(3, int)
+        m = identity(3, int)
+    "});
+}
+
+#[test]
+fn identity_user_defined_conflicts_with_builtin_is_error() {
+    assert_eq!(
+        sema_error(indoc! {"
+            identity(n: int): int is
+                n * 2
+            identity(3, int)
+        "}),
+        SemaError::Type(
+            "Cannot define a function named `identity`: conflicts with a built-in.".into()
+        )
+    );
+}
+
+// --- ForArray and extended For (Step 11) --------------------------------------------
+
+// -- Extended Stmt::For (1-binder, array/matrix source) --
+
+#[test]
+fn for_range_with_array_len_bound_and_indexed_assign() {
+    // `idx` is a range loop variable (Int, read-only). Using it as an index into `ary`
+    // is a READ, not an assignment to `idx`, so the loop-var guard must not fire.
+    // Note: compound `ary[idx] += 1` is a parse error until step-20 loose ends; use `=`.
+    analyzed(indoc! {"
+        ary = [1, 2, 3]
+        for idx in 0..ary.len
+            ary[idx] = ary[idx] + 1
+    "});
+}
+
+#[test]
+fn for_over_1d_int_array_binds_int() {
+    analyzed(indoc! {"
+        a = [1, 2, 3]
+        total = 0
+        for val in a
+            total += val
+    "});
+}
+
+#[test]
+fn for_over_2d_int_matrix_binds_int() {
+    analyzed(indoc! {"
+        m = [1, 2; 3, 4]
+        total = 0
+        for val in m
+            total += val
+    "});
+}
+
+#[test]
+fn for_over_float_array_binds_float() {
+    analyzed(indoc! {"
+        a = [1.0, 2.0, 3.0]
+        total = 0.0
+        for val in a
+            total += val
+    "});
+}
+
+#[test]
+fn for_over_bool_array_binds_bool() {
+    analyzed(indoc! {"
+        a = [true, false, true]
+        for val in a
+            val
+    "});
+}
+
+#[test]
+fn for_over_range_still_works_after_extension() {
+    analyzed(indoc! {"
+        total = 0
+        for idx in 1..3
+            total += idx
+    "});
+}
+
+#[test]
+fn for_over_scalar_is_error() {
+    assert!(matches!(
+        sema_error(indoc! {"
+            for val in 42
+                val
+        "}),
+        SemaError::Type(_)
+    ));
+}
+
+#[test]
+fn for_over_bool_scalar_is_error() {
+    assert!(matches!(
+        sema_error(indoc! {"
+            for val in true
+                val
+        "}),
+        SemaError::Type(_)
+    ));
+}
+
+#[test]
+fn for_loop_var_on_1d_array_is_read_only() {
+    assert!(matches!(
+        sema_error(indoc! {"
+            a = [1, 2, 3]
+            for val in a
+                val = 5
+        "}),
+        SemaError::Type(_)
+    ));
+}
+
+#[test]
+fn for_loop_var_on_2d_matrix_is_read_only() {
+    assert!(matches!(
+        sema_error(indoc! {"
+            m = [1, 2; 3, 4]
+            for val in m
+                val = 5
+        "}),
+        SemaError::Type(_)
+    ));
+}
+
+// -- Stmt::ForArray (2 binders, 1D) --
+
+#[test]
+fn for_array_2_binders_on_int_array() {
+    // idx is Int, val is Int — both usable in the body.
+    analyzed(indoc! {"
+        a = [10, 20, 30]
+        total = 0
+        for idx, val in a
+            total += val + idx
+    "});
+}
+
+#[test]
+fn for_array_2_binders_on_float_array() {
+    analyzed(indoc! {"
+        a = [1.0, 2.0, 3.0]
+        total = 0.0
+        for idx, val in a
+            total += val
+    "});
+}
+
+#[test]
+fn for_array_2_binders_index_is_int() {
+    // idx is Int: using it as a range bound is valid.
+    analyzed(indoc! {"
+        a = [10, 20, 30]
+        for idx, val in a
+            0..idx
+    "});
+}
+
+#[test]
+fn for_array_2_binders_on_matrix_is_error() {
+    assert_eq!(
+        sema_error(indoc! {"
+            m = [1, 2; 3, 4]
+            for idx, val in m
+                val
+        "}),
+        SemaError::Type("Binder count does not match array rank.".into())
+    );
+}
+
+#[test]
+fn for_array_2_binders_on_range_is_error() {
+    assert_eq!(
+        sema_error(indoc! {"
+            for idx, val in 1..5
+                val
+        "}),
+        SemaError::Type("Binder count does not match array rank.".into())
+    );
+}
+
+#[test]
+fn for_array_index_binder_is_read_only() {
+    assert!(matches!(
+        sema_error(indoc! {"
+            a = [1, 2, 3]
+            for idx, val in a
+                idx = 0
+        "}),
+        SemaError::Type(_)
+    ));
+}
+
+#[test]
+fn for_array_value_binder_is_read_only() {
+    assert!(matches!(
+        sema_error(indoc! {"
+            a = [1, 2, 3]
+            for idx, val in a
+                val = 0
+        "}),
+        SemaError::Type(_)
+    ));
+}
+
+// -- Stmt::ForArray (3 binders, 2D) --
+
+#[test]
+fn for_array_3_binders_on_int_matrix() {
+    analyzed(indoc! {"
+        m = [1, 2; 3, 4]
+        total = 0
+        for row, col, val in m
+            total += val + row + col
+    "});
+}
+
+#[test]
+fn for_array_3_binders_on_float_matrix() {
+    analyzed(indoc! {"
+        m = [1.0, 2.0; 3.0, 4.0]
+        total = 0.0
+        for row, col, val in m
+            total += val
+    "});
+}
+
+#[test]
+fn for_array_3_binders_on_1d_array_is_error() {
+    assert_eq!(
+        sema_error(indoc! {"
+            a = [1, 2, 3]
+            for row, col, val in a
+                val
+        "}),
+        SemaError::Type("Binder count does not match array rank.".into())
+    );
+}
+
+#[test]
+fn for_array_row_binder_is_read_only() {
+    assert!(matches!(
+        sema_error(indoc! {"
+            m = [1, 2; 3, 4]
+            for row, col, val in m
+                row = 0
+        "}),
+        SemaError::Type(_)
+    ));
+}
+
+#[test]
+fn for_array_col_binder_is_read_only() {
+    assert!(matches!(
+        sema_error(indoc! {"
+            m = [1, 2; 3, 4]
+            for row, col, val in m
+                col = 0
+        "}),
+        SemaError::Type(_)
+    ));
+}
+
+#[test]
+fn for_array_3_binders_value_is_read_only() {
+    assert!(matches!(
+        sema_error(indoc! {"
+            m = [1, 2; 3, 4]
+            for row, col, val in m
+                val = 0
+        "}),
+        SemaError::Type(_)
+    ));
+}
+
+// -- Stmt::IndexedAssign2D --
+
+#[test]
+fn indexed_assign2d_int_value_to_int_matrix() {
+    analyzed(indoc! {"
+        m = [1, 2; 3, 4]
+        m[0, 1] = 42
+    "});
+}
+
+#[test]
+fn indexed_assign2d_float_value_to_float_matrix() {
+    analyzed(indoc! {"
+        m = [1.0, 2.0; 3.0, 4.0]
+        m[0, 1] = 9.9
+    "});
+}
+
+#[test]
+fn indexed_assign2d_bool_promotes_to_int_matrix() {
+    analyzed(indoc! {"
+        m = [1, 2; 3, 4]
+        m[0, 0] = true
+    "});
+}
+
+#[test]
+fn indexed_assign2d_int_promotes_to_float_matrix() {
+    analyzed(indoc! {"
+        m = [1.0, 2.0; 3.0, 4.0]
+        m[0, 0] = 42
+    "});
+}
+
+#[test]
+fn indexed_assign2d_float_to_int_matrix_is_error() {
+    assert!(matches!(
+        sema_error(indoc! {"
+            m = [1, 2; 3, 4]
+            m[0, 1] = 1.5
+        "}),
+        SemaError::Type(_)
+    ));
+}
+
+#[test]
+fn indexed_assign2d_target_not_matrix_is_error() {
+    assert!(matches!(
+        sema_error(indoc! {"
+            a = [1, 2, 3]
+            a[0, 1] = 42
+        "}),
+        SemaError::Type(_)
+    ));
+}
+
+#[test]
+fn indexed_assign2d_float_row_index_is_error() {
+    assert!(matches!(
+        sema_error(indoc! {"
+            m = [1, 2; 3, 4]
+            m[1.0, 0] = 42
+        "}),
+        SemaError::Type(_)
+    ));
+}
+
+#[test]
+fn indexed_assign2d_float_col_index_is_error() {
+    assert!(matches!(
+        sema_error(indoc! {"
+            m = [1, 2; 3, 4]
+            m[0, 1.0] = 42
+        "}),
+        SemaError::Type(_)
+    ));
+}
+
+#[test]
+fn indexed_assign2d_bool_row_index_is_error() {
+    assert!(matches!(
+        sema_error(indoc! {"
+            m = [1, 2; 3, 4]
+            m[true, 0] = 99
+        "}),
+        SemaError::Type(_)
+    ));
+}
+
+#[test]
+fn indexed_assign2d_bool_col_index_is_error() {
+    assert!(matches!(
+        sema_error(indoc! {"
+            m = [1, 2; 3, 4]
+            m[0, false] = 99
+        "}),
+        SemaError::Type(_)
+    ));
+}
+
+#[test]
+fn index2d_bool_row_read_gives_clear_diagnostic() {
+    // Bool in a read index position must give the "Matrix index must be Int" message,
+    // not the misleading "Slice requires a literal-bound range" fallback.
+    assert_eq!(
+        sema_error(&with_matrix("m[true, 0]")),
+        SemaError::Type("Matrix index must be Int, got Bool.".into())
+    );
+}
+
+#[test]
+fn index2d_bool_col_read_gives_clear_diagnostic() {
+    assert_eq!(
+        sema_error(&with_matrix("m[0, false]")),
+        SemaError::Type("Matrix index must be Int, got Bool.".into())
+    );
+}
+
+// -----------------------------------------------------------------------------------------
+// Step 19 — literal scalar index bounds checking (1D and 2D)
+// -----------------------------------------------------------------------------------------
+
+fn with_array4(expr: &str) -> String {
+    format!("a = [10, 20, 30, 40]\n{expr}")
+}
+
+fn with_matrix4(expr: &str) -> String {
+    format!("m = [1, 2, 3, 4; 5, 6, 7, 8; 9, 10, 11, 12; 13, 14, 15, 16]\n{expr}")
+}
+
+#[test]
+fn literal_positive_oob_index_on_1d_is_sema_error() {
+    assert_eq!(
+        sema_error(&with_array4("a[4]")),
+        SemaError::Type("Array index out of bounds.".into())
+    );
+}
+
+#[test]
+fn literal_negative_oob_index_on_1d_is_sema_error() {
+    // -5 on a 4-element array: effective = -5 + 4 = -1 < 0.
+    assert_eq!(
+        sema_error(&with_array4("a[-5]")),
+        SemaError::Type("Array index out of bounds.".into())
+    );
+}
+
+#[test]
+fn literal_negative_in_bounds_index_on_1d_is_valid() {
+    assert_eq!(root_type(&with_array4("a[-4]")), PinpType::Int); // first element
+    assert_eq!(root_type(&with_array4("a[-1]")), PinpType::Int); // last element
+}
+
+#[test]
+fn literal_positive_oob_row_on_2d_is_sema_error() {
+    assert_eq!(
+        sema_error(&with_matrix4("m[4, 0]")),
+        SemaError::Type("Array index out of bounds.".into())
+    );
+}
+
+#[test]
+fn literal_negative_oob_col_on_2d_is_sema_error() {
+    assert_eq!(
+        sema_error(&with_matrix4("m[0, -5]")),
+        SemaError::Type("Array index out of bounds.".into())
+    );
+}
+
+#[test]
+fn literal_negative_in_bounds_index_on_2d_is_valid() {
+    assert_eq!(root_type(&with_matrix4("m[-4, -4]")), PinpType::Int);
+    assert_eq!(root_type(&with_matrix4("m[-1, -1]")), PinpType::Int);
+}
+
+#[test]
+fn literal_oob_write_index_on_1d_is_sema_error() {
+    assert_eq!(
+        sema_error(&with_array4("a[-5] = 99")),
+        SemaError::Type("Array index out of bounds.".into())
+    );
+}
+
+#[test]
+fn literal_valid_negative_write_index_on_1d_is_accepted() {
+    assert!(!analyzed(&with_array4("a[-1] = 99")).top_level.is_empty());
+}
+
+#[test]
+fn literal_oob_write_index_on_2d_is_sema_error() {
+    assert_eq!(
+        sema_error(&with_matrix4("m[0, -5] = 99")),
+        SemaError::Type("Array index out of bounds.".into())
+    );
+}
+
+// ---- step 20 — loose ends -------------------------------------------------------
+
+#[test]
+fn for_underscore_value_binder_on_1d_is_sema_error() {
+    assert_eq!(
+        sema_error(indoc! {"
+            a = [1, 2, 3]
+            for _ in a
+                0
+        "}),
+        SemaError::Type("Value binder must not be `_`.".into())
+    );
+}
+
+#[test]
+fn for_idx_underscore_value_binder_on_1d_is_sema_error() {
+    assert_eq!(
+        sema_error(indoc! {"
+            a = [1, 2, 3]
+            for idx, _ in a
+                0
+        "}),
+        SemaError::Type("Value binder must not be `_`.".into())
+    );
+}
+
+#[test]
+fn for_both_underscore_binders_on_1d_is_sema_error() {
+    assert_eq!(
+        sema_error(indoc! {"
+            a = [1, 2, 3]
+            for _, _ in a
+                0
+        "}),
+        SemaError::Type("Value binder must not be `_`.".into())
+    );
+}
+
+#[test]
+fn for_underscore_value_binder_on_2d_is_sema_error() {
+    assert_eq!(
+        sema_error(&with_matrix4(indoc! {"
+            for row, col, _ in m
+                0
+        "})),
+        SemaError::Type("Value binder must not be `_`.".into())
+    );
+}
+
+#[test]
+fn for_all_underscore_binders_on_2d_is_sema_error() {
+    assert_eq!(
+        sema_error(&with_matrix4(indoc! {"
+            for _, _, _ in m
+                0
+        "})),
+        SemaError::Type("Value binder must not be `_`.".into())
+    );
+}
+
+#[test]
+fn indexed_compound_assign_1d_type_mismatch_is_sema_error() {
+    // `a[0] += 1.5` on Int array: value becomes Float, not assignable to Int element.
+    assert_eq!(
+        sema_error(&with_array4("a[0] += 1.5")),
+        SemaError::Type("Cannot assign Float to array element of type Int.".into())
+    );
+}
+
+#[test]
+fn indexed_compound_assign_2d_type_mismatch_is_sema_error() {
+    // `m[0, 0] *= 2.5` on Int matrix: value becomes Float, not assignable to Int element.
+    assert_eq!(
+        sema_error(&with_matrix4("m[0, 0] *= 2.5")),
+        SemaError::Type("Cannot assign Float to matrix element of type Int.".into())
+    );
+}
+
+#[test]
+fn indexed_compound_div_eq_on_int_array_is_sema_error() {
+    // `/=` always produces Float; cannot store Float back into an Int array.
+    assert_eq!(
+        sema_error(&with_array4("a[0] /= 2")),
+        SemaError::Type("Cannot assign Float to array element of type Int.".into())
+    );
 }

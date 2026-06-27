@@ -80,7 +80,7 @@ call       = Ident "(" ( expression { "," expression } )? ")"
 In both forms the body's final **expression** is the return value; in the block form it follows
 zero or more statements. After `is`, a `Newline` selects the block form, otherwise the single-line
 form (which must declare a return type, #2). `return` stays deferred. **Calls** `f(args)` are
-expressions (#1); **`::name`** reads or assigns a global (#5); **`<op>=`** desugars to
+expressions (#1); **`::name`** reads or assigns a global (#5); **`<op>=`** is lowered to
 `place = place <op> expr`.
 
 ## Type system (iteration 2)
@@ -131,7 +131,7 @@ immutable.
 - **New expression nodes:** `Call { callee: SymId, args: Vec<ExprId> }`, `Global(SymId)` (a `::name`
   reference). Iteration-1 nodes unchanged.
 - **Assignment target generalised:** `enum Place { Local(SymId), Global(SymId) }`,
-  `Stmt::Assign { target: Place, rhs: ExprId }`. `<op>=` is desugared at parse time into an `Assign`
+  `Stmt::Assign { target: Place, rhs: ExprId }`. `<op>=` is expanded at parse time into an `Assign`
   whose `rhs` is a `Bin { op, lhs = <read of target>, rhs }`.
 
 ## Lexer

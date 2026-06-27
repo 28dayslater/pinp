@@ -2,7 +2,7 @@
 
 use super::*;
 use crate::parser::{
-    ArrayElementType, BinOp, Block, ExprId, FuncDef, Place, RangeKind, Stmt, UnOp,
+    ArrayElementType, BinOp, Block, BuiltinMember, ExprId, FuncDef, Place, RangeKind, Stmt, UnOp,
 };
 
 impl Analyzer<'_, '_> {
@@ -16,6 +16,19 @@ impl Analyzer<'_, '_> {
     }
 
     pub(super) fn analyze_func(&mut self, func: &FuncDef) -> Result<(), SemaError> {
+        // Built-in names are reserved; a user definition with same name is an error.
+        // NOTE: when the list of buil-ins grows, we will need to consult internal
+        //       list of built-in headers.
+        #[allow(clippy::single_match)]
+        match self.name(func.name) {
+            "identity" => {
+                return Err(SemaError::Type(format!(
+                    "Cannot define a function named `{}`: conflicts with a built-in.",
+                    self.name(func.name)
+                )));
+            }
+            _ => {}
+        }
         let mut frame = FxHashMap::default();
         for param in &func.params {
             // `void` is the no-return marker, not a value type — rejecting it here is what keeps a
@@ -98,20 +111,65 @@ impl Analyzer<'_, '_> {
                 self.check_condition(*cond)?;
                 Ok(())
             }
-            Stmt::For { var, range, body } => {
-                let range_type = self.analyze_expr(*range)?;
-                if range_type != PinpType::Range {
-                    return Err(SemaError::Type(format!(
-                        "`for` requires a range to iterate, got {range_type:?}."
-                    )));
-                }
-                // Seed a body frame with the loop counter (`Int`, read-only) before analysing the
-                // body; the inner block scope nests within it, so reads resolve outward to `var`.
+            Stmt::For { var, source, body } => {
+                let source_type = self.analyze_expr(*source)?;
+                // Range → Int counter; Array/Matrix → element type; anything else → error.
+                let var_type = match source_type {
+                    PinpType::Range => PinpType::Int,
+                    PinpType::Array(elem_type, _) | PinpType::Matrix(elem_type, _, _) => {
+                        if self.name(*var) == "_" {
+                            return Err(SemaError::Type("Value binder must not be `_`.".into()));
+                        }
+                        PinpType::from(elem_type)
+                    }
+                    other => {
+                        return Err(SemaError::Type(format!("Cannot iterate over {other:?}.")));
+                    }
+                };
+                // Seed a body frame with the loop variable (read-only) before analysing the body;
+                // the inner block scope nests within it, so reads resolve outward to `var`.
                 self.scopes.push(FxHashMap::default());
-                self.scopes.last_mut().unwrap().insert(*var, PinpType::Int);
+                self.scopes.last_mut().unwrap().insert(*var, var_type);
                 self.loop_vars.push(*var);
                 self.analyze_block(body)?;
                 self.loop_vars.pop();
+                self.scopes.pop();
+                Ok(())
+            }
+            Stmt::ForArray {
+                binders,
+                source,
+                body,
+            } => {
+                let source_type = self.analyze_expr(*source)?;
+                let mut frame = FxHashMap::default();
+                match (binders.len(), source_type) {
+                    (2, PinpType::Array(elem_type, _)) => {
+                        frame.insert(binders[0], PinpType::Int);
+                        frame.insert(binders[1], PinpType::from(elem_type));
+                    }
+                    (3, PinpType::Matrix(elem_type, _, _)) => {
+                        frame.insert(binders[0], PinpType::Int);
+                        frame.insert(binders[1], PinpType::Int);
+                        frame.insert(binders[2], PinpType::from(elem_type));
+                    }
+                    _ => {
+                        return Err(SemaError::Type(
+                            "Binder count does not match array rank.".into(),
+                        ));
+                    }
+                }
+                if self.name(*binders.last().unwrap()) == "_" {
+                    return Err(SemaError::Type("Value binder must not be `_`.".into()));
+                }
+                self.scopes.push(frame);
+                for binder in binders.iter() {
+                    self.loop_vars.push(*binder);
+                }
+                self.analyze_block(body)?;
+                for _ in binders.iter() {
+                    self.loop_vars.pop();
+                }
                 self.scopes.pop();
                 Ok(())
             }
@@ -119,8 +177,19 @@ impl Analyzer<'_, '_> {
                 target,
                 index,
                 value,
+                compound_op,
             } => {
-                self.indexed_assign_check(*target, *index, *value)?;
+                self.indexed_assign_check(*target, *index, *value, *compound_op)?;
+                Ok(())
+            }
+            Stmt::IndexedAssign2D {
+                target,
+                row,
+                col,
+                value,
+                compound_op,
+            } => {
+                self.indexed_assign2d_check(*target, *row, *col, *value, *compound_op)?;
                 Ok(())
             }
         }
@@ -237,13 +306,20 @@ impl Analyzer<'_, '_> {
             Node::Membership { value, range } => self.membership_type(value, range)?,
             Node::ArrayLiteral { elements } => self.array_literal_type(&elements)?,
             Node::Index { array, index } => self.index_type(array, index)?,
-            Node::Member { object, member } => self.member_type(object, member)?,
+            Node::Member { object, member } => self.member_type(expr_id, object, member)?,
             Node::Comprehension {
                 element,
                 var,
                 var_type,
                 source,
             } => self.comprehension_type(element, var, var_type, source)?,
+            Node::MatrixLiteral { rows } => self.matrix_literal_type(&rows)?,
+            Node::Index2D { matrix, row, col } => self.matrix_index2d_type(matrix, row, col)?,
+            Node::FullExtent => {
+                return Err(SemaError::Type(
+                    "`:` is only valid inside a 2D index expression.".into(),
+                ));
+            }
         };
         self.types[expr_id.value()] = inferred;
         Ok(inferred)
@@ -337,6 +413,18 @@ impl Analyzer<'_, '_> {
         }
     }
 
+    /// Compile-time bounds check for a scalar literal index. Non-literal indices pass through;
+    /// the runtime normalization and check in codegen handles those.
+    fn check_literal_index(&self, index_id: ExprId, len: usize) -> Result<(), SemaError> {
+        if let Some(val) = self.int_literal(index_id) {
+            let effective = if val < 0 { val + len as i64 } else { val };
+            if effective < 0 || effective >= len as i64 {
+                return Err(SemaError::Type("Array index out of bounds.".into()));
+            }
+        }
+        Ok(())
+    }
+
     /// Rejects an ill-formed range whose bounds are literals: an inclusive range whose step opposes
     /// its direction, or an exclusive operator pointing the wrong way. (A zero step is rejected
     /// earlier, in `range_type`, since it is invalid regardless of the bounds.)
@@ -425,6 +513,123 @@ impl Analyzer<'_, '_> {
         ))
     }
 
+    /// Types a matrix literal `[r0_e0, …; r1_e0, …; …]`. All rows must have the same element
+    /// count; all elements must share a common type under the promotion lattice.
+    fn matrix_literal_type(&mut self, rows: &[Vec<ExprId>]) -> Result<PinpType, SemaError> {
+        let col_count = rows[0].len();
+        let mut common: Option<PinpType> = None;
+        for row in rows {
+            if row.len() != col_count {
+                return Err(SemaError::Type(
+                    "All matrix rows must have the same number of columns.".into(),
+                ));
+            }
+            for &elem_id in row {
+                let elem_type = self.analyze_expr(elem_id)?;
+                common = Some(match common {
+                    None => elem_type,
+                    Some(previous) => join(previous, elem_type).ok_or_else(|| {
+                        SemaError::Type("Inconsistent element types in matrix literal.".into())
+                    })?,
+                });
+            }
+        }
+        let common = common.expect("parser ensures matrix has at least one element");
+        Ok(PinpType::Matrix(
+            self.to_array_element_type(common)?,
+            rows.len(),
+            col_count,
+        ))
+    }
+
+    /// Types `matrix[row_sel, col_sel]`. Classifies each selector as a scalar index or a
+    /// compile-time-checked slice, then derives the result type from the four-case table.
+    fn matrix_index2d_type(
+        &mut self,
+        matrix: ExprId,
+        row: ExprId,
+        col: ExprId,
+    ) -> Result<PinpType, SemaError> {
+        let matrix_type = self.analyze_expr(matrix)?;
+        let PinpType::Matrix(elem_type, row_count, col_count) = matrix_type else {
+            return Err(SemaError::Type("2D index target is not a matrix.".into()));
+        };
+        let row_sel = self.classify_dim_selector(row, row_count)?;
+        let col_sel = self.classify_dim_selector(col, col_count)?;
+        Ok(match (row_sel, col_sel) {
+            (DimSelector::Index, DimSelector::Index) => PinpType::from(elem_type),
+            (DimSelector::Index, DimSelector::Slice(len)) => PinpType::Array(elem_type, len),
+            (DimSelector::Slice(len), DimSelector::Index) => PinpType::Array(elem_type, len),
+            (DimSelector::Slice(row_len), DimSelector::Slice(col_len)) => {
+                PinpType::Matrix(elem_type, row_len, col_len)
+            }
+        })
+    }
+
+    /// Classifies one dimension selector in a 2D index expression: `FullExtent`, an `Int` scalar
+    /// index, or an ascending literal-bound range slice. The selector's node is typed as a side-effect.
+    fn classify_dim_selector(
+        &mut self,
+        selector: ExprId,
+        dim_len: usize,
+    ) -> Result<DimSelector, SemaError> {
+        // `:` — full extent of the dimension.
+        if matches!(self.nodes[selector.value()], Node::FullExtent) {
+            self.types[selector.value()] = PinpType::Range;
+            return Ok(DimSelector::Slice(dim_len));
+        }
+        let selector_type = self.analyze_expr(selector)?;
+        if selector_type == PinpType::Int {
+            self.check_literal_index(selector, dim_len)?;
+            return Ok(DimSelector::Index);
+        }
+        // Explicit rejection before the range path so Bool gets a clear diagnostic rather
+        // than the misleading "Slice requires a literal-bound range without step."
+        if selector_type == PinpType::Bool {
+            return Err(SemaError::Type(
+                "Matrix index must be Int, got Bool.".into(),
+            ));
+        }
+        let bad = || SemaError::Type("Slice requires a literal-bound range without step.".into());
+        // Must be a Range; extract bounds and validate.
+        let (start, stop, step, kind) = match self.nodes[selector.value()] {
+            Node::Range {
+                start,
+                stop,
+                step,
+                kind,
+            } => (start, stop, step, kind),
+            _ => return Err(bad()),
+        };
+        if step.is_some() || kind == RangeKind::DownExclusive {
+            return Err(bad());
+        }
+        let start_val = self.int_literal(start).ok_or_else(bad)?;
+        let stop_val = self.int_literal(stop).ok_or_else(bad)?;
+        let oob = || SemaError::Type("Slice index out of bounds.".into());
+        if start_val < 0 || stop_val < 0 {
+            return Err(oob());
+        }
+        let start_usize = start_val as usize;
+        let stop_usize = stop_val as usize;
+        let slice_len = match kind {
+            RangeKind::Inclusive => {
+                if stop_usize >= dim_len || start_usize > stop_usize {
+                    return Err(oob());
+                }
+                stop_usize - start_usize + 1
+            }
+            RangeKind::UpExclusive => {
+                if stop_usize > dim_len || start_usize >= stop_usize {
+                    return Err(oob());
+                }
+                stop_usize - start_usize
+            }
+            RangeKind::DownExclusive => unreachable!("handled above"),
+        };
+        Ok(DimSelector::Slice(slice_len))
+    }
+
     /// Types a range-init `[literal-range]`. Every range bound must be an integer literal (so the
     /// element count is compile-time constant); the result is always `Array(Int, len)`.
     fn array_from_range_type(&mut self, range_id: ExprId) -> Result<PinpType, SemaError> {
@@ -461,11 +666,12 @@ impl Analyzer<'_, '_> {
             return self.slice_type(index, elem_type, array_len);
         }
         let index_type = self.analyze_expr(index)?;
-        if !int_like(index_type) {
+        if index_type != PinpType::Int {
             return Err(SemaError::Type(format!(
                 "Array index must be Int, got {index_type:?}."
             )));
         }
+        self.check_literal_index(index, array_len)?;
         Ok(PinpType::from(elem_type))
     }
 
@@ -542,22 +748,42 @@ impl Analyzer<'_, '_> {
         Ok(PinpType::Array(elem_type, count))
     }
 
-    /// Types a member access `object.member`. Currently only `.len` on arrays is valid.
-    fn member_type(&mut self, object: ExprId, member: SymId) -> Result<PinpType, SemaError> {
+    /// Types a member access `object.member`. Resolves the member name to a [`BuiltinMember`]
+    /// variant (the single string-comparison site for members in the compiler), validates it
+    /// against the object type, and records the resolved variant for codegen.
+    fn member_type(
+        &mut self,
+        expr_id: ExprId,
+        object: ExprId,
+        member: SymId,
+    ) -> Result<PinpType, SemaError> {
         let object_type = self.analyze_expr(object)?;
-        match object_type {
-            PinpType::Array(_, _) => {}
-            other => {
-                return Err(SemaError::Type(format!(
-                    "`.{}` is not valid on {other:?}.",
-                    self.name(member)
-                )));
-            }
-        }
-        match self.name(member) {
-            "len" => Ok(PinpType::Int),
-            other => Err(SemaError::Type(format!("Unknown member `.{other}`."))),
-        }
+        let member_name = self.name(member);
+        let Some(builtin) = BuiltinMember::from_name(member_name) else {
+            return Err(SemaError::Type(format!("Unknown member `.{member_name}`.")));
+        };
+        let result_type = match (builtin, object_type) {
+            (BuiltinMember::Len, PinpType::Array(..)) => Ok(PinpType::Int),
+            (BuiltinMember::Len, PinpType::Matrix(..)) => Ok(PinpType::Int),
+            (BuiltinMember::Ndim, PinpType::Array(..)) => Ok(PinpType::Int),
+            (BuiltinMember::Ndim, PinpType::Matrix(..)) => Ok(PinpType::Int),
+            (BuiltinMember::Rows, PinpType::Matrix(..)) => Ok(PinpType::Int),
+            (BuiltinMember::Cols, PinpType::Matrix(..)) => Ok(PinpType::Int),
+            (BuiltinMember::Rows, PinpType::Array(..)) => Err(SemaError::Type(
+                ".rows is not defined for a 1D array. Use .len.".into(),
+            )),
+            (BuiltinMember::Cols, PinpType::Array(..)) => Err(SemaError::Type(
+                ".cols is not defined for a 1D array. Use .len.".into(),
+            )),
+            (BuiltinMember::Ndim, other) => Err(SemaError::Type(format!(
+                "`.ndim` is not defined on {other:?}."
+            ))),
+            (_, other) => Err(SemaError::Type(format!(
+                "`.{member_name}` is not valid on {other:?}."
+            ))),
+        }?;
+        self.builtin_members[expr_id.value()] = Some(builtin);
+        Ok(result_type)
     }
 
     /// Types a comprehension `[element for var[:type] in source]`. The source must be a range with
@@ -608,6 +834,7 @@ impl Analyzer<'_, '_> {
         target: Place,
         index: ExprId,
         value: ExprId,
+        compound_op: Option<BinOp>,
     ) -> Result<(), SemaError> {
         let target_type = match target {
             Place::Local(sym_id) => self.lookup_assign_target(sym_id).ok_or_else(|| {
@@ -633,16 +860,72 @@ impl Analyzer<'_, '_> {
             };
         }
         let index_type = self.analyze_expr(index)?;
-        if !int_like(index_type) {
+        if index_type != PinpType::Int {
             return Err(SemaError::Type(format!(
                 "Array index must be Int, got {index_type:?}."
             )));
         }
+        self.check_literal_index(index, array_len)?;
         let value_type = self.analyze_expr(value)?;
         let elem_pinp_type = PinpType::from(elem_type);
-        if !assignable(value_type, elem_pinp_type) {
+        // For compound assigns (`arr[i] op= rhs`), the stored value is `elem op rhs`, not `rhs`
+        // itself — so check the result type of the operation, not the raw RHS type.
+        let stored_type = match compound_op {
+            Some(op) => self.bin_type(op, elem_pinp_type, value_type)?,
+            None => value_type,
+        };
+        if !assignable(stored_type, elem_pinp_type) {
             return Err(SemaError::Type(format!(
-                "Cannot assign {value_type:?} to array element of type {elem_pinp_type:?}."
+                "Cannot assign {stored_type:?} to array element of type {elem_pinp_type:?}."
+            )));
+        }
+        Ok(())
+    }
+
+    /// Types a `mat[row, col] = value` statement. The target must be a Matrix; both indices must
+    /// be `Int`; the value must be assignable to the element type.
+    fn indexed_assign2d_check(
+        &mut self,
+        target: Place,
+        row: ExprId,
+        col: ExprId,
+        value: ExprId,
+        compound_op: Option<BinOp>,
+    ) -> Result<(), SemaError> {
+        let target_type = match target {
+            Place::Local(sym_id) => self.lookup_assign_target(sym_id).ok_or_else(|| {
+                SemaError::UnknownSymbol(format!("Unknown matrix `{}`.", self.name(sym_id)))
+            })?,
+            Place::Global(sym_id) => self.lookup_global(sym_id)?,
+        };
+        let PinpType::Matrix(elem_type, rows, cols) = target_type else {
+            return Err(SemaError::Type(
+                "2D indexed assignment requires a matrix target.".into(),
+            ));
+        };
+        let row_type = self.analyze_expr(row)?;
+        if row_type != PinpType::Int {
+            return Err(SemaError::Type(format!(
+                "Matrix row index must be Int, got {row_type:?}."
+            )));
+        }
+        self.check_literal_index(row, rows)?;
+        let col_type = self.analyze_expr(col)?;
+        if col_type != PinpType::Int {
+            return Err(SemaError::Type(format!(
+                "Matrix column index must be Int, got {col_type:?}."
+            )));
+        }
+        self.check_literal_index(col, cols)?;
+        let value_type = self.analyze_expr(value)?;
+        let elem_pinp_type = PinpType::from(elem_type);
+        let stored_type = match compound_op {
+            Some(op) => self.bin_type(op, elem_pinp_type, value_type)?,
+            None => value_type,
+        };
+        if !assignable(stored_type, elem_pinp_type) {
+            return Err(SemaError::Type(format!(
+                "Cannot assign {stored_type:?} to matrix element of type {elem_pinp_type:?}."
             )));
         }
         Ok(())
@@ -754,10 +1037,13 @@ impl Analyzer<'_, '_> {
             UnOp::Neg => match operand_type {
                 PinpType::Bool | PinpType::Int => Ok(PinpType::Int),
                 PinpType::Float => Ok(PinpType::Float),
-                // TODO: element-wise negation on arrays may be allowed for matrix algebra later.
-                PinpType::Void | PinpType::Range | PinpType::Array(_, _) => Err(SemaError::Type(
-                    format!("Unary minus requires a numeric operand, got {operand_type:?}."),
-                )),
+                // TODO: element-wise negation on arrays/matrices may be allowed for matrix algebra later.
+                PinpType::Void
+                | PinpType::Range
+                | PinpType::Array(_, _)
+                | PinpType::Matrix(_, _, _) => Err(SemaError::Type(format!(
+                    "Unary minus requires a numeric operand, got {operand_type:?}."
+                ))),
             },
             UnOp::Not => {
                 if operand_type == PinpType::Bool {
@@ -819,7 +1105,13 @@ impl Analyzer<'_, '_> {
     }
 
     /// Types a call: the callee must be defined, with matching arity and assignable arguments.
+    /// Compiler built-ins are intercepted by name before the normal user-function path.
     fn call_type(&mut self, callee: SymId, args: &[ExprId]) -> Result<PinpType, SemaError> {
+        #[allow(clippy::single_match)]
+        match self.name(callee) {
+            "identity" => return self.identity_call_type(args),
+            _ => {}
+        }
         let signature = self.funcs.get(&callee).cloned().ok_or_else(|| {
             SemaError::UnknownSymbol(format!(
                 "Call to undefined function `{}`.",
@@ -845,5 +1137,47 @@ impl Analyzer<'_, '_> {
             }
         }
         Ok(signature.return_type)
+    }
+
+    /// Types the `identity(n, type)` built-in. `n` must be a literal integer >= 2; `type` must
+    /// be the identifier `int` or `float`. Codegen reads the result `PinpType::Matrix` directly
+    /// rather than processing the arg nodes, so only arg 0's type slot is filled here.
+    fn identity_call_type(&mut self, args: &[ExprId]) -> Result<PinpType, SemaError> {
+        if args.len() != 2 {
+            return Err(SemaError::Type(
+                "identity() takes exactly 2 arguments.".into(),
+            ));
+        }
+        let size = match self.nodes[args[0].value()] {
+            Node::Int(n) if n >= 2 => n as usize,
+            _ => {
+                return Err(SemaError::Type(
+                    "identity() size must be a literal integer >= 2.".into(),
+                ));
+            }
+        };
+        self.types[args[0].value()] = PinpType::Int;
+        let elem_type = match self.nodes[args[1].value()] {
+            Node::Var(sym_id) => match self.names[sym_id.value()] {
+                "int" => ArrayElementType::Int,
+                "float" => ArrayElementType::Float,
+                "bool" => {
+                    return Err(SemaError::Type(
+                        "identity() does not support bool element type.".into(),
+                    ));
+                }
+                _ => {
+                    return Err(SemaError::Type(
+                        "identity() type must be int or float.".into(),
+                    ));
+                }
+            },
+            _ => {
+                return Err(SemaError::Type(
+                    "identity() type must be int or float.".into(),
+                ));
+            }
+        };
+        Ok(PinpType::Matrix(elem_type, size, size))
     }
 }

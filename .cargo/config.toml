@@ -1,0 +1,7 @@
+# SPDX-License-Identifier: MIT
+#
+# Run tests sequentially until LLVM JIT / mimalloc TLS races are resolved.
+# Remove or raise this limit once the JIT instantiation is serialized.
+
+[env]
+RUST_TEST_THREADS = "1"

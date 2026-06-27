@@ -1,16 +1,25 @@
 # PINP - Pinp Is Not Python
 
-## A toy programming language with longer-term ambitions of growing beyond a simple toy
+## A programming language project that starts small but aims beyond a toy implementation.
 
-This project serves as a showcase of what an experienced human dev could achieve using AI tools.
+### My ambition is to implement a language that:
 
-Real world pro dev workflow:
-- TDD red → green → refactor
-- Iterative development with specs
-- Proper git workflow and scope control
-- Human oversight throughout
+- Reads like pseudocode.
+- Minimizes syntactic noise while preserving explicit semantics.
+- Feels like Python without trying to be Python.
+- Statically typed with local type inference.
+- Fast enough for everyday use (LLVM JIT from day one).
 
-The project is tightly dependent on LLVM as the back-end.
-The usage pattern is intended to be direct source code execution via a front-end that processes
-the code and sends it directly to LLVM JIT.
-AOT is planned in the future.
+Development follows a professional AI-augmented software engineering workflow:
+
+- Specification-driven development.
+- TDD (red → green → refactor).
+- Continuous human supervision throughout.
+- Small iterations, further divided when necessary (reviews at each step).
+- Review-driven development using both human and alternative AI models.
+- Proper git workflow and scope control.
+
+
+Pinp targets LLVM exclusively by design. Life is too short to re-invent backend compiler technology.
+
+Ahead of Time compilation (AOT) is planned in the future.

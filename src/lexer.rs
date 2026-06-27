@@ -36,10 +36,15 @@ enum Lexeme {
     #[regex(r"([0-9]{1,3}(_[0-9]{3})+|[0-9]+)?\.([0-9]{1,3}(_[0-9]{3})+|[0-9]+)([eE][+-]?([0-9]{1,3}(_[0-9]{3})+|[0-9]+))?")]
     Float,
 
-    // Identifier: leading `_`s allowed, then a letter, then letters/digits/`_`.
+    // Identifier: optional leading `_`s, then a letter, then letters/digits/`_`.
     // Examples: a  Fu  _BAR  _baz_baz_  _fu12_11_bar
     #[regex(r"_*[a-zA-Z][a-zA-Z0-9_]*")]
     Identifier,
+    // Bare `_` — the don't-care binder. Separate from `Identifier` so the parser can
+    // accept it in binder positions and reject it elsewhere without special-casing strings.
+    // Logos longest-match ensures `_foo` → `Identifier`, bare `_` → `Underscore`.
+    #[token("_")]
+    Underscore,
 
     // Compound-assignment operators. Each is a single contiguous token (longest-match
     // beats the bare operator). `div=`/`mod=` likewise beat the identifiers `div`/`mod`,
@@ -100,6 +105,8 @@ enum Lexeme {
     Colon,
     #[token(",")]
     Comma,
+    #[token(";")]
+    Semicolon,
 
     // Range operators. `..` is the inclusive form; `..<`/`..>` exclude the stop bound (longest-match
     // beats `..`). `..` competes with the `Float` regex only where a digit follows the dot, so `.5`
@@ -151,6 +158,7 @@ pub enum TokenKind {
     Colon,
     ColonColon,
     Comma,
+    Semicolon,
     Dot,
     DotDot,
     DotDotLt,
@@ -172,6 +180,8 @@ pub enum TokenKind {
     KwLoop,
     KwFor,
     KwIn,
+    /// The bare `_` character: the don't-care binder in `for` loops.
+    Underscore,
     Newline,
     Indent,
     Dedent,
@@ -265,6 +275,7 @@ pub fn lex(src: &str) -> Result<Vec<Token<'_>>, LexError> {
                 "in" => TokenKind::KwIn,
                 _ => TokenKind::Identifier,
             },
+            Lexeme::Underscore => TokenKind::Underscore,
             Lexeme::PlusEq => TokenKind::PlusEq,
             Lexeme::MinusEq => TokenKind::MinusEq,
             Lexeme::StarEq => TokenKind::StarEq,
@@ -303,6 +314,7 @@ pub fn lex(src: &str) -> Result<Vec<Token<'_>>, LexError> {
             Lexeme::ColonColon => TokenKind::ColonColon,
             Lexeme::Colon => TokenKind::Colon,
             Lexeme::Comma => TokenKind::Comma,
+            Lexeme::Semicolon => TokenKind::Semicolon,
             Lexeme::Dot => TokenKind::Dot,
             Lexeme::DotDot => TokenKind::DotDot,
             Lexeme::DotDotLt => TokenKind::DotDotLt,
@@ -673,6 +685,22 @@ mod tests {
                 Eof
             ]
         );
+    }
+
+    #[test]
+    fn semicolon_is_a_token() {
+        use TokenKind::*;
+        // `;` is the 2D matrix row separator; it appears inside `[…]` brackets so no
+        // newline logic fires. Here we test it as a bare token and inside brackets.
+        assert_eq!(kinds(";"), vec![Semicolon, Eof]);
+        assert_eq!(
+            kinds("[1, 2; 3, 4]"),
+            vec![
+                LBracket, Int, Comma, Int, Semicolon, Int, Comma, Int, RBracket, Eof
+            ]
+        );
+        // Existing tokens are undisturbed around `;`.
+        assert_eq!(kinds("a; b"), vec![Identifier, Semicolon, Identifier, Eof]);
     }
 
     #[test]

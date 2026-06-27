@@ -5,7 +5,7 @@
 //! mutation, and bounds-check runtime errors. Requires the `llvm` feature.
 
 mod common;
-use common::{eval, eval_bool, eval_int};
+use common::{eval, eval_array, eval_bool, eval_int};
 use indoc::indoc;
 use pinp::codegen::PinpValue;
 
@@ -373,10 +373,11 @@ fn index_too_high_is_runtime_error() {
 }
 
 #[test]
-fn negative_index_is_runtime_error() {
+fn negative_index_oob_is_error() {
+    // -4 on a 3-element array: effective = -4 + 3 = -1 — still negative, still out of bounds.
     let result = pinp::codegen::PinpJit::eval(indoc! {"
         a = [1, 2, 3]
-        a[-1]
+        a[-4]
     "});
     assert!(
         result.unwrap_err().contains("Array index out of bounds"),
@@ -888,5 +889,136 @@ fn range_init_variable_bounds_is_sema_error() {
     assert!(
         result.unwrap_err().contains("literal"),
         "expected non-literal bound sema error"
+    );
+}
+
+// -----------------------------------------------------------------------------------------
+// Step 19 — negative indexing (1D)
+// -----------------------------------------------------------------------------------------
+
+#[test]
+fn negative_index_reads_first_middle_last() {
+    // 4-element array; -1 is last, -4 is first, -2 is third.
+    assert_eq!(eval_int("[10, 20, 30, 40][-4]"), 10);
+    assert_eq!(eval_int("[10, 20, 30, 40][-2]"), 30);
+    assert_eq!(eval_int("[10, 20, 30, 40][-1]"), 40);
+}
+
+#[test]
+fn negative_index_variable_reads_correct_element() {
+    // Variable index: normalization is a runtime select, not a sema fold.
+    assert_eq!(
+        eval_int(indoc! {"
+        a = [10, 20, 30, 40]
+        i = 0 - 1
+        a[i]
+    "}),
+        40
+    );
+}
+
+#[test]
+fn negative_index_variable_oob_is_runtime_error() {
+    // -5 on a 4-element array: effective = -5 + 4 = -1 — still negative, still OOB.
+    let result = pinp::codegen::PinpJit::eval(indoc! {"
+        a = [1, 2, 3, 4]
+        i = 0 - 5
+        a[i]
+    "});
+    assert!(
+        result.unwrap_err().contains("Array index out of bounds"),
+        "expected bounds error"
+    );
+}
+
+#[test]
+fn negative_index_writes_first_middle_last() {
+    // Write to -4 (first), -2 (third), -1 (last) and confirm the whole array.
+    assert_eq!(
+        eval(indoc! {"
+            a = [10, 20, 30, 40]
+            a[-4] = 1
+            a[-2] = 3
+            a[-1] = 4
+            a
+        "}),
+        PinpValue::Array(vec![
+            PinpValue::Int(1),
+            PinpValue::Int(20),
+            PinpValue::Int(3),
+            PinpValue::Int(4),
+        ])
+    );
+}
+
+#[test]
+fn negative_index_write_variable_oob_is_runtime_error() {
+    let result = pinp::codegen::PinpJit::eval(indoc! {"
+        a = [1, 2, 3, 4]
+        i = 0 - 5
+        a[i] = 99
+    "});
+    assert!(
+        result.unwrap_err().contains("Array index out of bounds"),
+        "expected bounds error"
+    );
+}
+
+// -----------------------------------------------------------------------------------------
+// Step 20 — loose ends
+// -----------------------------------------------------------------------------------------
+
+#[test]
+fn indexed_compound_assign_1d_increments_element() {
+    assert_eq!(
+        eval_array(indoc! {"
+            a = [10, 20, 30]
+            a[1] += 5
+            a
+        "}),
+        vec![PinpValue::Int(10), PinpValue::Int(25), PinpValue::Int(30)]
+    );
+}
+
+#[test]
+fn indexed_compound_assign_float_array_int_rhs() {
+    // float_arr[i] += int_rhs — apply_compound_op must promote int RHS to float, not the result.
+    let result = eval_array(indoc! {"
+        a = [1.0, 2.0, 3.0]
+        a[1] += 3
+        a
+    "});
+    assert_eq!(result[1], PinpValue::Float(5.0));
+}
+
+#[test]
+fn indexed_compound_assign_1d_sub_eq() {
+    // Tests a different compound op (sub) to complement the add-eq coverage.
+    assert_eq!(
+        eval_array(indoc! {"
+            a = [10, 20, 30]
+            a[2] -= 3
+            a
+        "}),
+        vec![PinpValue::Int(10), PinpValue::Int(20), PinpValue::Int(27)]
+    );
+}
+
+#[test]
+fn indexed_compound_assign_index_evaluated_once() {
+    // Regression: a[f()] += v must call f() exactly once.  Before the fix the index was
+    // evaluated twice — once to locate the write slot and once inside the compound-read
+    // expression — so `next()` was called twice and the wrong element was read.
+    assert_eq!(
+        eval_array(indoc! {"
+            counter = 0
+            bump(): int is
+                ::counter += 1
+                ::counter
+            arr = [10, 20, 30]
+            arr[bump()] += 5
+            arr
+        "}),
+        vec![PinpValue::Int(10), PinpValue::Int(25), PinpValue::Int(30)]
     );
 }

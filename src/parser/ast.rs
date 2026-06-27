@@ -36,6 +36,8 @@ pub enum PinpType {
     Range,
     /// A 1D array of `n` elements of `ArrayElementType`, heap-allocated via `pinp_alloc`.
     Array(ArrayElementType, usize),
+    /// A 2D matrix of `rows × cols` elements of `ArrayElementType`, heap-allocated, row-major.
+    Matrix(ArrayElementType, usize, usize),
 }
 
 /// An interned identifier: an index into [`Ast::names`]. `Copy` and cheap to compare; the
@@ -94,6 +96,33 @@ pub enum BinOp {
 pub enum UnOp {
     Neg,
     Not,
+}
+
+/// A compiler-known member that arrays and matrices expose via the `.member` syntax.
+///
+/// Sema resolves the raw member name to this variant (the one string-comparison site in the
+/// compiler) and records it in [`Ast::builtin_members`]. Codegen pattern-matches the enum
+/// exhaustively, so adding a new variant forces both sema and codegen to be updated.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum BuiltinMember {
+    Len,
+    Ndim,
+    Rows,
+    Cols,
+}
+
+impl BuiltinMember {
+    /// Maps a raw member name to the enum variant, or `None` if the name is unrecognised.
+    /// This is the single source of truth for which member names the language knows about.
+    pub fn from_name(name: &str) -> Option<Self> {
+        match name {
+            "len" => Some(Self::Len),
+            "ndim" => Some(Self::Ndim),
+            "rows" => Some(Self::Rows),
+            "cols" => Some(Self::Cols),
+            _ => None,
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -165,6 +194,23 @@ pub enum Node {
         var_type: PinpType,
         source: ExprId,
     },
+    /// `[r0_e0, r0_e1, …; r1_e0, …; …]` — 2D matrix literal. Each inner `Vec` is one row; all
+    /// rows must have the same length (checked by sema). Element type is deduced from all elements.
+    MatrixLiteral {
+        rows: Vec<Vec<ExprId>>,
+    },
+    /// `matrix[row, col]` — 2D index or slice. Each of `row` and `col` is one of:
+    ///   • a scalar `Int` expression → index that dimension (runtime-checked)
+    ///   • a `Node::Range` with literal bounds → slice that dimension (compile-time checked)
+    ///   • `Node::FullExtent` → full extent of that dimension (`:` syntax, resolved by sema)
+    Index2D {
+        matrix: ExprId,
+        row: ExprId,
+        col: ExprId,
+    },
+    /// `:` in a 2D slice position — the full extent of that dimension. Valid only as the `row`
+    /// or `col` child of `Node::Index2D`; sema resolves it to `0..rows-1` or `0..cols-1`.
+    FullExtent,
 }
 
 /// The operator that introduced a [`Node::Range`]: `..` keeps both bounds, `..<`/`..>` drop the
@@ -221,17 +267,36 @@ pub enum Stmt {
         cond: ExprId,
         until: bool,
     },
-    /// `for var in range <body>` — iterates `var` (an `Int`, read-only and body-local) over a range.
+    /// `for var in source <body>` — single-binder iteration. Source may be a range (`Int`
+    /// loop variable), a 1D array (value only), or a 2D matrix (value only, row-major).
     For {
         var: SymId,
-        range: ExprId,
+        source: ExprId,
         body: Block,
     },
-    /// `arr[index] = value` — write one element of a 1D array in place.
+    /// `for binders… in source <body>` — multi-binder array/matrix iteration.
+    /// 2 binders + 1D array → (index, value); 3 binders + 2D matrix → (row, col, value).
+    ForArray {
+        binders: Vec<SymId>,
+        source: ExprId,
+        body: Block,
+    },
+    /// `arr[index] = value` or `arr[index] <op>= rhs` — write one element of a 1D array.
+    /// For compound assignment `<op>=`, `compound_op` is `Some(op)` and `value` is the RHS;
+    /// codegen loads the current element, applies `op`, and stores the result.
     IndexedAssign {
         target: Place,
         index: ExprId,
         value: ExprId,
+        compound_op: Option<BinOp>,
+    },
+    /// `mat[row, col] = value` or `mat[row, col] <op>= rhs` — write one element of a 2D matrix.
+    IndexedAssign2D {
+        target: Place,
+        row: ExprId,
+        col: ExprId,
+        value: ExprId,
+        compound_op: Option<BinOp>,
     },
 }
 
@@ -274,13 +339,17 @@ pub enum TopLevel {
 
 /// A parsed program. Borrows the source for the lifetime `'src` (identifiers are slices into it).
 ///
-/// Layout: `nodes` and `types` are parallel arenas indexed by [`ExprId`]; `top_level` is the
-/// program in source order; `names` maps a [`SymId`] back to its text. Returned by [`crate::parser::parse`] with
-/// `types` unpopulated; [`crate::sema::analyze`] fills `types` in.
+/// Layout: `nodes`, `types`, and `builtin_members` are parallel arenas indexed by [`ExprId`];
+/// `top_level` is the program in source order; `names` maps a [`SymId`] back to its text.
+/// Returned by [`crate::parser::parse`] with `types` unpopulated and `builtin_members` all `None`;
+/// [`crate::sema::analyze`] fills both in.
 #[derive(Default)]
 pub struct Ast<'src> {
     pub nodes: Vec<Node>,
     pub types: Vec<PinpType>,
+    /// Parallel to `nodes`. For `Node::Member` expressions, sema writes the resolved
+    /// [`BuiltinMember`] here; all other nodes remain `None`.
+    pub builtin_members: Vec<Option<BuiltinMember>>,
     pub top_level: Vec<TopLevel>,
     pub names: Vec<&'src str>,
     symbols: FxHashMap<&'src str, SymId>,
@@ -297,12 +366,26 @@ impl<'src> Ast<'src> {
         self.types[expr_id.value()]
     }
 
-    /// Pushes a node, returning its id. The type is left as a placeholder for sema to fill.
+    /// Pushes a node, returning its id. Type and built-in member are left as placeholders for
+    /// sema to fill.
     pub(super) fn push(&mut self, node: Node) -> ExprId {
         let expr_id = ExprId(self.nodes.len() as u32);
         self.nodes.push(node);
         self.types.push(PinpType::Void);
+        self.builtin_members.push(None);
         expr_id
+    }
+
+    /// Records the resolved [`BuiltinMember`] kind for a `Node::Member` expression. Called by
+    /// sema after validating the member name and object type.
+    pub fn set_builtin_member(&mut self, expr_id: ExprId, kind: BuiltinMember) {
+        self.builtin_members[expr_id.value()] = Some(kind);
+    }
+
+    /// The resolved [`BuiltinMember`] kind for `expr_id`. `None` for non-`Node::Member` nodes.
+    /// Valid only after [`crate::sema::analyze`] has run.
+    pub fn builtin_member_of(&self, expr_id: ExprId) -> Option<BuiltinMember> {
+        self.builtin_members[expr_id.value()]
     }
 
     pub(super) fn intern(&mut self, name: &'src str) -> SymId {

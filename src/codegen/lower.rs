@@ -131,8 +131,10 @@ impl<'ctx, 'ast> CodeGen<'ctx, 'ast> {
             PinpType::Float => self.float_type().into(),
             PinpType::Void => unreachable!("Void is not a storable value type."),
             PinpType::Range => self.range_type().into(),
-            // An array variable holds a heap pointer (opaque ptr, 64-bit on all targets we support).
-            PinpType::Array(_, _) => self.context.ptr_type(AddressSpace::default()).into(),
+            // Array and matrix variables hold a heap pointer (opaque ptr, 64-bit on all targets).
+            PinpType::Array(_, _) | PinpType::Matrix(_, _, _) => {
+                self.context.ptr_type(AddressSpace::default()).into()
+            }
         }
     }
 

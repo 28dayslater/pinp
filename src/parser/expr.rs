@@ -321,12 +321,26 @@ impl<'src> Parser<'src> {
                 lhs = self.ast.push(Node::Membership { value: lhs, range });
                 continue;
             }
-            // Postfix `lhs[index]` — element access.
+            // Postfix `lhs[…]` — 1D element/slice, or 2D `lhs[row_sel, col_sel]`.
             if self.peek().kind == TokenKind::LBracket && POSTFIX_BP >= min_bp {
                 self.advance(); // '['
-                let index = self.parse_expr(0)?;
-                self.expect(TokenKind::RBracket)?;
-                lhs = self.ast.push(Node::Index { array: lhs, index });
+                let row_or_index = self.parse_dim_selector()?;
+                if self.peek().kind == TokenKind::Comma {
+                    self.advance(); // ','
+                    let col = self.parse_dim_selector()?;
+                    self.expect(TokenKind::RBracket)?;
+                    lhs = self.ast.push(Node::Index2D {
+                        matrix: lhs,
+                        row: row_or_index,
+                        col,
+                    });
+                } else {
+                    self.expect(TokenKind::RBracket)?;
+                    lhs = self.ast.push(Node::Index {
+                        array: lhs,
+                        index: row_or_index,
+                    });
+                }
                 continue;
             }
             // Postfix `lhs.member` — built-in member access (`.len`, etc.).
@@ -488,6 +502,8 @@ impl<'src> Parser<'src> {
             ));
         }
 
+        // The column of the first element is the alignment anchor for multi-line matrix rows.
+        let anchor_col = self.peek().col;
         let first = self.parse_expr(0)?;
 
         // Comprehension: `[element for var[:type] in source]`.
@@ -512,17 +528,77 @@ impl<'src> Parser<'src> {
             }));
         }
 
-        // Array literal: `[e0, e1, …]`.
-        let mut elements = vec![first];
+        // Array or matrix literal: parse the first row.
+        let mut first_row = vec![first];
         while self.peek().kind == TokenKind::Comma {
             self.advance(); // ','
             if self.peek().kind == TokenKind::RBracket {
-                break; // trailing comma
+                break; // trailing comma before `]`
             }
-            elements.push(self.parse_expr(0)?);
+            if self.peek().kind == TokenKind::Semicolon {
+                return Err(ParseError::Unexpected(
+                    "Trailing `,` before `;` in matrix row.".into(),
+                ));
+            }
+            first_row.push(self.parse_expr(0)?);
         }
+
+        // Matrix literal: `[r0_e0, …; r1_e0, …; …]` — a `;` follows the first row.
+        if self.peek().kind == TokenKind::Semicolon {
+            let mut rows = vec![first_row];
+            while self.peek().kind == TokenKind::Semicolon {
+                let sep_line = self.peek().line;
+                self.advance(); // ';'
+                if self.peek().kind == TokenKind::RBracket {
+                    return Err(ParseError::Unexpected(
+                        "Trailing `;` in matrix literal.".into(),
+                    ));
+                }
+                // A row that begins on a new line must align its first element with row 0.
+                if self.peek().line != sep_line && self.peek().col != anchor_col {
+                    return Err(ParseError::Layout(format!(
+                        "Matrix row at column {} must align with the first row at column {}.",
+                        self.peek().col,
+                        anchor_col,
+                    )));
+                }
+                let mut row = vec![self.parse_expr(0)?];
+                while self.peek().kind == TokenKind::Comma {
+                    self.advance(); // ','
+                    if self.peek().kind == TokenKind::RBracket {
+                        break; // trailing comma before `]`
+                    }
+                    if self.peek().kind == TokenKind::Semicolon {
+                        return Err(ParseError::Unexpected(
+                            "Trailing `,` before `;` in matrix row.".into(),
+                        ));
+                    }
+                    row.push(self.parse_expr(0)?);
+                }
+                rows.push(row);
+            }
+            self.expect(TokenKind::RBracket)?;
+            return Ok(self.ast.push(Node::MatrixLiteral { rows }));
+        }
+
+        // 1D array literal.
         self.expect(TokenKind::RBracket)?;
-        Ok(self.ast.push(Node::ArrayLiteral { elements }))
+        Ok(self.ast.push(Node::ArrayLiteral {
+            elements: first_row,
+        }))
+    }
+
+    // One dimension selector inside `obj[…, …]`:
+    //   `:` immediately followed by `,` or `]` → `Node::FullExtent` (full extent of that dimension)
+    //   otherwise → an arbitrary expression (scalar index or range)
+    fn parse_dim_selector(&mut self) -> Result<ExprId, ParseError> {
+        if self.peek().kind == TokenKind::Colon
+            && matches!(self.at(1), TokenKind::Comma | TokenKind::RBracket)
+        {
+            self.advance(); // ':'
+            return Ok(self.ast.push(Node::FullExtent));
+        }
+        self.parse_expr(0)
     }
 
     // `<name>(<args>)` — a function call.

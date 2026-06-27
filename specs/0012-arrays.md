@@ -75,9 +75,14 @@ time (a consequence of the literal-only constraint).
 ```
 x = ary[i]         # read element at zero-based index i
 ary[i] = x         # write element at index i
+x = ary[-1]        # last element (Python-style negative index)
+ary[-1] = x        # write last element
 ```
 
-Out-of-bounds access is a runtime error.
+Negative indices follow Python convention: `-1` addresses the last element, `-len` the first.
+The valid range is `[-len, len)`; anything outside it is an error. When the index is an integer
+literal, the check is at compile time (sema); for variable indices, it is at runtime. Negative
+indexing is implemented in 0013 step 19.
 
 ### Built-in member
 
@@ -289,10 +294,11 @@ From the top level's point of view:
 
 Current runtime errors and their messages:
 
-| Condition                     | Message                          |
-|-------------------------------|----------------------------------|
-| Array index out of bounds     | `Array index out of bounds.`     |
-| Range step is zero            | `Range step cannot be zero.`     |
+| Condition                                    | Message                          |
+|----------------------------------------------|----------------------------------|
+| Array index out of bounds (positive or zero) | `Array index out of bounds.`     |
+| Negative index below `-len`                  | `Array index out of bounds.`     |
+| Range step is zero                           | `Range step cannot be zero.`     |
 
 The 0008 out-of-band error-global mechanism is replaced by this iteration: a native runtime
 function `pinp_runtime_error` (linked alongside mimalloc) unwinds the JIT call stack via
@@ -463,8 +469,11 @@ with anything else returns `None`.
 
 - `array` must resolve to `PinpType::Array(elem_type, _)` — else `SemaError::Type("Index target
   is not an array.")`.
-- `index` must be `Int` or `Bool` (int-like) — else `SemaError::Type("Array index must be an
-  integer.")`.
+- `index` must be `Int` — else `SemaError::Type("Array index must be Int, got …")`.
+  `Bool` is rejected even though it promotes to `Int`; `arr[true]` is almost certainly a bug.
+- If `index` is a `Node::Int` literal, apply negative normalization (`effective = val < 0 ?
+  val + len : val`) and check `effective ∈ [0, len)` — `SemaError::Type("Array index out of
+  bounds.")` if not. Non-literal indices are checked at runtime (see 0013 step 19).
 - Result type: the scalar `PinpType` matching `elem_type`.
 
 ### `Node::Member`
@@ -525,10 +534,11 @@ literals); no IR arithmetic is needed.
 ### `Node::Index`
 
 1. Evaluate `array` → pointer; evaluate `index` as `i64`.
-2. **Bounds check**: `if index < 0 or index >= len` call `pinp_runtime_error` (below) then
+2. **Normalize** (implemented in 0013 step 19): `effective = index < 0 ? index + len : index`.
+3. **Bounds check**: `if effective < 0 or effective >= len` call `pinp_runtime_error` then
    `unreachable` (longjmp never returns — `build_unreachable()` tells LLVM this).
-3. GEP to the element at `index`; `load` and return. For `Bool`, mask the low bit (same guard as
-   the `i1` entry-return).
+4. GEP to the element at `effective`; `load` and return. For `Bool`, mask the low bit (same
+   guard as the `i1` entry-return).
 
 The length `len` is extracted from `ast.type_of(array)` — a compile-time constant, emitted as an
 `i64` immediate.

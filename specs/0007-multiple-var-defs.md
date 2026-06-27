@@ -113,7 +113,7 @@ Assign {
 }
 ```
 
-Single `a = 1` is `target_lists: [[Local(a)]], values: [rhs]`; compound `a += 1` desugars as before to
+Single `a = 1` is `target_lists: [[Local(a)]], values: [rhs]`; compound `a += 1` is expanded as before to
 the single-target, single-value shape with a `Bin` value. The nesting is what distinguishes parallel
 (`a, b = …` → one inner Vec of two) from chained (`a = b = …` → two inner Vecs of one) — a flat list
 could not tell `a, b = 1` (arity error) from `a = b = 1` (chained).
@@ -128,7 +128,7 @@ could not tell `a, b = 1` (arity error) from `a = b = 1` (chained).
     `ParseError::Unexpected("Invalid assignment target …")`), mapped to `Place::Local`/`Place::Global`.
     Validate the arity rule, then build `Assign`.
   - **a compound assign op follows** a single-element first group → the existing single-target compound
-    desugar (`finish_assign`), unchanged.
+    expansion (`finish_compound`), unchanged.
   - **end of statement** → the first group must be a single expression → `Stmt::Expr`; a multi-element
     group with no `=` is a syntax error.
 - This replaces the current 1–2 token `Identifier =`/`:: Identifier =` look-ahead. Parsing targets as

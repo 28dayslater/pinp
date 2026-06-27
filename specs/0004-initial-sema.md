@@ -21,7 +21,7 @@ lex  ->  parse (syntax)  ->  sema (types, scopes, checks)  ->  codegen
 ```
 
 - **parse** becomes purely syntactic: tokens to a structural `Ast`. It still distinguishes `::name`
-  from a bare name (that is lexical, via the `::` token) and still desugars `place <op>= e` (that is
+  from a bare name (that is lexical, via the `::` token) and still expands `place <op>= e` (that is
   a structural rewrite, no types needed). It leaves the `types` arena unpopulated.
 - **sema** walks the `Ast`, infers every node's `PinpType` (filling the `types` arena), owns the
   scope stack and the function-signature table, and runs every semantic check.
@@ -73,7 +73,7 @@ something to smuggle into a behaviour-preserving refactor.
    `PinpType` is a fixed lexical lookup needed to build the structural AST (`Param.param_type`,
    `FuncDef.return_type`), so it — and the `unknown_type_name_is_error` test — stay on the parser
    side rather than forcing the AST to carry unresolved type names.
-4. **Assignment checking is uniform (no plain/compound distinction).** The parser desugars
+4. **Assignment checking is uniform (no plain/compound distinction).** The parser expands
    `x <op>= e` to `x = (x <op> e)` and sema does not track which it was; both require the result type
    be assignable to the target's existing type. This slightly tightens plain re-assignment to an
    incompatible type (no test exercises it) in exchange for a simpler sema.

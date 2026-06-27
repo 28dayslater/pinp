@@ -7,7 +7,7 @@ use inkwell::IntPredicate;
 use inkwell::basic_block::BasicBlock;
 use inkwell::values::IntValue;
 
-use crate::parser::{ArrayElementType, ExprId, Node, RangeKind, Stmt};
+use crate::parser::{ArrayElementType, BinOp, ExprId, Node, RangeKind, Stmt};
 
 impl<'ctx, 'ast> CodeGen<'ctx, 'ast> {
     // -------------------------------------------------------------------------
@@ -87,8 +87,14 @@ impl<'ctx, 'ast> CodeGen<'ctx, 'ast> {
                 self.builder.position_at_end(exit);
                 Ok(None)
             }
-            Stmt::For { var, range, body } => {
-                let range = self.expect_value(*range)?;
+            Stmt::For { var, source, body } => {
+                match self.ast.type_of(*source) {
+                    PinpType::Array(_, _) | PinpType::Matrix(_, _, _) => {
+                        return self.gen_for_array_single(*var, *source, body);
+                    }
+                    _ => {}
+                }
+                let range = self.expect_value(*source)?;
                 let (start, stop, step, inclusive) = self.extract_range(range)?;
                 let function = self.current_function();
 
@@ -144,6 +150,7 @@ impl<'ctx, 'ast> CodeGen<'ctx, 'ast> {
                 target,
                 index,
                 value,
+                compound_op,
             } => {
                 // Look up the array variable's alloca slot and confirm it is an array.
                 let (slot_ptr, array_pinp_type) = match *target {
@@ -173,15 +180,43 @@ impl<'ctx, 'ast> CodeGen<'ctx, 'ast> {
                 if matches!(self.ast.node(*index), Node::Range { .. }) {
                     return self.gen_slice_assign(elem_type, array_ptr, *index, *value);
                 }
-                // Bounds-check and locate the element.
+                // Bounds-check and locate the element — evaluate the index exactly once.
                 let index_val = self.as_int(*index)?;
                 let elem_ptr = self.bounds_check_and_gep(elem_type, array_ptr, index_val, n)?;
-                // Evaluate, promote to element type, and store.
-                let val = self.expect_value(*value)?;
-                let val = self.promote(val, self.ast.type_of(*value), PinpType::from(elem_type));
+                let val = match compound_op {
+                    None => {
+                        let val = self.expect_value(*value)?;
+                        self.promote(val, self.ast.type_of(*value), PinpType::from(elem_type))
+                    }
+                    Some(op) => {
+                        // Load current element through elem_ptr (index not re-evaluated).
+                        // apply_compound_op already returns the correct LLVM type for elem_type.
+                        let current = self
+                            .builder
+                            .build_load(self.element_llvm_type(elem_type), elem_ptr, "cur_elem")
+                            .map_err(err)?;
+                        self.apply_compound_op(*op, current, elem_type, *value)?
+                    }
+                };
                 self.builder.build_store(elem_ptr, val).map_err(err)?;
                 Ok(None)
             }
+            Stmt::ForArray {
+                binders,
+                source,
+                body,
+            } => match self.ast.type_of(*source) {
+                PinpType::Array(_, _) => self.gen_for_array_2(binders, *source, body),
+                PinpType::Matrix(_, _, _) => self.gen_for_array_3(binders, *source, body),
+                _ => unreachable!("sema ensures ForArray source is Array or Matrix"),
+            },
+            Stmt::IndexedAssign2D {
+                target,
+                row,
+                col,
+                value,
+                compound_op,
+            } => self.gen_indexed_assign2d(*target, *row, *col, *value, *compound_op),
         }
     }
 
@@ -497,6 +532,202 @@ impl<'ctx, 'ast> CodeGen<'ctx, 'ast> {
         Ok(None)
     }
 
+    // -------------------------------------------------------------------------
+    // Array / matrix for-loop helpers
+    // -------------------------------------------------------------------------
+
+    // `for val in arr` / `for val in mat` — single binder, value only.
+    // Flat counter `i in 0..total`; element at offset `i` is loaded and stored into `val`'s slot.
+    fn gen_for_array_single(
+        &mut self,
+        var: SymId,
+        source: ExprId,
+        body: &crate::parser::Block,
+    ) -> Result<Option<BasicValueEnum<'ctx>>, String> {
+        let (elem_type, total) = match self.ast.type_of(source) {
+            PinpType::Array(elem_type, n) => (elem_type, n),
+            PinpType::Matrix(elem_type, rows, cols) => (elem_type, rows * cols),
+            _ => unreachable!("gen_for_array_single called on non-array source"),
+        };
+        let heap_ptr = self.expect_value(source)?.into_pointer_value();
+        let val_slot = self.alloca_at_entry(PinpType::from(elem_type))?;
+        let (counter, header, body_bb, exit) =
+            self.build_array_loop_header("fora", total as u64)?;
+
+        self.builder.position_at_end(body_bb);
+        let idx = self.load_counter(counter)?;
+        self.load_and_store_element(elem_type, heap_ptr, idx, val_slot)?;
+        self.push_scope();
+        self.locals
+            .last_mut()
+            .unwrap()
+            .insert(var, (val_slot, PinpType::from(elem_type)));
+        self.gen_block(body)?;
+        self.pop_scope();
+        self.advance_and_loop(counter, idx, header)?;
+
+        self.builder.position_at_end(exit);
+        Ok(None)
+    }
+
+    // `for idx, val in arr` — two binders on a 1D array.
+    // Counter `i` doubles as the index; element at `i` is the value.
+    fn gen_for_array_2(
+        &mut self,
+        binders: &[SymId],
+        source: ExprId,
+        body: &crate::parser::Block,
+    ) -> Result<Option<BasicValueEnum<'ctx>>, String> {
+        let PinpType::Array(elem_type, n) = self.ast.type_of(source) else {
+            unreachable!("gen_for_array_2 called on non-Array source")
+        };
+        let heap_ptr = self.expect_value(source)?.into_pointer_value();
+        let idx_slot = self.alloca_at_entry(PinpType::Int)?;
+        let val_slot = self.alloca_at_entry(PinpType::from(elem_type))?;
+        let (counter, header, body_bb, exit) = self.build_array_loop_header("fora2", n as u64)?;
+
+        self.builder.position_at_end(body_bb);
+        let idx = self.load_counter(counter)?;
+        self.builder.build_store(idx_slot, idx).map_err(err)?;
+        self.load_and_store_element(elem_type, heap_ptr, idx, val_slot)?;
+        self.push_scope();
+        let frame = self.locals.last_mut().unwrap();
+        frame.insert(binders[0], (idx_slot, PinpType::Int));
+        frame.insert(binders[1], (val_slot, PinpType::from(elem_type)));
+        self.gen_block(body)?;
+        self.pop_scope();
+        self.advance_and_loop(counter, idx, header)?;
+
+        self.builder.position_at_end(exit);
+        Ok(None)
+    }
+
+    // `for row, col, val in mat` — three binders on a 2D matrix.
+    // Single flat counter `i in 0..rows*cols`; `row = i / cols`, `col = i % cols`.
+    fn gen_for_array_3(
+        &mut self,
+        binders: &[SymId],
+        source: ExprId,
+        body: &crate::parser::Block,
+    ) -> Result<Option<BasicValueEnum<'ctx>>, String> {
+        let PinpType::Matrix(elem_type, rows, cols) = self.ast.type_of(source) else {
+            unreachable!("gen_for_array_3 called on non-Matrix source")
+        };
+        let heap_ptr = self.expect_value(source)?.into_pointer_value();
+        let cols_val = self.int_type().const_int(cols as u64, false);
+        let row_slot = self.alloca_at_entry(PinpType::Int)?;
+        let col_slot = self.alloca_at_entry(PinpType::Int)?;
+        let val_slot = self.alloca_at_entry(PinpType::from(elem_type))?;
+        let (counter, header, body_bb, exit) =
+            self.build_array_loop_header("fora3", (rows * cols) as u64)?;
+
+        self.builder.position_at_end(body_bb);
+        let idx = self.load_counter(counter)?;
+        let row = self
+            .builder
+            .build_int_signed_div(idx, cols_val, "row")
+            .map_err(err)?;
+        let col = self
+            .builder
+            .build_int_signed_rem(idx, cols_val, "col")
+            .map_err(err)?;
+        self.builder.build_store(row_slot, row).map_err(err)?;
+        self.builder.build_store(col_slot, col).map_err(err)?;
+        self.load_and_store_element(elem_type, heap_ptr, idx, val_slot)?;
+        self.push_scope();
+        let frame = self.locals.last_mut().unwrap();
+        frame.insert(binders[0], (row_slot, PinpType::Int));
+        frame.insert(binders[1], (col_slot, PinpType::Int));
+        frame.insert(binders[2], (val_slot, PinpType::from(elem_type)));
+        self.gen_block(body)?;
+        self.pop_scope();
+        self.advance_and_loop(counter, idx, header)?;
+
+        self.builder.position_at_end(exit);
+        Ok(None)
+    }
+
+    // Emit the header/exit scaffold for a counted loop over `total` elements.
+    // Returns `(counter_slot, header_bb, body_bb, exit_bb)`; caller fills in the body.
+    fn build_array_loop_header(
+        &mut self,
+        label: &str,
+        total: u64,
+    ) -> Result<
+        (
+            PointerValue<'ctx>,
+            inkwell::basic_block::BasicBlock<'ctx>,
+            inkwell::basic_block::BasicBlock<'ctx>,
+            inkwell::basic_block::BasicBlock<'ctx>,
+        ),
+        String,
+    > {
+        let total_val = self.int_type().const_int(total, false);
+        let counter = self.alloca_at_entry(PinpType::Int)?;
+        self.builder
+            .build_store(counter, self.int_type().const_zero())
+            .map_err(err)?;
+        let func = self.current_function();
+        let header = self
+            .context
+            .append_basic_block(func, &format!("{label}_hdr"));
+        let body_bb = self
+            .context
+            .append_basic_block(func, &format!("{label}_body"));
+        let exit = self
+            .context
+            .append_basic_block(func, &format!("{label}_exit"));
+        self.builder
+            .build_unconditional_branch(header)
+            .map_err(err)?;
+        self.builder.position_at_end(header);
+        let idx = self.load_counter(counter)?;
+        let cond = self
+            .builder
+            .build_int_compare(IntPredicate::SLT, idx, total_val, &format!("{label}_cond"))
+            .map_err(err)?;
+        self.builder
+            .build_conditional_branch(cond, body_bb, exit)
+            .map_err(err)?;
+        Ok((counter, header, body_bb, exit))
+    }
+
+    // GEP into `heap_ptr` at flat offset `idx`, load the element, and store it into `slot`.
+    fn load_and_store_element(
+        &self,
+        elem_type: ArrayElementType,
+        heap_ptr: PointerValue<'ctx>,
+        idx: IntValue<'ctx>,
+        slot: PointerValue<'ctx>,
+    ) -> Result<(), String> {
+        let src_ptr = self.build_element_ptr(elem_type, heap_ptr, idx)?;
+        let elem = self
+            .builder
+            .build_load(self.element_llvm_type(elem_type), src_ptr, "elem")
+            .map_err(err)?;
+        self.builder.build_store(slot, elem).map_err(err)?;
+        Ok(())
+    }
+
+    // Increment the counter by 1 and branch back to `header`.
+    fn advance_and_loop(
+        &self,
+        counter: PointerValue<'ctx>,
+        current_idx: IntValue<'ctx>,
+        header: inkwell::basic_block::BasicBlock<'ctx>,
+    ) -> Result<(), String> {
+        let one = self.int_type().const_int(1, false);
+        let next = self
+            .builder
+            .build_int_add(current_idx, one, "next")
+            .map_err(err)?;
+        self.builder.build_store(counter, next).map_err(err)?;
+        self.builder
+            .build_unconditional_branch(header)
+            .map_err(err)?;
+        Ok(())
+    }
+
     // The `for` continue test: ascending wants `counter <= stop` (inclusive) or `< stop`; descending
     // the mirror. `going_up` picks the side, so the two directions share one header.
     pub(super) fn range_continue(
@@ -537,5 +768,57 @@ impl<'ctx, 'ast> CodeGen<'ctx, 'ast> {
             .build_select(going_up, up, down, "for_cond")
             .map_err(err)?
             .into_int_value())
+    }
+
+    // `mat[row, col] = value` — bounds-check both indices then store.
+    fn gen_indexed_assign2d(
+        &mut self,
+        target: Place,
+        row_id: ExprId,
+        col_id: ExprId,
+        value_id: ExprId,
+        compound_op: Option<BinOp>,
+    ) -> Result<Option<BasicValueEnum<'ctx>>, String> {
+        let (slot_ptr, matrix_pinp_type) = match target {
+            Place::Local(sym_id) => {
+                if let Some(slot) = self.find_local(sym_id) {
+                    slot
+                } else {
+                    self.globals[&sym_id]
+                }
+            }
+            Place::Global(sym_id) => self.globals[&sym_id],
+        };
+        let PinpType::Matrix(elem_type, rows, cols) = matrix_pinp_type else {
+            unreachable!("IndexedAssign2D target is always a matrix")
+        };
+        let matrix_ptr = self
+            .builder
+            .build_load(
+                self.context.ptr_type(AddressSpace::default()),
+                slot_ptr,
+                "mat_ptr",
+            )
+            .map_err(err)?
+            .into_pointer_value();
+        let row_val = self.as_int(row_id)?;
+        let col_val = self.as_int(col_id)?;
+        let elem_ptr =
+            self.bounds_check_and_gep_2d(elem_type, matrix_ptr, row_val, col_val, rows, cols)?;
+        let val = match compound_op {
+            None => {
+                let val = self.expect_value(value_id)?;
+                self.promote(val, self.ast.type_of(value_id), PinpType::from(elem_type))
+            }
+            Some(op) => {
+                let current = self
+                    .builder
+                    .build_load(self.element_llvm_type(elem_type), elem_ptr, "cur_elem")
+                    .map_err(err)?;
+                self.apply_compound_op(op, current, elem_type, value_id)?
+            }
+        };
+        self.builder.build_store(elem_ptr, val).map_err(err)?;
+        Ok(None)
     }
 }
