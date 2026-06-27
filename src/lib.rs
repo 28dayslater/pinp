@@ -6,3 +6,6 @@ pub mod sema;
 
 #[cfg(feature = "llvm")]
 pub mod codegen;
+
+#[cfg(feature = "llvm")]
+pub mod runtime;
