@@ -1,11 +1,11 @@
 // SPDX-License-Identifier: MIT
 
 use super::*;
-use crate::parser::{ArrayElementType, Ast, BinOp, Node, PinpType, Stmt, TopLevel, parse};
+use crate::parser::{ArrayElementType, BinOp, Node, PinpType, ProgramAst, Stmt, TopLevel, parse};
 use indoc::indoc;
 
 /// Parse + analyze, returning the typed AST (panicking on any error).
-fn analyzed(src: &str) -> Ast<'_> {
+fn analyzed(src: &str) -> ProgramAst<'_> {
     let mut ast = parse(src).expect("source should parse");
     analyze(&mut ast).expect("source should analyze");
     ast
@@ -2486,5 +2486,26 @@ fn indexed_compound_div_eq_on_int_array_is_sema_error() {
     assert_eq!(
         sema_error(&with_array4("a[0] /= 2")),
         SemaError::Type("Cannot assign Float to array element of type Int.".into())
+    );
+}
+
+// --- `str` annotations rejected until string values land in sema/codegen -------------
+
+#[test]
+fn str_parameter_is_rejected() {
+    // The `str` annotation parses (`parse_type` accepts it), but a `str` parameter is deferred this
+    // iteration, so sema rejects it rather than letting `Str` reach codegen's unimplemented path.
+    assert_eq!(
+        sema_error("greet(name: str): int is 5"),
+        SemaError::Type("String parameters are not yet supported.".into())
+    );
+}
+
+#[test]
+fn str_comprehension_annotation_is_rejected() {
+    // A range counter cannot promote to a string; sema rejects the annotation before codegen.
+    assert_eq!(
+        sema_error("[1 for x:str in 1..3]"),
+        SemaError::Type("Cannot promote range variable to string.".into())
     );
 }

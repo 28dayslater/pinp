@@ -2,8 +2,8 @@
 
 //! Semantic analysis: the pass between [`crate::parser`] and code generation.
 //!
-//! The parser produces a structural [`Ast`] with an unpopulated `types` arena. [`analyze`] walks
-//! it, **resolves names** against a scope stack, **infers** every expression's [`PinpType`]
+//! The parser produces a structural [`ProgramAst`] with an unpopulated `types` arena. [`analyze`]
+//! walks it, **resolves names** against a scope stack, **infers** every expression's [`PinpType`]
 //! (writing it back into the arena), and **checks** the semantic rules — reporting the first
 //! [`SemaError`]. Codegen then consumes the now-typed AST.
 //!
@@ -14,7 +14,7 @@
 
 use rustc_hash::FxHashMap;
 
-use crate::parser::{Ast, BuiltinMember, Node, PinpType, SymId, TopLevel};
+use crate::parser::{BuiltinMember, Node, PinpType, ProgramAst, SymId, TopLevel};
 
 mod analyzer;
 
@@ -85,9 +85,9 @@ struct Signature {
 
 /// Infers types and checks the semantic rules, filling the AST's `types` and `builtin_members`
 /// arenas in place.
-pub fn analyze(ast: &mut Ast) -> Result<(), SemaError> {
+pub fn analyze(ast: &mut ProgramAst) -> Result<(), SemaError> {
     // Borrow the read-only structure and the writable arenas as disjoint fields.
-    let Ast {
+    let ProgramAst {
         nodes,
         types,
         builtin_members,

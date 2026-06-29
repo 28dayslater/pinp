@@ -3,8 +3,8 @@
 //! AST → LLVM IR lowering: the heart of the codegen backend.
 //!
 //! *Lowering* is the compiler term for rewriting a program into a lower-level form — here the typed
-//! [`Ast`] into LLVM IR, one step "down" toward the machine. Sema has already resolved names and
-//! inferred every type, so lowering carries no analysis: it is a mechanical walk that emits, for
+//! [`ProgramAst`] into LLVM IR, one step "down" toward the machine. Sema has already resolved names
+//! and inferred every type, so lowering carries no analysis: it is a mechanical walk that emits, for
 //! each construct, the IR that computes it. LLVM then optimises that IR and machine-codes it.
 //!
 //! This file holds the `CodeGen` state and its construction, the small scope and LLVM-type helpers
@@ -28,7 +28,7 @@ impl<'ctx, 'ast> CodeGen<'ctx, 'ast> {
     // -------------------------------------------------------------------------
 
     /// Creates an empty code generator lowering `ast` into a module in `context`.
-    pub(super) fn new(context: &'ctx Context, ast: &'ast Ast<'ast>) -> Self {
+    pub(super) fn new(context: &'ctx Context, ast: &'ast ProgramAst<'ast>) -> Self {
         CodeGen {
             context,
             module: context.create_module("pinp"),
@@ -129,6 +129,7 @@ impl<'ctx, 'ast> CodeGen<'ctx, 'ast> {
             PinpType::Bool => self.bool_type().into(),
             PinpType::Int => self.int_type().into(),
             PinpType::Float => self.float_type().into(),
+            PinpType::Str => todo!("string codegen — step 5"),
             PinpType::Void => unreachable!("Void is not a storable value type."),
             PinpType::Range => self.range_type().into(),
             // Array and matrix variables hold a heap pointer (opaque ptr, 64-bit on all targets).

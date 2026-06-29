@@ -137,6 +137,25 @@ fn empty() -> PinpStr {
     make_with(0, |_| {})
 }
 
+/// A fixed stack buffer implementing [`core::fmt::Write`], so an integer can be formatted without the
+/// transient heap `String` that `to_string` allocates. Being a plain local it is inherently
+/// thread-safe — each call owns its own buffer, with no shared or static state. 24 bytes covers the
+/// widest `i64` (`-9223372036854775808`, 20 chars); a write past the end would panic, which an `i64`
+/// never reaches.
+struct StackBuf {
+    bytes: [u8; 24],
+    len: usize,
+}
+
+impl std::fmt::Write for StackBuf {
+    fn write_str(&mut self, text: &str) -> std::fmt::Result {
+        let end = self.len + text.len();
+        self.bytes[self.len..end].copy_from_slice(text.as_bytes());
+        self.len = end;
+        Ok(())
+    }
+}
+
 // ── extern "C" ABI ───────────────────────────────────────────────────────────
 
 /// Constructs a `PinpStr` from a null-terminated C string.
@@ -238,7 +257,16 @@ pub unsafe extern "C" fn pinp_str_cmp(a: *const PinpStr, b: *const PinpStr) -> i
 /// Always safe to call; `unsafe` only for ABI uniformity with the rest of the surface.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn pinp_str_from_int(n: i64) -> PinpStr {
-    make_from(n.to_string().as_bytes())
+    // Format into a stack buffer rather than via `to_string`, whose transient heap `String` would be
+    // pure waste — an `i64` always fits inline. The buffer is a per-call local, so this stays
+    // thread-safe with no shared state.
+    use std::fmt::Write;
+    let mut buffer = StackBuf {
+        bytes: [0; 24],
+        len: 0,
+    };
+    let _ = write!(buffer, "{n}"); // formatting an i64 into 24 bytes cannot fail
+    make_from(&buffer.bytes[..buffer.len])
 }
 
 /// Formats an `f64` as its shortest round-tripping decimal string.

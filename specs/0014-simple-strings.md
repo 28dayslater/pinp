@@ -33,9 +33,9 @@ end-of-file rather than end-of-line. The benefit is no prefix or triple-delimite
 ## f-strings (interpolation)
 
 `bar = f'fu = {fu} bar = {bar}'` is supported. Each `{name}` hole names an existing binding —
-a local/parameter, or a `{::name}` global. An unresolved name is a **sema error**, since every name
-is statically visible at compile time. Interpolating a non-`str` scalar (`bool`/`int`/`float`)
-stringifies it.
+a local/parameter, or a `{::name}` global. Whitespace around the name is ignored, so `{ fu }` and
+`{fu}` are the same hole. An unresolved name is a **sema error**, since every name is statically
+visible at compile time. Interpolating a non-`str` scalar (`bool`/`int`/`float`) stringifies it.
 
 ## Operations
 
@@ -172,7 +172,8 @@ clone (it carries a `StrId`, not a `String`); the identifier interner is untouch
 
 `str_lit` and `f_str_lit` join `number`/`bool`/`name` as atoms in `parse_primary`. f-string holes
 are `{identifier}` or `{::identifier}`; an empty hole `{}`, an unbalanced brace, or a non-name hole
-is a parse error.
+is a parse error. A hole's text is re-lexed (the lexer is the single source of truth for "name"),
+so surrounding whitespace is tolerated — `{ x }` is the same as `{x}`.
 
 The parser turns a raw token into content in two steps: strip the delimiters (and leading `f`),
 then **auto-dedent**:
@@ -201,6 +202,10 @@ it are dedented consistently.
 - `Member{len}` on `Str` → `Int` (a new arm in `member_type`, recording `BuiltinMember::Len`).
 - `str(x)` and `meminfo()` join `identity` as name-intercepted built-ins in `call_type`:
   `str` takes one scalar/`str` arg → `Str`; `meminfo` takes none → `Void`.
+- **`str` parameters are rejected here** (the deferral the parser comment defers to): a function
+  signature with a `PinpType::Str` parameter is a sema error this iteration, since the cross-call
+  freeing model is out of scope. The annotation parses (`parse_type` accepts `str`); sema is what
+  turns a `str` *parameter* into an error.
 
 ## Codegen — values and the freeing model
 
@@ -209,6 +214,9 @@ This is the new machinery. A `str` binding gets a `{ i64, i64 }` alloca; reads/w
 - `emit(Str)` → `pinp_str_from_cstr(global)`.
 - `emit(FStr)` → emit each segment as a `PinpStr` (`from_cstr` for literals; `from_int`/`from_float`/
   constant for scalar holes; a load for `str` holes), then one `pinp_str_concat_n`.
+  - Scalar→`str` rendering: `int` formats via the dependency-free `StackBuf` (decimal, no heap);
+    `bool` renders as `"true"`/`"false"`; `float` moves from `to_string` to `ryu` in step 8 (the
+    deliberate `2.0`-not-`2` change). Cover each with tests as its step lands.
 - `emit(Bin Add)` with `str` lhs → `collect_str_parts` walks the left spine, then a single
   `pinp_str_concat_n`. (The flatten bonus.)
 - Comparisons → `pinp_str_cmp` (or `pinp_str_eq` for `==`/`!=`) against 0.
@@ -267,6 +275,21 @@ multiline + auto-dedent lands last as an isolated delta.
 7. **Multiline + auto-dedent**. Lexer regex spans newlines (unterminated → EOF error); parser
    auto-dedent (owned content is already in place from step 3). Lexer/parser/e2e tests for multiline
    round-trips and the dedent edge cases.
+   - **TODO (revisit here):** decide whether the lexer should also assert the *inner* string
+     content, or whether stripping/content checks belong solely to the parser layer. Deferred from
+     step 2 pending concrete parser dedent/segment tests to judge against.
+   - **TODO (end-of-iteration coverage review):** run `cargo llvm-cov` and close the
+     `runtime/string.rs` gap (~81% lines at step 2 — `pinp_meminfo`, the over-long guard behind the
+     `#[ignore]`d test, and the concat paths still un-exercised). Confirm the later steps lifted it
+     and add targeted tests for anything still uncovered.
+
+8. **Float formatting via `ryu` (final optimisation).** Replace `pinp_str_from_float`'s `to_string`
+   (a transient heap `String`) with `ryu::Buffer`, a stack buffer — no heap traffic, thread-safe (a
+   per-call local), and stack-bounded because ryu uses scientific notation for extreme magnitudes.
+   This is a *deliberate format change*: ryu renders `2.0` (not std's `2`) and `1e300`-style
+   exponents, which the user prefers (a float reads as a float). Update the `from_float` test
+   accordingly (`2.0` → `"2.0"`) and any e2e float-interpolation expectations. `ryu` is float-only,
+   so integer formatting **stays** on the dependency-free `StackBuf` already in place — no `itoa`.
 
 ## Tests
 
@@ -301,6 +324,13 @@ by layer:
 - Escape sequences; multiline / raw strings; UTF-8.
 - Interpolating aggregates (arrays/ranges) into f-strings.
 - `str`-typed array elements.
+- **Mutable strings** (a separate future iteration). Surface is a compiler built-in
+  `mustr(initial_content, [cap: nnn])`, *not* a literal prefix like `m"content"` — chosen after
+  deliberation as cleaner and more explicit (capacity is a named argument, no new literal syntax).
+  The `cap` argument also drives allocation: **no `cap` ⇒ heap-only**; a `cap` of a reasonable
+  compile-time size makes the buffer **eligible for stack allocation** instead of the heap. The
+  `PinpStr` layout already reserves the `is_mutable` flag (bit30 of `cap` / bit6 of `tag_len`) for
+  this.
 
 ---
 

@@ -32,6 +32,8 @@ pub enum PinpType {
     Bool,
     Int,
     Float,
+    /// An immutable string. Its runtime representation is the 16-byte `PinpStr` descriptor.
+    Str,
     Void,
     Range,
     /// A 1D array of `n` elements of `ArrayElementType`, heap-allocated via `pinp_alloc`.
@@ -40,25 +42,39 @@ pub enum PinpType {
     Matrix(ArrayElementType, usize, usize),
 }
 
-/// An interned identifier: an index into [`Ast::names`]. `Copy` and cheap to compare; the
+/// An interned identifier: an index into [`ProgramAst::names`]. `Copy` and cheap to compare; the
 /// backing text lives once in the interner, never re-stored per use.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct SymId(pub u32);
 
 impl SymId {
-    /// This id's underlying value — its index into [`Ast::names`].
+    /// This id's underlying value — its index into [`ProgramAst::names`].
     pub fn value(self) -> usize {
         self.0 as usize
     }
 }
 
-/// An index into the [`Ast::nodes`] arena. The node's inferred [`PinpType`] sits at the same
-/// index in the parallel [`Ast::types`] vec.
+/// An index into [`ProgramAst::string_literals`]: the owned content of a [`Node::Str`] or of one
+/// literal run of a [`Node::FStr`]. Content is owned rather than a source slice because auto-dedent
+/// (and, later, escape processing) rewrite the bytes, so it cannot borrow the source.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct StrId(pub u32);
+
+impl StrId {
+    /// This id's underlying value — its index into [`ProgramAst::string_literals`].
+    pub fn value(self) -> usize {
+        self.0 as usize
+    }
+}
+
+/// An index into the [`ProgramAst::nodes`] arena. The node's inferred [`PinpType`] sits at the same
+/// index in the parallel [`ProgramAst::types`] vec.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct ExprId(pub u32);
 
 impl ExprId {
-    /// This id's underlying value — its index into the parallel [`Ast::nodes`]/[`Ast::types`] arenas.
+    /// This id's underlying value — its index into the parallel
+    /// [`ProgramAst::nodes`]/[`ProgramAst::types`] arenas.
     pub fn value(self) -> usize {
         self.0 as usize
     }
@@ -101,7 +117,7 @@ pub enum UnOp {
 /// A compiler-known member that arrays and matrices expose via the `.member` syntax.
 ///
 /// Sema resolves the raw member name to this variant (the one string-comparison site in the
-/// compiler) and records it in [`Ast::builtin_members`]. Codegen pattern-matches the enum
+/// compiler) and records it in [`ProgramAst::builtin_members`]. Codegen pattern-matches the enum
 /// exhaustively, so adding a new variant forces both sema and codegen to be updated.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum BuiltinMember {
@@ -136,6 +152,12 @@ pub enum Node {
     Int(i64),
     Float(f64),
     Bool(bool),
+    /// A string literal; its dedented content lives in [`ProgramAst::string_literals`].
+    Str(StrId),
+    /// An f-string `f'…{name}…'`, lowered to its alternating literal/interpolation [`FStrSegment`]s.
+    FStr {
+        segments: Vec<FStrSegment>,
+    },
     Var(SymId),    // bare name: a parameter/local, or a top-level global
     Global(SymId), // `::name`
     Unary {
@@ -211,6 +233,14 @@ pub enum Node {
     /// `:` in a 2D slice position — the full extent of that dimension. Valid only as the `row`
     /// or `col` child of `Node::Index2D`; sema resolves it to `0..rows-1` or `0..cols-1`.
     FullExtent,
+}
+
+/// One piece of an f-string: a fixed literal run, or a `{name}`/`{::name}` interpolation hole.
+/// [`Place`] already encodes the local/`::`-global distinction.
+#[derive(Debug, Clone, PartialEq)]
+pub enum FStrSegment {
+    Literal(StrId),
+    Interp(Place),
 }
 
 /// The operator that introduced a [`Node::Range`]: `..` keeps both bounds, `..<`/`..>` drop the
@@ -344,7 +374,7 @@ pub enum TopLevel {
 /// Returned by [`crate::parser::parse`] with `types` unpopulated and `builtin_members` all `None`;
 /// [`crate::sema::analyze`] fills both in.
 #[derive(Default)]
-pub struct Ast<'src> {
+pub struct ProgramAst<'src> {
     pub nodes: Vec<Node>,
     pub types: Vec<PinpType>,
     /// Parallel to `nodes`. For `Node::Member` expressions, sema writes the resolved
@@ -352,10 +382,12 @@ pub struct Ast<'src> {
     pub builtin_members: Vec<Option<BuiltinMember>>,
     pub top_level: Vec<TopLevel>,
     pub names: Vec<&'src str>,
+    /// Owned content of every string and f-string-literal run, addressed by [`StrId`].
+    pub string_literals: Vec<String>,
     symbols: FxHashMap<&'src str, SymId>,
 }
 
-impl<'src> Ast<'src> {
+impl<'src> ProgramAst<'src> {
     /// Borrows the node at `expr_id`.
     pub fn node(&self, expr_id: ExprId) -> &Node {
         &self.nodes[expr_id.value()]
@@ -386,6 +418,18 @@ impl<'src> Ast<'src> {
     /// Valid only after [`crate::sema::analyze`] has run.
     pub fn builtin_member_of(&self, expr_id: ExprId) -> Option<BuiltinMember> {
         self.builtin_members[expr_id.value()]
+    }
+
+    /// Stores an owned literal string, returning its [`StrId`].
+    pub(super) fn push_string_literal(&mut self, content: String) -> StrId {
+        let str_id = StrId(self.string_literals.len() as u32);
+        self.string_literals.push(content);
+        str_id
+    }
+
+    /// The content of the literal at `str_id`.
+    pub fn string_literal(&self, str_id: StrId) -> &str {
+        &self.string_literals[str_id.value()]
     }
 
     pub(super) fn intern(&mut self, name: &'src str) -> SymId {

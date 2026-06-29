@@ -36,6 +36,21 @@ enum Lexeme {
     #[regex(r"([0-9]{1,3}(_[0-9]{3})+|[0-9]+)?\.([0-9]{1,3}(_[0-9]{3})+|[0-9]+)([eE][+-]?([0-9]{1,3}(_[0-9]{3})+|[0-9]+))?")]
     Float,
 
+    // A single-line string literal between matching quotes: any run that contains neither its own
+    // delimiter nor a newline. Single and double quotes are interchangeable. An unterminated
+    // literal (no closing quote before the line ends) matches nothing and surfaces as a lex error
+    // at the opening quote. Multiline support — dropping the `\n` exclusion so the body spans
+    // physical lines — is a deferred step.
+    #[regex(r"'[^'\n]*'")]
+    #[regex("\"[^\"\n]*\"")]
+    Str,
+
+    // An f-string (interpolation) literal: the `f` prefix immediately before a single-line string
+    // body. Longest-match keeps a bare `f` not followed by a quote an `Identifier`.
+    #[regex(r"f'[^'\n]*'")]
+    #[regex("f\"[^\"\n]*\"")]
+    FStr,
+
     // Identifier: optional leading `_`s, then a letter, then letters/digits/`_`.
     // Examples: a  Fu  _BAR  _baz_baz_  _fu12_11_bar
     #[regex(r"_*[a-zA-Z][a-zA-Z0-9_]*")]
@@ -131,6 +146,10 @@ enum Lexeme {
 pub enum TokenKind {
     Int,
     Float,
+    /// A string literal, delimiters included in `text` (the parser strips them).
+    Str,
+    /// An f-string literal (`f'…'`), prefix and delimiters included in `text`.
+    FStr,
     Identifier,
     Plus,
     Minus,
@@ -255,6 +274,8 @@ pub fn lex(src: &str) -> Result<Vec<Token<'_>>, LexError> {
             }
             Lexeme::Int => TokenKind::Int,
             Lexeme::Float => TokenKind::Float,
+            Lexeme::Str => TokenKind::Str,
+            Lexeme::FStr => TokenKind::FStr,
             Lexeme::Identifier => match token_text {
                 "div" => TokenKind::KwDiv,
                 "mod" => TokenKind::KwMod,
@@ -701,6 +722,90 @@ mod tests {
         );
         // Existing tokens are undisturbed around `;`.
         assert_eq!(kinds("a; b"), vec![Identifier, Semicolon, Identifier, Eof]);
+    }
+
+    // ── string literals ─────────────────────────────────────────────────────
+
+    #[test]
+    fn string_both_quote_styles() {
+        use TokenKind::*;
+        // Single and double quotes are interchangeable; only the captured slice differs.
+        assert_eq!(kinds("'hello'"), vec![Str, Eof]);
+        assert_eq!(kinds("\"hello\""), vec![Str, Eof]);
+        assert_eq!(lex("'hello'").unwrap()[0].text, "'hello'");
+        assert_eq!(lex("\"hello\"").unwrap()[0].text, "\"hello\"");
+    }
+
+    #[test]
+    fn empty_string_literal() {
+        use TokenKind::*;
+        // `''`/`""` is a single empty-string token — the two delimiters with no content between —
+        // not two separate quote characters.
+        assert_eq!(kinds("''"), vec![Str, Eof]);
+        assert_eq!(lex("''").unwrap()[0].text, "''");
+        assert_eq!(kinds("\"\""), vec![Str, Eof]);
+        assert_eq!(lex("\"\"").unwrap()[0].text, "\"\"");
+    }
+
+    #[test]
+    fn string_content_is_opaque() {
+        use TokenKind::*;
+        // Spaces, operators, digits, keywords, and `#` inside a literal are all just content:
+        // no whitespace skipping, no comment, no sub-tokenisation.
+        assert_eq!(kinds("'if 1 + 2  # x'"), vec![Str, Eof]);
+        assert_eq!(lex("'if 1 + 2  # x'").unwrap()[0].text, "'if 1 + 2  # x'");
+    }
+
+    #[test]
+    fn opposite_quote_allowed_inside() {
+        // The non-delimiter quote is ordinary content — no escaping, no mixed delimiters.
+        assert_eq!(lex("\"can't\"").unwrap()[0].text, "\"can't\"");
+        assert_eq!(lex("'say \"hi\"'").unwrap()[0].text, "'say \"hi\"'");
+    }
+
+    #[test]
+    fn fstring_both_quote_styles() {
+        use TokenKind::*;
+        assert_eq!(kinds("f'hi'"), vec![FStr, Eof]);
+        assert_eq!(kinds("f\"hi\""), vec![FStr, Eof]);
+        assert_eq!(lex("f'hi'").unwrap()[0].text, "f'hi'");
+    }
+
+    #[test]
+    fn bare_f_stays_identifier() {
+        use TokenKind::*;
+        // Longest-match yields FStr only when a quote immediately follows `f`.
+        assert_eq!(kinds("f"), vec![Identifier, Eof]);
+        assert_eq!(kinds("f + 1"), vec![Identifier, Plus, Int, Eof]);
+        assert_eq!(kinds("foo"), vec![Identifier, Eof]);
+        // A space splits it into an identifier and a plain string.
+        assert_eq!(kinds("f 'hi'"), vec![Identifier, Str, Eof]);
+    }
+
+    #[test]
+    fn string_adjacent_to_tokens() {
+        use TokenKind::*;
+        assert_eq!(kinds("a + 'b'"), vec![Identifier, Plus, Str, Eof]);
+        assert_eq!(kinds("'a' 'b'"), vec![Str, Str, Eof]);
+        // `.len` on a literal is unaffected: Str, Dot, Identifier.
+        assert_eq!(kinds("'hi'.len"), vec![Str, Dot, Identifier, Eof]);
+    }
+
+    #[test]
+    fn unterminated_string_is_error_at_opening_quote() {
+        // No closing quote before end of input: the opening quote is the failure site.
+        let err = lex("'abc").unwrap_err();
+        assert_eq!((err.line, err.col), (1, 1));
+        assert!(lex("\"abc").is_err());
+        assert!(lex("f'abc").is_err());
+    }
+
+    #[test]
+    fn newline_does_not_close_a_string() {
+        // Single-line only for now (multiline is a later step): a newline before the closing quote
+        // leaves the literal unterminated — an error, located at the opening quote.
+        let err = lex("x = 'abc\n").unwrap_err();
+        assert_eq!((err.line, err.col), (1, 5));
     }
 
     #[test]

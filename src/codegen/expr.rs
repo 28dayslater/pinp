@@ -34,6 +34,7 @@ impl<'ctx, 'ast> CodeGen<'ctx, 'ast> {
             Node::Int(int_value) => self.int_type().const_int(*int_value as u64, true).into(),
             Node::Float(float_value) => self.float_type().const_float(*float_value).into(),
             Node::Bool(bool_value) => self.bool_type().const_int(*bool_value as u64, false).into(),
+            Node::Str(_) | Node::FStr { .. } => todo!("string codegen — step 5"),
             Node::Var(sym_id) => self.load_var(*sym_id, false)?,
             Node::Global(sym_id) => self.load_var(*sym_id, true)?,
             Node::Unary {
@@ -1586,6 +1587,7 @@ impl<'ctx, 'ast> CodeGen<'ctx, 'ast> {
             PinpType::Bool => self.bool_type().const_zero().into(),
             PinpType::Int => self.int_type().const_zero().into(),
             PinpType::Float => self.float_type().const_zero().into(),
+            PinpType::Str => todo!("string codegen — step 5"),
             PinpType::Void => unreachable!("Void has no zero value."),
             PinpType::Range => self.range_type().const_zero().into(),
             // Null pointer is the zero for array/matrix slots (must be overwritten before use).

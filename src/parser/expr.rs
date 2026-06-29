@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: MIT
 
 use super::*;
-use crate::lexer::TokenKind;
+use crate::lexer::{TokenKind, lex};
 
 // ---------------------------------------------------------------------------
 // Operator tables and binding powers
@@ -456,6 +456,20 @@ impl<'src> Parser<'src> {
                 self.advance();
                 Ok(self.ast.push(Node::Bool(false)))
             }
+            TokenKind::Str => {
+                // Strip the matching quotes; the interior is the content (single-line for now).
+                let text = self.advance().text;
+                let content = text[1..text.len() - 1].to_string();
+                let str_id = self.ast.push_string_literal(content);
+                Ok(self.ast.push(Node::Str(str_id)))
+            }
+            TokenKind::FStr => {
+                // Strip the leading `f` and the matching quotes, then split into segments.
+                let text = self.advance().text;
+                let content = &text[2..text.len() - 1];
+                let segments = self.parse_fstring_segments(content)?;
+                Ok(self.ast.push(Node::FStr { segments }))
+            }
             TokenKind::Identifier => {
                 if self.at(1) == TokenKind::LParen {
                     return self.parse_call();
@@ -625,5 +639,68 @@ impl<'src> Parser<'src> {
         }
         self.expect(TokenKind::RParen)?;
         Ok(self.ast.push(Node::Call { callee, args }))
+    }
+
+    // Split an f-string's inter-delimiter content into alternating literal/interpolation segments.
+    // A `{` opens a `{name}`/`{::name}` hole closed by the next `}`; every other character is literal
+    // text. Adjacent holes (and a leading/trailing `{`) emit no empty literal run. The content is
+    // single-line for now — multi-line auto-dedent of the literal runs is a later step.
+    fn parse_fstring_segments(
+        &mut self,
+        content: &'src str,
+    ) -> Result<Vec<FStrSegment>, ParseError> {
+        let mut segments = Vec::new();
+        let bytes = content.as_bytes(); // `{` and `}` are ASCII, so byte scanning is UTF-8-safe
+        let mut literal_start = 0;
+        let mut index = 0;
+        while index < bytes.len() {
+            match bytes[index] {
+                b'{' => {
+                    if index > literal_start {
+                        let run = content[literal_start..index].to_string();
+                        segments.push(FStrSegment::Literal(self.ast.push_string_literal(run)));
+                    }
+                    let rest = &content[index + 1..];
+                    let close = rest.find('}').ok_or_else(|| {
+                        ParseError::Unexpected("Unterminated `{` in f-string.".into())
+                    })?;
+                    let place = self.fstring_place(&rest[..close])?;
+                    segments.push(FStrSegment::Interp(place));
+                    index += 1 + close + 1; // step past the `}`
+                    literal_start = index;
+                }
+                b'}' => {
+                    return Err(ParseError::Unexpected("Unmatched `}` in f-string.".into()));
+                }
+                _ => index += 1,
+            }
+        }
+        if literal_start < bytes.len() {
+            let run = content[literal_start..].to_string();
+            segments.push(FStrSegment::Literal(self.ast.push_string_literal(run)));
+        }
+        Ok(segments)
+    }
+
+    // Resolve one f-string hole to its [`Place`]. The hole's text is re-lexed — the lexer is the
+    // single source of truth for what a name is — so it must tokenise to exactly `name` (a local) or
+    // `::name` (a global); anything else (empty, a number, an operator, two names) is a parse error.
+    fn fstring_place(&mut self, hole: &'src str) -> Result<Place, ParseError> {
+        let tokens = lex(hole).map_err(|error| ParseError::Lex(error.message))?;
+        match tokens.as_slice() {
+            [name, eof] if name.kind == TokenKind::Identifier && eof.kind == TokenKind::Eof => {
+                Ok(Place::Local(self.ast.intern(name.text)))
+            }
+            [marker, name, eof]
+                if marker.kind == TokenKind::ColonColon
+                    && name.kind == TokenKind::Identifier
+                    && eof.kind == TokenKind::Eof =>
+            {
+                Ok(Place::Global(self.ast.intern(name.text)))
+            }
+            _ => Err(ParseError::Unexpected(format!(
+                "Invalid f-string interpolation `{{{hole}}}`; expected a name."
+            ))),
+        }
     }
 }

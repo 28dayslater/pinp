@@ -39,6 +39,13 @@ impl Analyzer<'_, '_> {
                     self.name(param.name)
                 )));
             }
+            // `str` parameters are deferred this iteration (their cross-call freeing model is out of
+            // scope). The annotation parses; rejecting it here keeps `Str` from reaching codegen.
+            if param.param_type == PinpType::Str {
+                return Err(SemaError::Type(
+                    "String parameters are not yet supported.".into(),
+                ));
+            }
             frame.insert(param.name, param.param_type); // duplicate params already rejected by the parser
         }
         let old_base = self.fn_base;
@@ -284,6 +291,7 @@ impl Analyzer<'_, '_> {
             Node::Int(_) => PinpType::Int,
             Node::Float(_) => PinpType::Float,
             Node::Bool(_) => PinpType::Bool,
+            Node::Str(_) | Node::FStr { .. } => todo!("string type inference — step 4"),
             Node::Var(sym_id) => self.lookup_local(sym_id)?,
             Node::Global(sym_id) => self.lookup_global(sym_id)?,
             Node::Unary { op, operand } => {
@@ -804,6 +812,13 @@ impl Analyzer<'_, '_> {
                 "Cannot promote range variable to bool.".into(),
             ));
         }
+        // A range counter is an `i64`; it has no meaningful promotion to a string. (Independently,
+        // string values are not yet wired through codegen, so this also stops `Str` reaching it.)
+        if var_type == PinpType::Str {
+            return Err(SemaError::Type(
+                "Cannot promote range variable to string.".into(),
+            ));
+        }
         let source_type = self.analyze_expr(source)?;
         if source_type != PinpType::Range {
             return Err(SemaError::Type(
@@ -1038,7 +1053,8 @@ impl Analyzer<'_, '_> {
                 PinpType::Bool | PinpType::Int => Ok(PinpType::Int),
                 PinpType::Float => Ok(PinpType::Float),
                 // TODO: element-wise negation on arrays/matrices may be allowed for matrix algebra later.
-                PinpType::Void
+                PinpType::Str
+                | PinpType::Void
                 | PinpType::Range
                 | PinpType::Array(_, _)
                 | PinpType::Matrix(_, _, _) => Err(SemaError::Type(format!(

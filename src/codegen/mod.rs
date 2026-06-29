@@ -4,7 +4,7 @@
 //!
 //! [`Jit`] is a thin safe wrapper over the ORCv2 LLJIT C API (reached through
 //! `inkwell::llvm_sys`, no extra dependency); inkwell 0.9 ships no ORC bindings.
-//! `CodeGen` lowers a parsed [`Ast`] into an LLVM module, and [`PinpJit`] ties
+//! `CodeGen` lowers a parsed [`ProgramAst`] into an LLVM module, and [`PinpJit`] ties
 //! the two together: source string in, executed, [`PinpValue`] out. This is the
 //! harness pinp's runtime tests are written against.
 
@@ -15,7 +15,7 @@ use inkwell::module::Module;
 use inkwell::values::{BasicValueEnum, FunctionValue, PointerValue, ValueKind};
 use rustc_hash::FxHashMap;
 
-use crate::parser::{ArrayElementType, Ast, PinpType, Place, SymId, parse};
+use crate::parser::{ArrayElementType, PinpType, Place, ProgramAst, SymId, parse};
 use crate::sema::analyze;
 
 mod expr;
@@ -39,7 +39,7 @@ const ENTRY: &str = "__pinp_main";
 // Code generator
 // ---------------------------------------------------------------------------
 
-/// Lowers a parsed [`Ast`] into an LLVM module. Every pinp function becomes an
+/// Lowers a parsed [`ProgramAst`] into an LLVM module. Every pinp function becomes an
 /// LLVM function, top-level globals become module globals, and the top-level
 /// statements are emitted into an `ENTRY` function whose return value is the
 /// program's final expression.
@@ -47,7 +47,7 @@ struct CodeGen<'ctx, 'ast> {
     context: &'ctx Context,
     module: Module<'ctx>,
     builder: Builder<'ctx>,
-    ast: &'ast Ast<'ast>,
+    ast: &'ast ProgramAst<'ast>,
     functions: FxHashMap<SymId, (FunctionValue<'ctx>, Vec<PinpType>, PinpType)>,
     globals: FxHashMap<SymId, (PointerValue<'ctx>, PinpType)>,
     // A stack of local scope frames mirroring sema: a function (or the entry) pushes a base frame,
@@ -161,6 +161,7 @@ impl PinpJit {
             PinpType::Bool => PinpValue::Bool(result_buf as u8 & 1 != 0),
             PinpType::Int => PinpValue::Int(result_buf as i64),
             PinpType::Float => PinpValue::Float(f64::from_bits(result_buf)),
+            PinpType::Str => todo!("string JIT result dispatch — step 5"),
             PinpType::Void => PinpValue::Void,
             PinpType::Range => unreachable!("a program cannot evaluate to a range"),
             PinpType::Matrix(elem_type, row_count, col_count) => {
