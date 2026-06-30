@@ -1627,3 +1627,12 @@ fn fstring_non_name_holes_are_errors() {
 fn fstring_stray_close_brace_is_error() {
     assert!(parse("f'}'").is_err());
 }
+
+#[test]
+fn fstring_hole_with_comment_is_error() {
+    // Re-lexing the hole must not let `#` start a comment: `f'{x#note}'` would otherwise silently
+    // interpolate `x` and swallow the rest of the hole.
+    for src in ["f'{x#note}'", "f'{ x # note }'", "f'{#}'"] {
+        assert!(parse(src).is_err(), "expected `{src}` to be rejected");
+    }
+}

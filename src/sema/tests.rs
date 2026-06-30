@@ -2509,3 +2509,414 @@ fn str_comprehension_annotation_is_rejected() {
         SemaError::Type("Cannot promote range variable to string.".into())
     );
 }
+
+// --- string inference ----------------------------------------------------------------
+
+#[test]
+fn string_literal_is_str() {
+    assert_eq!(root_type("'hi'"), PinpType::Str);
+    assert_eq!(root_type("\"hi\""), PinpType::Str);
+}
+
+#[test]
+fn fstring_is_str() {
+    assert_eq!(root_type("f'hello'"), PinpType::Str);
+    assert_eq!(
+        root_type(indoc! {"
+            x = 5
+            f'n={x}'
+        "}),
+        PinpType::Str
+    );
+}
+
+#[test]
+fn str_conditional_branches_join_to_str() {
+    assert_eq!(root_type("'a' if true else 'b'"), PinpType::Str);
+}
+
+// --- concatenation -------------------------------------------------------------------
+
+#[test]
+fn str_concat_is_str() {
+    assert_eq!(root_type("'a' + 'b'"), PinpType::Str);
+    assert_eq!(root_type("'a' + 'b' + 'c'"), PinpType::Str);
+}
+
+#[test]
+fn str_concat_autowraps_scalar_rhs() {
+    assert_eq!(root_type("'n=' + 5"), PinpType::Str);
+    assert_eq!(root_type("'x=' + 1.5"), PinpType::Str);
+    assert_eq!(root_type("'b=' + true"), PinpType::Str);
+}
+
+#[test]
+fn str_variable_concat() {
+    assert_eq!(
+        root_type(indoc! {"
+            s = 'hi'
+            s + ' there'
+        "}),
+        PinpType::Str
+    );
+}
+
+#[test]
+fn int_plus_str_is_error() {
+    assert!(matches!(sema_error("5 + 'x'"), SemaError::Type(_)));
+}
+
+#[test]
+fn str_with_non_add_operator_is_error() {
+    assert!(matches!(sema_error("'a' - 'b'"), SemaError::Type(_)));
+    assert!(matches!(sema_error("'a' * 'b'"), SemaError::Type(_)));
+}
+
+#[test]
+fn str_concat_with_aggregate_rhs_is_error() {
+    assert!(matches!(sema_error("'a' + (1..3)"), SemaError::Type(_)));
+}
+
+// --- comparisons ---------------------------------------------------------------------
+
+#[test]
+fn str_comparisons_are_bool() {
+    for op in ["==", "!=", "<", "<=", ">", ">="] {
+        assert_eq!(
+            root_type(&format!("'a' {op} 'b'")),
+            PinpType::Bool,
+            "op `{op}`"
+        );
+    }
+}
+
+#[test]
+fn str_vs_numeric_comparison_is_error() {
+    assert!(matches!(sema_error("'a' < 5"), SemaError::Type(_)));
+    assert!(matches!(sema_error("5 == 'a'"), SemaError::Type(_)));
+}
+
+// --- .len ----------------------------------------------------------------------------
+
+#[test]
+fn str_len_is_int() {
+    assert_eq!(root_type("'hi'.len"), PinpType::Int);
+    assert_eq!(root_type("('a' + 'b').len"), PinpType::Int);
+}
+
+// --- str(x) conversion ---------------------------------------------------------------
+
+#[test]
+fn str_conversion_is_str() {
+    for src in ["str(5)", "str(1.5)", "str(true)", "str('x')"] {
+        assert_eq!(root_type(src), PinpType::Str, "`{src}`");
+    }
+}
+
+#[test]
+fn str_conversion_bad_arg_is_error() {
+    assert!(matches!(sema_error("str(1..3)"), SemaError::Type(_)));
+}
+
+#[test]
+fn str_conversion_wrong_arity_is_error() {
+    assert!(matches!(sema_error("str()"), SemaError::Type(_)));
+    assert!(matches!(sema_error("str(1, 2)"), SemaError::Type(_)));
+}
+
+// --- meminfo() -----------------------------------------------------------------------
+
+#[test]
+fn meminfo_is_void() {
+    assert_eq!(root_type("meminfo()"), PinpType::Void);
+}
+
+#[test]
+fn meminfo_with_args_is_error() {
+    assert!(matches!(sema_error("meminfo(1)"), SemaError::Type(_)));
+}
+
+// --- f-string interpolation validation -----------------------------------------------
+
+#[test]
+fn fstring_scalar_and_str_holes_ok() {
+    assert_eq!(
+        root_type(indoc! {"
+            b = true
+            i = 7
+            d = 1.5
+            s = 'x'
+            f'{b} {i} {d} {s}'
+        "}),
+        PinpType::Str
+    );
+}
+
+#[test]
+fn fstring_global_hole_resolves() {
+    assert_eq!(
+        root_type(indoc! {"
+            g = 5
+            f'{::g}'
+        "}),
+        PinpType::Str
+    );
+}
+
+#[test]
+fn fstring_unknown_name_is_error() {
+    assert!(matches!(
+        sema_error("f'{nope}'"),
+        SemaError::UnknownSymbol(_)
+    ));
+}
+
+#[test]
+fn fstring_aggregate_hole_is_error() {
+    assert!(matches!(
+        sema_error(indoc! {"
+            a = [1, 2, 3]
+            f'{a}'
+        "}),
+        SemaError::Type(_)
+    ));
+}
+
+// --- rebind across str/numeric -------------------------------------------------------
+
+#[test]
+fn str_rebind_to_int_is_error() {
+    assert!(matches!(
+        sema_error(indoc! {"
+            x = 'hi'
+            x = 5
+        "}),
+        SemaError::Type(_)
+    ));
+}
+
+#[test]
+fn int_rebind_to_str_is_error() {
+    assert!(matches!(
+        sema_error(indoc! {"
+            x = 5
+            x = 'hi'
+        "}),
+        SemaError::Type(_)
+    ));
+}
+
+// --- reserved built-in names ---------------------------------------------------------
+
+#[test]
+fn cannot_define_str_function() {
+    assert!(matches!(
+        sema_error("str(x: int): int is 5"),
+        SemaError::Type(_)
+    ));
+}
+
+#[test]
+fn cannot_define_meminfo_function() {
+    assert!(matches!(
+        sema_error("meminfo(): int is 5"),
+        SemaError::Type(_)
+    ));
+}
+
+// --- str-typed aggregate elements stay deferred --------------------------------------
+
+#[test]
+fn str_array_elements_are_rejected() {
+    // `str`-typed array/matrix elements (and str comprehensions) are out of scope this iteration;
+    // each `str` element reaches `to_array_element_type`, which rejects it.
+    assert!(matches!(sema_error("['a', 'b']"), SemaError::Type(_)));
+    assert!(matches!(sema_error("[str(1), 'x']"), SemaError::Type(_)));
+    assert!(matches!(sema_error("['a'; 'b']"), SemaError::Type(_)));
+    assert!(matches!(
+        sema_error("['x' for i in 1..3]"),
+        SemaError::Type(_)
+    ));
+}
+
+// --- str member negatives ------------------------------------------------------------
+
+#[test]
+fn str_only_exposes_len() {
+    // `.len` is the one built-in member on str; ndim/rows/cols and unknown members are errors, so
+    // the member table cannot silently broaden later.
+    assert!(matches!(sema_error("'x'.ndim"), SemaError::Type(_)));
+    assert!(matches!(sema_error("'x'.rows"), SemaError::Type(_)));
+    assert!(matches!(sema_error("'x'.cols"), SemaError::Type(_)));
+    assert!(matches!(sema_error("'x'.foo"), SemaError::Type(_)));
+}
+
+// --- str through the function return / call path -------------------------------------
+
+#[test]
+fn function_can_return_str() {
+    // The return path is a distinct sema check (body-vs-declared assignability) from local inference.
+    assert_eq!(
+        root_type(indoc! {"
+            greet(): str is 'hi'
+            greet()
+        "}),
+        PinpType::Str
+    );
+}
+
+#[test]
+fn str_call_result_supports_len() {
+    assert_eq!(
+        root_type(indoc! {"
+            greet(): str is 'hi'
+            greet().len
+        "}),
+        PinpType::Int
+    );
+}
+
+#[test]
+fn function_str_return_with_non_str_body_is_error() {
+    // Body `Int` is not assignable to declared `Str`.
+    assert!(matches!(
+        sema_error("greet(): str is 1"),
+        SemaError::Type(_)
+    ));
+}
+
+#[test]
+fn function_non_str_return_with_str_body_is_error() {
+    // Body `Str` is not assignable to declared `Int`.
+    assert!(matches!(
+        sema_error("greet(): int is 'x'"),
+        SemaError::Type(_)
+    ));
+}
+
+// --- step 4b: duplicate for-binders --------------------------------------------------
+
+#[test]
+fn for_array_duplicate_binders_on_1d_is_error() {
+    // `for i, i in arr` must not silently make `i` the value and drop the index.
+    assert_eq!(
+        sema_error(indoc! {"
+            a = [10, 20, 30]
+            for i, i in a
+                i
+        "}),
+        SemaError::Type("Duplicate binder `i`.".into())
+    );
+}
+
+#[test]
+fn for_array_duplicate_binders_on_2d_is_error() {
+    // Both a repeated index binder and a value binder reusing an index name are errors.
+    assert_eq!(
+        sema_error(indoc! {"
+            m = [1, 2; 3, 4]
+            for r, r, v in m
+                v
+        "}),
+        SemaError::Type("Duplicate binder `r`.".into())
+    );
+    assert_eq!(
+        sema_error(indoc! {"
+            m = [1, 2; 3, 4]
+            for r, c, r in m
+                c
+        "}),
+        SemaError::Type("Duplicate binder `r`.".into())
+    );
+}
+
+#[test]
+fn for_array_repeated_underscore_binders_stay_allowed() {
+    // `_` is the don't-care binder: repeating it discards several positions and is not a clash.
+    analyzed(indoc! {"
+        m = [1, 2; 3, 4]
+        for _, _, v in m
+            v
+    "});
+}
+
+// --- step 4b: pin down str corner cases ----------------------------------------------
+
+#[test]
+fn str_compound_concat_is_ok() {
+    // `s += 'b'` desugars to `s = s + 'b'`, so it is ordinary concatenation.
+    assert_eq!(
+        root_type(indoc! {"
+            s = 'a'
+            s += 'b'
+            s
+        "}),
+        PinpType::Str
+    );
+}
+
+#[test]
+fn str_compound_non_add_operator_is_error() {
+    assert!(matches!(
+        sema_error(indoc! {"
+            s = 'a'
+            s *= 'b'
+        "}),
+        SemaError::Type(_)
+    ));
+    assert!(matches!(
+        sema_error(indoc! {"
+            s = 'a'
+            s -= 'b'
+        "}),
+        SemaError::Type(_)
+    ));
+    assert!(matches!(
+        sema_error(indoc! {"
+            s = 'a'
+            s ^= 'b'
+        "}),
+        SemaError::Type(_)
+    ));
+}
+
+#[test]
+fn unary_operator_on_str_is_error() {
+    assert!(matches!(sema_error("-'a'"), SemaError::Type(_)));
+    assert!(matches!(sema_error("not 'a'"), SemaError::Type(_)));
+}
+
+#[test]
+fn str_as_range_bound_is_error() {
+    assert!(matches!(sema_error("'a'..5"), SemaError::Type(_)));
+    assert!(matches!(sema_error("1..'a'"), SemaError::Type(_)));
+    assert!(matches!(sema_error("1..5:'a'"), SemaError::Type(_)));
+}
+
+#[test]
+fn for_over_str_is_error() {
+    assert!(matches!(
+        sema_error(indoc! {"
+            for c in 'abc'
+                c
+        "}),
+        SemaError::Type(_)
+    ));
+}
+
+#[test]
+fn str_comparison_chain_is_bool() {
+    // A chain desugars to `and`-joined pairwise comparisons; each pair is str-vs-str.
+    assert_eq!(root_type("'a' < 'b' < 'c'"), PinpType::Bool);
+    assert_eq!(root_type("'a' == 'a' == 'a'"), PinpType::Bool);
+}
+
+#[test]
+fn mixed_str_int_ternary_is_void() {
+    // Str joins only with Str, so mixed branches leave the `if` valueless.
+    assert_eq!(root_type("'a' if true else 5"), PinpType::Void);
+    assert_eq!(
+        sema_error("x = 'a' if true else 5"),
+        SemaError::Type("Cannot assign a void value.".into())
+    );
+}

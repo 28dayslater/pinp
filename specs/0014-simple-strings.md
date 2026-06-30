@@ -261,12 +261,36 @@ multiline + auto-dedent lands last as an isolated delta.
    the `str(x)` and `meminfo()` built-ins; f-string interpolation name resolution and its errors.
    Extensive + adversarial in-module sema tests.
 
+4b. **Review fixes** (added after a full-project review between steps 4 and 5; tests first, as
+   always):
+   - Reject duplicate binders in a multi-binder `for` (`for i, i in arr` is currently accepted
+     and the second binder silently wins). New sema check plus tests.
+   - Reject a comment inside an f-string hole: `f'{x#note}'` currently interpolates `x` because
+     the hole is re-lexed with comment skipping. Make it a parse error.
+   - Add the leak-invariant runtime test that step 1 promised but never landed: after alloc/free
+     traffic through the string runtime, `pinp_memory_info` counts must balance. Also cover
+     `concat_n` crossing the 15→16 inline/heap boundary exactly.
+   - Pin down corners that already behave correctly but have no test: `s += 'b'` (compound
+     concat), `s *= 'b'` error, unary `-`/`not` on `str`, `str` as a range bound, `for` over a
+     `str`, a chained `str` comparison (`'a' < 'b' < 'c'`), a mixed `str`/`int` ternary (joins to
+     `Void`), and `str` array elements being rejected.
+
 5. **Codegen + host return**. The `{i64,i64}` type; `emit(Str)`/`emit(FStr)`; concat with chain-
    flatten; `str(x)`; `.len`; comparisons; `meminfo()`. `PinpValue::Str`, the JIT string-return
    dispatch, and the `eval_str` helper (the host frees the returned `PinpStr`). First e2e milestone
    (`tests/strings.rs`): content, length, comparisons. **No in-JIT freeing yet** — temporaries leak
    within a run, as arrays already do. (May split into 5a literals/`.len`/return path and 5b concat/
    `str()`/f-string/comparisons if the diff is large.)
+   - **Prerequisite:** export the string runtime's symbols in `build.rs`. The `pinp_str_*` and
+     `pinp_meminfo` functions are Rust `#[no_mangle]` functions in the binary, and a Linux
+     executable does not put those in its dynamic symbol table by default — so the JIT's
+     process-symbol lookup cannot find them until each gets an `--export-dynamic-symbol` link
+     argument, like the five C `pinp_*` symbols already have.
+   - **Prerequisite:** handle allocation failure in the string runtime. `pinp_alloc` returns null
+     when memory runs out, and `make_with` currently writes through the result unchecked. A null
+     result should raise `pinp_runtime_error("Out of memory.")` instead.
+   - **Decide before implementing `str(float)`:** what NaN and infinity render as. Today's
+     `to_string` gives `"NaN"`/`"inf"`; ryu (step 8) has its own spellings. Pick one and test it.
 
 6. **Freeing model**. Deterministic free-on-scope-exit for owned `str` slots, temporary frees after
    the consuming op, and move-out for a returned `str`. Leak-check e2e via `pinp_memory_info`
@@ -282,6 +306,10 @@ multiline + auto-dedent lands last as an isolated delta.
      `runtime/string.rs` gap (~81% lines at step 2 — `pinp_meminfo`, the over-long guard behind the
      `#[ignore]`d test, and the concat paths still un-exercised). Confirm the later steps lifted it
      and add targeted tests for anything still uncovered.
+   - **TODO (decide while touching the lexer):** tabs and CRLF. Today a tab in indentation is
+     silently ignored (a tab-indented block fails with the unhelpful "Expected Indent"), and a
+     CRLF file fails with "Unexpected character `\r`". Either reject both with clear messages or
+     accept them — and test whichever we choose.
 
 8. **Float formatting via `ryu` (final optimisation).** Replace `pinp_str_from_float`'s `to_string`
    (a transient heap `String`) with `ryu::Buffer`, a stack buffer — no heap traffic, thread-safe (a
@@ -325,12 +353,21 @@ by layer:
 - Interpolating aggregates (arrays/ranges) into f-strings.
 - `str`-typed array elements.
 - **Mutable strings** (a separate future iteration). Surface is a compiler built-in
-  `mustr(initial_content, [cap: nnn])`, *not* a literal prefix like `m"content"` — chosen after
+  `mutstr(initial_content, [cap: nnn])`, *not* a literal prefix like `m"content"` — chosen after
   deliberation as cleaner and more explicit (capacity is a named argument, no new literal syntax).
   The `cap` argument also drives allocation: **no `cap` ⇒ heap-only**; a `cap` of a reasonable
   compile-time size makes the buffer **eligible for stack allocation** instead of the heap. The
   `PinpStr` layout already reserves the `is_mutable` flag (bit30 of `cap` / bit6 of `tag_len`) for
   this.
+- **Internal refactors** (out of this iteration's scope, queued for a follow-up; noted here so
+  they are not forgotten):
+  - Give built-in *functions* the same enum treatment built-in members already have: sema resolves
+    `identity`/`str`/`meminfo` by name once and records an enum, so codegen stops repeating string
+    comparisons and a new built-in cannot be added in one place but forgotten in another.
+  - Stop sema cloning every node it visits (`analyze_expr` clones whole `if` arms and argument
+    lists today); read the small id fields out instead.
+  - Extract the counted-loop scaffold in codegen into a shared helper — six emitters currently
+    hand-roll the same header/body/exit blocks.
 
 ---
 

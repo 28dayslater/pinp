@@ -483,6 +483,77 @@ mod tests {
         }
     }
 
+    // --- leak invariant ---------------------------------------------------------
+    /// Mirrors `pinp_mem_info` from src/runtime/pinp_runtime.h.
+    #[repr(C)]
+    #[derive(Default)]
+    struct MemInfo {
+        outstanding_bytes: i64,
+        allocation_count: i64,
+        free_count: i64,
+    }
+
+    fn memory_info() -> MemInfo {
+        unsafe extern "C" {
+            fn pinp_memory_info(info: *mut MemInfo);
+        }
+        let mut info = MemInfo::default();
+        unsafe { pinp_memory_info(&mut info) };
+        info
+    }
+
+    #[test]
+    fn heap_traffic_balances_through_the_shim() {
+        // Every heap constructor must be matched by its free through the shim's byte-exact
+        // bookkeeping. Deltas, not absolutes: other tests in this process share the counters
+        // (each balances its own traffic, so the window is clean at the edges).
+        let before = memory_info();
+
+        let long = make("this string is longer than fifteen bytes"); // heap
+        let left = make("0123456789"); // inline
+        let right = make("0123456789"); // inline
+        let joined = unsafe { pinp_str_concat(&left, &right) }; // 20 bytes: heap
+        let parts = [make("12345678"), make("12345678")];
+        let chained = unsafe { pinp_str_concat_n(parts.as_ptr(), parts.len()) }; // 16 bytes: heap
+
+        freed(long);
+        freed(left);
+        freed(right);
+        freed(joined);
+        for part in parts {
+            freed(part);
+        }
+        freed(chained);
+
+        let after = memory_info();
+        assert_eq!(after.allocation_count - before.allocation_count, 3);
+        assert_eq!(
+            after.allocation_count - before.allocation_count,
+            after.free_count - before.free_count
+        );
+        assert_eq!(after.outstanding_bytes, before.outstanding_bytes);
+    }
+
+    #[test]
+    fn concat_n_at_the_sso_boundary() {
+        // 7 + 8 = 15 bytes stays inline; 8 + 8 = 16 crosses to the heap.
+        let inline_parts = [make("1234567"), make("12345678")];
+        let inline_sum = unsafe { pinp_str_concat_n(inline_parts.as_ptr(), inline_parts.len()) };
+        assert!(!inline_sum.is_heap());
+        assert_eq!(inline_sum.as_bytes(), b"123456712345678");
+
+        let heap_parts = [make("12345678"), make("12345678")];
+        let heap_sum = unsafe { pinp_str_concat_n(heap_parts.as_ptr(), heap_parts.len()) };
+        assert!(heap_sum.is_heap());
+        assert_eq!(heap_sum.as_bytes(), b"1234567812345678");
+
+        for part in inline_parts.into_iter().chain(heap_parts) {
+            freed(part);
+        }
+        freed(inline_sum);
+        freed(heap_sum);
+    }
+
     // --- free resets descriptor ----------------------------------------------
     #[test]
     fn free_resets_to_empty_inline() {

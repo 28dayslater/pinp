@@ -686,6 +686,16 @@ impl<'src> Parser<'src> {
     // single source of truth for what a name is — so it must tokenise to exactly `name` (a local) or
     // `::name` (a global); anything else (empty, a number, an operator, two names) is a parse error.
     fn fstring_place(&mut self, hole: &'src str) -> Result<Place, ParseError> {
+        let invalid = || {
+            ParseError::Unexpected(format!(
+                "Invalid f-string interpolation `{{{hole}}}`; expected a name."
+            ))
+        };
+        // The lexer skips comments, so an unguarded `#` would truncate the hole instead of failing:
+        // `{x#note}` would lex to just `x` and silently interpolate it.
+        if hole.contains('#') {
+            return Err(invalid());
+        }
         let tokens = lex(hole).map_err(|error| ParseError::Lex(error.message))?;
         match tokens.as_slice() {
             [name, eof] if name.kind == TokenKind::Identifier && eof.kind == TokenKind::Eof => {
@@ -698,9 +708,7 @@ impl<'src> Parser<'src> {
             {
                 Ok(Place::Global(self.ast.intern(name.text)))
             }
-            _ => Err(ParseError::Unexpected(format!(
-                "Invalid f-string interpolation `{{{hole}}}`; expected a name."
-            ))),
+            _ => Err(invalid()),
         }
     }
 }
