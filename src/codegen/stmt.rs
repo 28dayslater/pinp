@@ -27,12 +27,32 @@ impl<'ctx, 'ast> CodeGen<'ctx, 'ast> {
                 // group. The SSA values are the temporaries; no extra slots needed.
                 let mut evaluated = Vec::with_capacity(values.len());
                 for value in values {
-                    evaluated.push((self.expect_value(*value)?, self.ast.type_of(*value)));
+                    let value_type = self.ast.type_of(*value);
+                    // A binding owns what it holds, so a string it is given must be owned — a
+                    // borrowed one (`t = s`) is copied on the way in.
+                    let evaluated_value = match value_type {
+                        PinpType::Str => self.gen_owned_str(*value)?,
+                        _ => self.expect_value(*value)?,
+                    };
+                    evaluated.push((evaluated_value, value_type));
                 }
-                for group in target_lists {
+                for (group_index, group) in target_lists.iter().enumerate() {
                     for (place, (value, value_type)) in group.iter().zip(&evaluated) {
                         let (pointer, slot_type) = self.resolve_place(*place, *value_type)?;
-                        let stored = self.promote(*value, *value_type, slot_type);
+                        // Chained `a = b = expr` stores the same value into several bindings; each
+                        // one past the first needs its own copy to own.
+                        let value = match (slot_type, group_index) {
+                            (PinpType::Str, 0) => *value,
+                            (PinpType::Str, _) => self.copy_str(*value)?,
+                            _ => *value,
+                        };
+                        // The slot's previous string is dead the moment it is overwritten. This runs
+                        // after the right-hand side is evaluated, so `s = s + 'x'` still reads the
+                        // old value before it goes.
+                        if slot_type == PinpType::Str {
+                            self.free_str_slot(pointer)?;
+                        }
+                        let stored = self.promote(value, *value_type, slot_type);
                         self.builder.build_store(pointer, stored).map_err(err)?;
                     }
                 }
@@ -228,12 +248,19 @@ impl<'ctx, 'ast> CodeGen<'ctx, 'ast> {
     ) -> Result<Option<BasicValueEnum<'ctx>>, String> {
         self.push_scope();
         for stmt in &block.stmts {
-            self.gen_stmt(stmt)?;
+            let value = self.gen_stmt(stmt)?;
+            self.free_discarded_str(stmt, value)?;
         }
+        // A block's value outlives the block, so a string result is owned before the scope releases
+        // its bindings — otherwise `s` as the last expression would hand back freed storage.
         let result = match block.result {
+            Some(expr_id) if self.ast.type_of(expr_id) == PinpType::Str => {
+                Some(self.gen_owned_str(expr_id)?)
+            }
             Some(expr_id) => self.gen_expr(expr_id)?,
             None => None,
         };
+        self.free_scope_strings()?;
         self.pop_scope();
         Ok(result)
     }

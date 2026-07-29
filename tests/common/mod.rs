@@ -34,6 +34,28 @@ eval_as!(eval_bool -> bool = Bool);
 eval_as!(eval_array -> Vec<PinpValue> = Array);
 eval_as!(eval_str -> String = Str);
 
+/// The runtime allocator's bookkeeping, mirroring `pinp_mem_info` in src/runtime/pinp_runtime.h.
+/// Every pinp heap allocation — arrays, and now string storage — is counted here.
+#[repr(C)]
+#[derive(Default, Clone, Copy, Debug)]
+pub struct MemoryCounts {
+    pub outstanding_bytes: i64,
+    pub allocation_count: i64,
+    pub free_count: i64,
+}
+
+/// Reads the runtime's current allocation bookkeeping. The counters are process-global, so a test
+/// comparing two readings must keep other allocating tests out in between.
+pub fn memory_counts() -> MemoryCounts {
+    unsafe extern "C" {
+        fn pinp_memory_info(info: *mut MemoryCounts);
+    }
+    let mut counts = MemoryCounts::default();
+    // SAFETY: the signature matches the shim's, and the out-parameter is a live local.
+    unsafe { pinp_memory_info(&mut counts) };
+    counts
+}
+
 /// Runs `src` and unwraps a `PinpValue::Matrix`, returning `(rows, cols, elements)`.
 pub fn eval_matrix(src: &str) -> (usize, usize, Vec<PinpValue>) {
     match eval(src) {

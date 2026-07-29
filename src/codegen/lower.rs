@@ -90,7 +90,38 @@ impl<'ctx, 'ast> CodeGen<'ctx, 'ast> {
         &self,
         pinp_type: PinpType,
     ) -> Result<PointerValue<'ctx>, String> {
-        self.alloca_at_entry_type(self.basic_type(pinp_type))
+        let slot = self.alloca_at_entry_type(self.basic_type(pinp_type))?;
+        // A string slot is freed before it is overwritten and again when its scope ends, so it must
+        // start out as a valid descriptor rather than whatever the stack held. All-zero is the empty
+        // inline string, which frees to nothing.
+        if pinp_type == PinpType::Str {
+            self.store_at_entry(slot, self.zero(PinpType::Str))?;
+        }
+        Ok(slot)
+    }
+
+    /// Stores an initial value into a slot right where the slot was allocated, so the store runs
+    /// once on entry rather than every time execution reaches the code that uses it.
+    pub(super) fn store_at_entry(
+        &self,
+        slot: PointerValue<'ctx>,
+        value: BasicValueEnum<'ctx>,
+    ) -> Result<(), String> {
+        let current = self.builder.get_insert_block().expect("an active block");
+        let alloca = slot
+            .as_instruction()
+            .expect("a slot is an alloca instruction");
+        match alloca.get_next_instruction() {
+            Some(next) => self.builder.position_before(&next),
+            None => self.builder.position_at_end(
+                alloca
+                    .get_parent()
+                    .expect("an instruction belongs to a block"),
+            ),
+        }
+        self.builder.build_store(slot, value).map_err(err)?;
+        self.builder.position_at_end(current);
+        Ok(())
     }
 
     /// [`alloca_at_entry`](Self::alloca_at_entry) for an LLVM type with no pinp type of its own —
@@ -304,7 +335,8 @@ impl<'ctx, 'ast> CodeGen<'ctx, 'ast> {
         }
 
         for stmt in &func.body.stmts {
-            self.gen_stmt(stmt)?;
+            let value = self.gen_stmt(stmt)?;
+            self.free_discarded_str(stmt, value)?;
         }
 
         let result = func
@@ -313,10 +345,17 @@ impl<'ctx, 'ast> CodeGen<'ctx, 'ast> {
             .expect("a function body always ends in a result expression");
         if func.return_type == PinpType::Void {
             self.gen_expr(result)?; // side effects only
+            self.free_scope_strings()?;
             self.builder.build_return(None).map_err(err)?;
         } else {
-            let value = self.expect_value(result)?;
+            // A returned string is moved out: it is owned before the frame's own strings are
+            // released, so returning a local's value hands back a copy rather than a freed one.
+            let value = match func.return_type {
+                PinpType::Str => self.gen_owned_str(result)?,
+                _ => self.expect_value(result)?,
+            };
             let value = self.promote(value, self.ast.type_of(result), func.return_type);
+            self.free_scope_strings()?;
             self.builder.build_return(Some(&value)).map_err(err)?;
         }
         self.in_function = false;
@@ -357,12 +396,23 @@ impl<'ctx, 'ast> CodeGen<'ctx, 'ast> {
                 let value = self.gen_stmt(stmt)?;
                 if i == last {
                     result = value;
+                } else {
+                    self.free_discarded_str(stmt, value)?;
                 }
             }
         }
 
         if result_type != PinpType::Void {
             let result_value = result.expect("A non-void program must yield a value.");
+            // The program's value is moved out to the host, which frees it — so it must be owned
+            // before the top-level bindings and globals are released just below.
+            let result_value = match result_type {
+                PinpType::Str => {
+                    let owned = self.stmt_result_owns_str(self.ast.top_level.last());
+                    self.own_str(result_value, owned)?
+                }
+                _ => result_value,
+            };
             let result_ptr = entry_fn
                 .get_first_param()
                 .expect("result pointer parameter")
@@ -371,6 +421,8 @@ impl<'ctx, 'ast> CodeGen<'ctx, 'ast> {
                 .build_store(result_ptr, result_value)
                 .map_err(err)?;
         }
+        self.free_scope_strings()?;
+        self.free_global_strings()?;
         self.builder.build_return(None).map_err(err)?;
         Ok(result_type)
     }

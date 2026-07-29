@@ -364,6 +364,13 @@ by layer:
   compile-time size makes the buffer **eligible for stack allocation** instead of the heap. The
   `PinpStr` layout already reserves the `is_mutable` flag (bit30 of `cap` / bit6 of `tag_len`) for
   this.
+- **Binding a string to two names copies it, where Python and friends would share one object.**
+  Step 6's copy-on-borrow model gives every binding its own storage, so `a = b = s` and `t = s`
+  allocate a copy; sharing would need reference counting, which `PinpStr` has no counter word for
+  (only the reserved `is_mutable` bit). This is invisible today — `str` is immutable, with no
+  identity test and no way to observe the difference — but **mutable strings must settle it**: once
+  `a` can be mutated in place, whether `b` sees the change is a language-semantics decision. Revisit
+  when `mutstr` lands, not before.
 - **Internal refactors** (out of this iteration's scope, queued for a follow-up; noted here so
   they are not forgotten):
   - Give built-in *functions* the same enum treatment built-in members already have: sema resolves
