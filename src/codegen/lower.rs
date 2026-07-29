@@ -268,6 +268,7 @@ impl<'ctx, 'ast> CodeGen<'ctx, 'ast> {
             if let TopLevel::Stmt(Stmt::Assign {
                 target_lists,
                 values,
+                ..
             }) = item
             {
                 for group in target_lists {

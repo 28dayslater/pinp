@@ -2,6 +2,8 @@
 
 use rustc_hash::FxHashMap;
 
+use crate::lexer::Span;
+
 // ---------------------------------------------------------------------------
 // Types and interned ids
 // ---------------------------------------------------------------------------
@@ -282,6 +284,10 @@ pub enum Place {
 pub enum Stmt {
     Assign {
         target_lists: Vec<Vec<Place>>,
+        /// Where each target was written, shaped exactly like `target_lists`. A `Place` is a bare
+        /// symbol id with nowhere to hang a position, so a finding about a binding — an unused one,
+        /// or a store nothing reads — takes its span from here.
+        target_spans: Vec<Vec<Span>>,
         values: Vec<ExprId>,
     },
     Expr(ExprId),
@@ -380,6 +386,12 @@ pub struct ProgramAst<'src> {
     /// Parallel to `nodes`. For `Node::Member` expressions, sema writes the resolved
     /// [`BuiltinMember`] here; all other nodes remain `None`.
     pub builtin_members: Vec<Option<BuiltinMember>>,
+    /// Parallel to `nodes`: where each node came from in the source.
+    ///
+    /// Only the kinds a diagnostic currently points at are recorded — `Node::Var` and
+    /// `Node::Global`, the two a finding names — and every other node holds [`Span::UNKNOWN`].
+    /// Filling the rest is mechanical and needs no redesign; see KI in dev-docs.
+    pub spans: Vec<Span>,
     pub top_level: Vec<TopLevel>,
     pub names: Vec<&'src str>,
     /// Owned content of every string and f-string-literal run, addressed by [`StrId`].
@@ -401,11 +413,22 @@ impl<'src> ProgramAst<'src> {
     /// Pushes a node, returning its id. Type and built-in member are left as placeholders for
     /// sema to fill.
     pub(super) fn push(&mut self, node: Node) -> ExprId {
+        self.push_spanned(node, Span::UNKNOWN)
+    }
+
+    /// [`push`](Self::push) for a node whose source position is known.
+    pub(super) fn push_spanned(&mut self, node: Node, span: Span) -> ExprId {
         let expr_id = ExprId(self.nodes.len() as u32);
         self.nodes.push(node);
         self.types.push(PinpType::Void);
         self.builtin_members.push(None);
+        self.spans.push(span);
         expr_id
+    }
+
+    /// Where `expr_id` came from in the source, or [`Span::UNKNOWN`] if it was not recorded.
+    pub fn span_of(&self, expr_id: ExprId) -> Span {
+        self.spans[expr_id.value()]
     }
 
     /// Records the resolved [`BuiltinMember`] kind for a `Node::Member` expression. Called by

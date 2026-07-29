@@ -22,6 +22,7 @@ impl<'ctx, 'ast> CodeGen<'ctx, 'ast> {
             Stmt::Assign {
                 target_lists,
                 values,
+                ..
             } => {
                 // Evaluate every value first (so `a, b = b, a` swaps), then store to each target
                 // group. The SSA values are the temporaries; no extra slots needed.

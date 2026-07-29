@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: MIT
 
 use super::*;
+use crate::lexer::Span;
 use indoc::indoc;
 
 fn parse_ok(src: &str) -> ProgramAst<'_> {
@@ -335,6 +336,7 @@ fn compound_assign_desugars_to_read_and_op() {
     let TopLevel::Stmt(Stmt::Assign {
         target_lists,
         values,
+        ..
     }) = ast.top_level.last().unwrap()
     else {
         panic!("Expected a desugared local assignment.");
@@ -358,6 +360,7 @@ fn last_assign<'a>(ast: &'a ProgramAst) -> (&'a Vec<Vec<Place>>, &'a Vec<ExprId>
     let TopLevel::Stmt(Stmt::Assign {
         target_lists,
         values,
+        ..
     }) = ast.top_level.last().unwrap()
     else {
         panic!("Expected an assignment statement.");
@@ -1775,4 +1778,97 @@ fn a_multiline_fstring_dedents_before_splitting() {
 fn a_hole_may_not_span_lines() {
     // A newline inside `{…}` cannot be part of a name, so the hole is not a name.
     assert!(parse("f'{a\nb}'").is_err());
+}
+
+// --- source spans --------------------------------------------------------------------
+//
+// Spans are recorded for the node kinds a diagnostic points at — `Node::Var` and `Node::Global` —
+// and everything else carries `Span::UNKNOWN` for now (a deliberate one-day compromise, see
+// specs/0015-static-analyses-start.md). Assignment targets take their span from the expression they
+// were parsed as, so they come along for free.
+
+#[test]
+fn variable_reads_carry_their_span() {
+    let src = "abc + xy";
+    let ast = parse_ok(src);
+    let spans: Vec<&str> = ast
+        .nodes
+        .iter()
+        .enumerate()
+        .filter(|(_, node)| matches!(node, Node::Var(_)))
+        .map(|(index, _)| ast.spans[index].text(src))
+        .collect();
+    assert_eq!(spans, vec!["abc", "xy"]);
+}
+
+#[test]
+fn a_global_span_covers_the_marker() {
+    // `::g` is how the binding is written, so that is what a finding should underline.
+    let src = "g = 1\nf(): int is ::g";
+    let ast = parse_ok(src);
+    let span = ast
+        .nodes
+        .iter()
+        .position(|node| matches!(node, Node::Global(_)))
+        .map(|index| ast.spans[index])
+        .expect("a global read");
+    assert_eq!(span.text(src), "::g");
+}
+
+#[test]
+fn assignment_targets_carry_spans() {
+    let src = "alpha, beta = 1, 2";
+    let ast = parse_ok(src);
+    let TopLevel::Stmt(Stmt::Assign { target_spans, .. }) = ast.top_level.last().unwrap() else {
+        panic!("Expected an assignment.");
+    };
+    let texts: Vec<&str> = target_spans[0].iter().map(|span| span.text(src)).collect();
+    assert_eq!(texts, vec!["alpha", "beta"]);
+}
+
+#[test]
+fn chained_assignment_records_a_span_per_group() {
+    let src = "a = b = 1";
+    let ast = parse_ok(src);
+    let TopLevel::Stmt(Stmt::Assign {
+        target_lists,
+        target_spans,
+        ..
+    }) = ast.top_level.last().unwrap()
+    else {
+        panic!("Expected an assignment.");
+    };
+    assert_eq!(target_spans.len(), target_lists.len());
+    assert_eq!(target_spans[0][0].text(src), "a");
+    assert_eq!(target_spans[1][0].text(src), "b");
+}
+
+#[test]
+fn compound_assignment_keeps_the_target_span() {
+    // `s += 1` desugars to `s = s + 1`; the name is written once, so both the target and the
+    // synthetic read point at it.
+    let src = "s = 1\ns += 2";
+    let ast = parse_ok(src);
+    let TopLevel::Stmt(Stmt::Assign { target_spans, .. }) = ast.top_level.last().unwrap() else {
+        panic!("Expected an assignment.");
+    };
+    assert_eq!(target_spans[0][0].text(src), "s");
+    assert_eq!(
+        target_spans[0][0],
+        Span::new(6, 7),
+        "the second `s`, not the first"
+    );
+}
+
+#[test]
+fn unrecorded_node_kinds_are_unknown_for_now() {
+    // Documents the compromise: an integer literal has no span yet, and reports as unknown rather
+    // than pointing at the start of the file.
+    let ast = parse_ok("41 + 1");
+    let literal = ast
+        .nodes
+        .iter()
+        .position(|node| matches!(node, Node::Int(41)))
+        .expect("the literal");
+    assert!(ast.spans[literal].is_unknown());
 }

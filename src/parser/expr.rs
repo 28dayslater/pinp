@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: MIT
 
 use super::*;
-use crate::lexer::{TokenKind, lex};
+use crate::lexer::{Span, TokenKind, lex};
 
 // ---------------------------------------------------------------------------
 // Operator tables and binding powers
@@ -474,15 +474,18 @@ impl<'src> Parser<'src> {
                 if self.at(1) == TokenKind::LParen {
                     return self.parse_call();
                 }
-                let name = self.advance().text;
+                let name_token = self.advance();
+                let (name, span) = (name_token.text, name_token.span());
                 let sym_id = self.ast.intern(name);
-                Ok(self.ast.push(Node::Var(sym_id)))
+                Ok(self.ast.push_spanned(Node::Var(sym_id), span))
             }
             TokenKind::ColonColon => {
-                self.advance(); // '::'
-                let name = self.expect(TokenKind::Identifier)?.text;
-                let sym_id = self.ast.intern(name);
-                Ok(self.ast.push(Node::Global(sym_id)))
+                let marker = self.advance(); // '::'
+                let name_token = self.expect(TokenKind::Identifier)?;
+                // The span covers `::name`, which is how the binding is written.
+                let span = Span::new(marker.start, name_token.span().end);
+                let sym_id = self.ast.intern(name_token.text);
+                Ok(self.ast.push_spanned(Node::Global(sym_id), span))
             }
             // `if` opening an expression is the block form; the one-line ternary is reached from
             // the `parse_expr` loop instead, after a left operand.

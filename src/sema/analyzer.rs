@@ -122,6 +122,7 @@ impl Analyzer<'_, '_> {
             Stmt::Assign {
                 target_lists,
                 values,
+                ..
             } => {
                 // Type every value first (rejecting `Void`), then assign positionally to each target
                 // group — arity (group length == value count) is guaranteed by the parser.

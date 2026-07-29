@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: MIT
 
 use super::*;
-use crate::lexer::TokenKind;
+use crate::lexer::{Span, TokenKind};
 use rustc_hash::FxHashSet;
 
 // The binary operator behind a compound-assignment token (`+=` -> `Add`, …). Plain `=` is not a
@@ -416,11 +416,14 @@ impl<'src> Parser<'src> {
         ) -> Result<Stmt, ParseError> {
             let values = groups.pop().expect("the first group is always present");
             let mut target_lists = Vec::with_capacity(groups.len());
+            let mut target_spans = Vec::with_capacity(groups.len());
             for group in groups {
                 // Convert each target before the arity check, so a non-place like `1, 2 = 3` reports
                 // the more specific "invalid target" rather than an arity mismatch.
                 let mut targets = Vec::with_capacity(group.len());
+                let mut spans = Vec::with_capacity(group.len());
                 for expr_id in group {
+                    spans.push(parser.ast.span_of(expr_id));
                     targets.push(parser.expr_as_place(expr_id)?);
                 }
                 if targets.len() != values.len() {
@@ -431,9 +434,11 @@ impl<'src> Parser<'src> {
                     )));
                 }
                 target_lists.push(targets);
+                target_spans.push(spans);
             }
             Ok(Stmt::Assign {
                 target_lists,
+                target_spans,
                 values,
             })
         }
@@ -488,9 +493,10 @@ impl<'src> Parser<'src> {
                 });
             }
             let place = self.expr_as_place(first_group[0])?;
+            let place_span = self.ast.span_of(first_group[0]);
             self.advance(); // the compound operator
             let rhs = self.parse_expr(0)?;
-            return Ok(self.finish_compound(place, op, rhs));
+            return Ok(self.finish_compound(place, place_span, op, rhs));
         }
 
         // `arr[idx] = value` — 1D indexed assignment.
@@ -623,11 +629,14 @@ impl<'src> Parser<'src> {
     }
 
     // Desugar `place <op>= e` into `place = place <op> e` — the single-target, single-value shape.
-    fn finish_compound(&mut self, place: Place, op: BinOp, rhs: ExprId) -> Stmt {
-        let read = self.ast.push(Node::from(place));
+    fn finish_compound(&mut self, place: Place, place_span: Span, op: BinOp, rhs: ExprId) -> Stmt {
+        // The synthetic read of `place` carries the target's own span: it is the same name, written
+        // once in the source and appearing twice after the desugaring.
+        let read = self.ast.push_spanned(Node::from(place), place_span);
         let combined = self.ast.push(Node::Bin { op, lhs: read, rhs });
         Stmt::Assign {
             target_lists: vec![vec![place]],
+            target_spans: vec![vec![place_span]],
             values: vec![combined],
         }
     }

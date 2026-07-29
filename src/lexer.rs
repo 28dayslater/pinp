@@ -219,14 +219,83 @@ pub enum TokenKind {
     Eof,
 }
 
+/// A half-open byte range into the source.
+///
+/// Byte offsets rather than line/column: the parser copies them straight off a token with no
+/// arithmetic, and [`LineIndex`] resolves them for display only when something is actually
+/// reported. A span is what lets a diagnostic point at source text.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Span {
+    pub start: u32,
+    pub end: u32,
+}
+
+impl Span {
+    /// The span of something whose position was never recorded. Analyses report it as "no
+    /// position" rather than pointing at the start of the file.
+    ///
+    /// It is indistinguishable from a genuine empty span at offset 0, which no real token has.
+    pub const UNKNOWN: Span = Span { start: 0, end: 0 };
+
+    pub fn new(start: u32, end: u32) -> Span {
+        Span { start, end }
+    }
+
+    pub fn is_unknown(&self) -> bool {
+        self.start == 0 && self.end == 0
+    }
+
+    /// The source text this span covers.
+    pub fn text<'src>(&self, src: &'src str) -> &'src str {
+        &src[self.start as usize..self.end as usize]
+    }
+}
+
+/// Line-start offsets for one source, so a byte offset resolves to a 1-based line and column.
+///
+/// Built once and queried many times: the lexer uses it to place errors, and the analysis layer to
+/// render diagnostics.
+pub struct LineIndex {
+    line_starts: Vec<u32>,
+}
+
+impl LineIndex {
+    pub fn new(src: &str) -> LineIndex {
+        let mut line_starts = vec![0];
+        for (index, byte) in src.bytes().enumerate() {
+            if byte == b'\n' {
+                line_starts.push(index as u32 + 1);
+            }
+        }
+        LineIndex { line_starts }
+    }
+
+    /// The 1-based line and column containing `offset`. A column counts bytes, not characters.
+    pub fn locate(&self, offset: u32) -> (u32, u32) {
+        let line = self.line_starts.partition_point(|&start| start <= offset) - 1;
+        (line as u32 + 1, offset - self.line_starts[line] + 1)
+    }
+}
+
 /// A lexical token: its [`TokenKind`], the `text` it spans (a slice of the source, empty for
-/// synthetic layout tokens), and the 1-based `line`/`col` of its start for diagnostics.
+/// synthetic layout tokens), the byte offset it starts at, and the 1-based `line`/`col` of that
+/// start for diagnostics.
 #[derive(Debug, Clone, PartialEq)]
 pub struct Token<'src> {
     pub kind: TokenKind,
     pub text: &'src str,
+    /// Byte offset of the token's first character. Synthetic layout tokens carry the offset of the
+    /// position they were manufactured at.
+    pub start: u32,
     pub line: u32,
     pub col: u32,
+}
+
+impl Token<'_> {
+    /// The token's source range.
+    pub fn span(&self) -> Span {
+        Span::new(self.start, self.start + self.text.len() as u32)
+    }
 }
 
 /// A lexing failure: a [`message`](Self::message) plus the 1-based `line`/`col` where it occurred.
@@ -248,11 +317,8 @@ pub struct LexError {
 // `Newline` plus a run of `Dedent`s, and EOF synthesises trailing `Dedent`s/`Eof`
 // that have no source token.
 pub fn lex(src: &str) -> Result<Vec<Token<'_>>, LexError> {
-    let line_starts = line_starts(src);
-    let locate = |offset: usize| -> (u32, u32) {
-        let line = line_starts.partition_point(|&start| start <= offset) - 1;
-        (line as u32 + 1, (offset - line_starts[line]) as u32 + 1)
-    };
+    let line_index = LineIndex::new(src);
+    let locate = |offset: usize| -> (u32, u32) { line_index.locate(offset as u32) };
 
     let mut out = Vec::new();
     let mut indents = vec![0];
@@ -260,7 +326,7 @@ pub fn lex(src: &str) -> Result<Vec<Token<'_>>, LexError> {
     // A newline is not turned into tokens the moment it is seen; it waits here until a line with
     // real content follows. Blank and comment-only lines keep overwriting this record, so they
     // collapse away and only the newline before a content line survives — with that line's indent.
-    let mut pending_newline: Option<(usize, u32, u32)> = None;
+    let mut pending_newline: Option<(usize, u32, u32, u32)> = None;
     // Stays false until the first real token, so a content-free run at the start of the file —
     // blank or comment lines with no statement yet to terminate — leaves no leading separator.
     let mut emitted_content = false;
@@ -280,7 +346,7 @@ pub fn lex(src: &str) -> Result<Vec<Token<'_>>, LexError> {
                 // Inside `( … )` a newline is implicit line-joining: record nothing, so the
                 // indent stack only ever reacts to real block indentation.
                 if paren_depth == 0 {
-                    pending_newline = Some((indent, line, col));
+                    pending_newline = Some((indent, lexer.span().start as u32, line, col));
                 }
                 continue;
             }
@@ -372,6 +438,7 @@ pub fn lex(src: &str) -> Result<Vec<Token<'_>>, LexError> {
         out.push(Token {
             kind,
             text: token_text,
+            start: lexer.span().start as u32,
             line,
             col,
         });
@@ -384,31 +451,23 @@ pub fn lex(src: &str) -> Result<Vec<Token<'_>>, LexError> {
         flush_pending_newline(&mut out, &mut indents, &mut pending_newline)?;
     }
     let (line, col) = locate(src.len());
+    let offset = src.len() as u32;
     while indents.len() > 1 {
         indents.pop();
-        out.push(synthetic(TokenKind::Dedent, line, col));
+        out.push(synthetic(TokenKind::Dedent, offset, line, col));
     }
-    out.push(synthetic(TokenKind::Eof, line, col));
+    out.push(synthetic(TokenKind::Eof, offset, line, col));
     Ok(out)
-}
-
-fn line_starts(src: &str) -> Vec<usize> {
-    let mut starts = vec![0];
-    for (index, byte) in src.bytes().enumerate() {
-        if byte == b'\n' {
-            starts.push(index + 1);
-        }
-    }
-    starts
 }
 
 // Build a token the lexer manufactures itself rather than matching from source:
 // `Newline`, `Indent`, `Dedent`, `Eof`. These have no backing source slice, so `text`
 // is empty — the empty `text` is what distinguishes them from lexed tokens.
-fn synthetic(kind: TokenKind, line: u32, col: u32) -> Token<'static> {
+fn synthetic(kind: TokenKind, start: u32, line: u32, col: u32) -> Token<'static> {
     Token {
         kind,
         text: "",
+        start,
         line,
         col,
     }
@@ -419,11 +478,11 @@ fn synthetic(kind: TokenKind, line: u32, col: u32) -> Token<'static> {
 fn flush_pending_newline(
     out: &mut Vec<Token<'_>>,
     indents: &mut Vec<usize>,
-    pending: &mut Option<(usize, u32, u32)>,
+    pending: &mut Option<(usize, u32, u32, u32)>,
 ) -> Result<(), LexError> {
-    if let Some((indent, line, col)) = pending.take() {
-        out.push(synthetic(TokenKind::Newline, line, col));
-        emit_indent(out, indents, indent, line, col)?;
+    if let Some((indent, offset, line, col)) = pending.take() {
+        out.push(synthetic(TokenKind::Newline, offset, line, col));
+        emit_indent(out, indents, indent, offset, line, col)?;
     }
     Ok(())
 }
@@ -432,17 +491,18 @@ fn emit_indent(
     out: &mut Vec<Token<'_>>,
     indents: &mut Vec<usize>,
     indent: usize,
+    offset: u32,
     line: u32,
     col: u32,
 ) -> Result<(), LexError> {
     let top = *indents.last().unwrap();
     if indent > top {
         indents.push(indent);
-        out.push(synthetic(TokenKind::Indent, line, col));
+        out.push(synthetic(TokenKind::Indent, offset, line, col));
     } else if indent < top {
         while indent < *indents.last().unwrap() {
             indents.pop();
-            out.push(synthetic(TokenKind::Dedent, line, col));
+            out.push(synthetic(TokenKind::Dedent, offset, line, col));
         }
         if *indents.last().unwrap() != indent {
             return Err(LexError {
@@ -819,6 +879,62 @@ mod tests {
         assert_eq!((err.line, err.col), (1, 1));
         assert!(lex("\"abc").is_err());
         assert!(lex("f'abc").is_err());
+    }
+
+    // ── spans and line resolution ───────────────────────────────────────────
+
+    #[test]
+    fn a_token_records_where_it_starts() {
+        let src = "abc = 42";
+        let tokens = lex(src).unwrap();
+        assert_eq!(tokens[0].span().text(src), "abc");
+        assert_eq!(tokens[1].span().text(src), "=");
+        assert_eq!(tokens[2].span().text(src), "42");
+    }
+
+    #[test]
+    fn a_span_covers_a_whole_multiline_literal() {
+        // The span is a byte range, so a token spanning lines needs no special handling.
+        let src = "x = 'one\ntwo'";
+        let literal = lex(src)
+            .unwrap()
+            .into_iter()
+            .find(|token| token.kind == TokenKind::Str)
+            .unwrap();
+        assert_eq!(literal.span().text(src), "'one\ntwo'");
+    }
+
+    #[test]
+    fn line_index_resolves_offsets() {
+        let src = "ab\ncde\n\nf";
+        let index = LineIndex::new(src);
+        assert_eq!(index.locate(0), (1, 1), "first byte");
+        assert_eq!(index.locate(1), (1, 2));
+        assert_eq!(index.locate(3), (2, 1), "first byte of a line");
+        assert_eq!(index.locate(5), (2, 3));
+        assert_eq!(index.locate(7), (3, 1), "an empty line");
+        assert_eq!(index.locate(8), (4, 1));
+        assert_eq!(
+            index.locate(src.len() as u32),
+            (4, 2),
+            "one past the end, where EOF is reported"
+        );
+    }
+
+    #[test]
+    fn line_index_agrees_with_reported_error_positions() {
+        // The lexer places its errors through the same index, so the two can never drift.
+        let src = "f() is\n\tx = 1\n";
+        let error = lex(src).unwrap_err();
+        let index = LineIndex::new(src);
+        let tab_offset = src.find('\t').unwrap() as u32;
+        assert_eq!((error.line, error.col), index.locate(tab_offset));
+    }
+
+    #[test]
+    fn an_unknown_span_is_recognisable() {
+        assert!(Span::UNKNOWN.is_unknown());
+        assert!(!Span::new(0, 1).is_unknown());
     }
 
     // ── multiline string literals ───────────────────────────────────────────
