@@ -289,8 +289,11 @@ multiline + auto-dedent lands last as an isolated delta.
    - **Prerequisite:** handle allocation failure in the string runtime. `pinp_alloc` returns null
      when memory runs out, and `make_with` currently writes through the result unchecked. A null
      result should raise `pinp_runtime_error("Out of memory.")` instead.
-   - **Decide before implementing `str(float)`:** what NaN and infinity render as. Today's
-     `to_string` gives `"NaN"`/`"inf"`; ryu (step 8) has its own spellings. Pick one and test it.
+   - **Decided — `str(float)` uses ryu's spelling throughout.** ryu and `to_string` agree exactly on
+     the non-finite cases (`"NaN"`, `"inf"`, `"-inf"`, and no sign on a negative NaN), so there was
+     nothing to trade off there; they differ only on finite values. Rather than write float
+     expectations against `to_string` and rewrite them in step 8, `pinp_str_from_float` moved to ryu
+     up front — step 8 is therefore already done (see below).
 
 6. **Freeing model**. Deterministic free-on-scope-exit for owned `str` slots, temporary frees after
    the consuming op, and move-out for a returned `str`. Leak-check e2e via `pinp_memory_info`
@@ -311,7 +314,9 @@ multiline + auto-dedent lands last as an isolated delta.
      CRLF file fails with "Unexpected character `\r`". Either reject both with clear messages or
      accept them — and test whichever we choose.
 
-8. **Float formatting via `ryu` (final optimisation).** Replace `pinp_str_from_float`'s `to_string`
+8. **Float formatting via `ryu`.** *(Done — pulled forward to step 4b, ahead of the first float
+   expectations in step 5, once the spelling question above was settled.)* Replace
+   `pinp_str_from_float`'s `to_string`
    (a transient heap `String`) with `ryu::Buffer`, a stack buffer — no heap traffic, thread-safe (a
    per-call local), and stack-bounded because ryu uses scientific notation for extreme magnitudes.
    This is a *deliberate format change*: ryu renders `2.0` (not std's `2`) and `1e300`-style

@@ -115,6 +115,14 @@ fn make_with(total: usize, write: impl FnOnce(&mut [u8])) -> PinpStr {
             unsafe { pinp_runtime_error(TOO_LONG.as_ptr()) };
         }
         let ptr = unsafe { pinp_alloc(total) };
+        // NOTE (deliberately untested): reaching this needs `pinp_alloc` to fail, and it cannot be
+        // provoked from a test — the guard above caps a request at 1 GiB, which an overcommitting
+        // Linux always grants. Faking it would mean an injection point in the allocator, which is
+        // not worth carrying. Don't spend time trying to cover this line.
+        if ptr.is_null() {
+            const OUT_OF_MEMORY: &CStr = c"Out of memory.";
+            unsafe { pinp_runtime_error(OUT_OF_MEMORY.as_ptr()) };
+        }
         let dst = unsafe { std::slice::from_raw_parts_mut(ptr, total) };
         write(dst);
         PinpStr {
@@ -271,11 +279,16 @@ pub unsafe extern "C" fn pinp_str_from_int(n: i64) -> PinpStr {
 
 /// Formats an `f64` as its shortest round-tripping decimal string.
 ///
+/// Uses ryu rather than [`f64::to_string`]: it writes into a stack buffer (no transient heap
+/// allocation), and it renders a whole float as `2.0` rather than `2`, so a float always reads as
+/// one. Extreme magnitudes come out in scientific notation, which is what bounds the buffer.
+///
 /// # Safety
 /// Always safe to call; `unsafe` only for ABI uniformity with the rest of the surface.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn pinp_str_from_float(d: f64) -> PinpStr {
-    make_from(d.to_string().as_bytes())
+    // `format` (not `format_finite`) is the branch that spells NaN and the infinities.
+    make_from(ryu::Buffer::new().format(d).as_bytes())
 }
 
 /// Prints mimalloc's allocation statistics to stderr (the `meminfo()` diagnostic built-in).
@@ -476,7 +489,17 @@ mod tests {
     }
     #[test]
     fn from_float_round_trips_shortest() {
-        for (d, want) in [(1.5f64, "1.5"), (2.0, "2"), (-0.25, "-0.25")] {
+        // ryu's spelling: a whole float keeps its `.0`, and huge magnitudes go scientific.
+        for (d, want) in [
+            (1.5f64, "1.5"),
+            (2.0, "2.0"),
+            (-0.25, "-0.25"),
+            (-0.0, "-0.0"),
+            (1e300, "1e300"),
+            (f64::NAN, "NaN"),
+            (f64::INFINITY, "inf"),
+            (f64::NEG_INFINITY, "-inf"),
+        ] {
             let s = unsafe { pinp_str_from_float(d) };
             assert_eq!(s.as_bytes(), want.as_bytes());
             freed(s);

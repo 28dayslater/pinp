@@ -17,3 +17,4 @@ indoc = "2.0.7"
 logos = "0.16.1"
 rustc-hash = "2.1.2"
 inkwell = { version = "0.9", features = ["llvm22-1"], optional = true }
+ryu = "1.0.23"

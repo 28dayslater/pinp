@@ -71,11 +71,33 @@ impl<'ctx, 'ast> CodeGen<'ctx, 'ast> {
             .find_map(|frame| frame.get(&sym).copied())
     }
 
+    /// The slot+type a name resolves to: `::name` is always a global, while a bare name is the
+    /// nearest enclosing local, falling back to a global at the top level (where top-level bindings
+    /// *are* module globals).
+    pub(super) fn var_slot(&self, sym_id: SymId, global: bool) -> (PointerValue<'ctx>, PinpType) {
+        if global {
+            self.globals[&sym_id]
+        } else if let Some(slot) = self.find_local(sym_id) {
+            slot
+        } else {
+            self.globals[&sym_id]
+        }
+    }
+
     /// Allocates a slot in the current function's entry block (not at the live insert point), so the
     /// alloca dominates every use and is not re-run — growing the stack — inside a loop body.
     pub(super) fn alloca_at_entry(
         &self,
         pinp_type: PinpType,
+    ) -> Result<PointerValue<'ctx>, String> {
+        self.alloca_at_entry_type(self.basic_type(pinp_type))
+    }
+
+    /// [`alloca_at_entry`](Self::alloca_at_entry) for an LLVM type with no pinp type of its own —
+    /// the array of `PinpStr`s a concatenation gathers its parts into, for instance.
+    pub(super) fn alloca_at_entry_type(
+        &self,
+        llvm_type: impl BasicType<'ctx>,
     ) -> Result<PointerValue<'ctx>, String> {
         let current = self.builder.get_insert_block().expect("an active block");
         let entry = current
@@ -87,10 +109,7 @@ impl<'ctx, 'ast> CodeGen<'ctx, 'ast> {
             Some(first) => self.builder.position_before(&first),
             None => self.builder.position_at_end(entry),
         }
-        let slot = self
-            .builder
-            .build_alloca(self.basic_type(pinp_type), "local")
-            .map_err(err)?;
+        let slot = self.builder.build_alloca(llvm_type, "local").map_err(err)?;
         self.builder.position_at_end(current);
         Ok(slot)
     }
@@ -114,6 +133,20 @@ impl<'ctx, 'ast> CodeGen<'ctx, 'ast> {
         self.context.bool_type() // i1
     }
 
+    /// The LLVM opaque pointer, used for every address the backend passes around.
+    pub(super) fn ptr_type(&self) -> inkwell::types::PointerType<'ctx> {
+        self.context.ptr_type(AddressSpace::default())
+    }
+
+    /// The LLVM type of a `PinpStr`: two INTEGER eightbytes, matching the runtime's 16-byte wire
+    /// struct. The shape is load-bearing, not cosmetic — `{ i64, i64 }` is what the SysV ABI
+    /// returns in `rax:rdx`, whereas the equally 16-byte `[16 x i8]` classifies as MEMORY and would
+    /// be returned through a hidden pointer the runtime does not expect.
+    pub(super) fn str_type(&self) -> StructType<'ctx> {
+        let int = self.int_type().into();
+        self.context.struct_type(&[int, int], false)
+    }
+
     // A range value is the aggregate `{ start, stop, step, inclusive }`: three `i64`s and an `i1`.
     // The operator's direction/inclusivity is baked into these fields at construction, so iteration
     // and membership read a uniform shape.
@@ -129,7 +162,7 @@ impl<'ctx, 'ast> CodeGen<'ctx, 'ast> {
             PinpType::Bool => self.bool_type().into(),
             PinpType::Int => self.int_type().into(),
             PinpType::Float => self.float_type().into(),
-            PinpType::Str => todo!("string codegen — step 5"),
+            PinpType::Str => self.str_type().into(),
             PinpType::Void => unreachable!("Void is not a storable value type."),
             PinpType::Range => self.range_type().into(),
             // Array and matrix variables hold a heap pointer (opaque ptr, 64-bit on all targets).

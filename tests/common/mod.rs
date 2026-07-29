@@ -32,6 +32,7 @@ eval_as!(eval_int -> i64 = Int);
 eval_as!(eval_float -> f64 = Float);
 eval_as!(eval_bool -> bool = Bool);
 eval_as!(eval_array -> Vec<PinpValue> = Array);
+eval_as!(eval_str -> String = Str);
 
 /// Runs `src` and unwraps a `PinpValue::Matrix`, returning `(rows, cols, elements)`.
 pub fn eval_matrix(src: &str) -> (usize, usize, Vec<PinpValue>) {

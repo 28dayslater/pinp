@@ -16,12 +16,14 @@ use inkwell::values::{BasicValueEnum, FunctionValue, PointerValue, ValueKind};
 use rustc_hash::FxHashMap;
 
 use crate::parser::{ArrayElementType, PinpType, Place, ProgramAst, SymId, parse};
+use crate::runtime::string::{PinpStr, pinp_str_free};
 use crate::sema::analyze;
 
 mod expr;
 mod jit;
 mod lower;
 mod stmt;
+mod string;
 
 #[cfg(test)]
 mod tests;
@@ -89,6 +91,10 @@ pub enum PinpValue {
     Bool(bool),
     Int(i64),
     Float(f64),
+    /// Content of a `str` result, copied out of the program's `PinpStr` before it is freed. pinp
+    /// strings are byte strings (ASCII by design, any other byte carried opaquely), so content that
+    /// is not valid UTF-8 arrives with the usual replacement characters rather than failing.
+    Str(String),
     Void,
     Array(Vec<PinpValue>),
     Matrix {
@@ -142,10 +148,11 @@ impl PinpJit {
 
         // SAFETY: the entry is always `void (*)(void*)` now — the uniform out-pointer ABI.
         let entry: unsafe extern "C" fn(*mut u8) = unsafe { self.jit.lookup(ENTRY)? };
-        // Use `u64` (not `[u8; 8]`) so the buffer has 8-byte alignment. LLVM emits `align 8`
-        // stores for i64/f64 and pointer-sized values; a misaligned target is UB in LLVM's model.
-        let mut result_buf: u64 = 0;
-        let result_ptr = (&raw mut result_buf).cast::<u8>();
+        // Use `u64`s (not bytes) so the buffer has 8-byte alignment. LLVM emits `align 8` stores
+        // for i64/f64 and pointer-sized values; a misaligned target is UB in LLVM's model. Two of
+        // them, because the widest result is the 16-byte `PinpStr`; a scalar uses the first only.
+        let mut result_buf: [u64; 2] = [0; 2];
+        let result_ptr = result_buf.as_mut_ptr().cast::<u8>();
         let mut error: *const std::ffi::c_char = std::ptr::null();
 
         unsafe { pinp_run(entry, result_ptr, &mut error) };
@@ -158,14 +165,24 @@ impl PinpJit {
         }
 
         Ok(match self.result_type {
-            PinpType::Bool => PinpValue::Bool(result_buf as u8 & 1 != 0),
-            PinpType::Int => PinpValue::Int(result_buf as i64),
-            PinpType::Float => PinpValue::Float(f64::from_bits(result_buf)),
-            PinpType::Str => todo!("string JIT result dispatch — step 5"),
+            PinpType::Bool => PinpValue::Bool(result_buf[0] as u8 & 1 != 0),
+            PinpType::Int => PinpValue::Int(result_buf[0] as i64),
+            PinpType::Float => PinpValue::Float(f64::from_bits(result_buf[0])),
+            // The program moved its `PinpStr` out into the buffer, so the host now owns it: copy the
+            // content, then release the storage. This is the matching free for that move-out — the
+            // one deterministic free in place before the freeing step lands.
+            PinpType::Str => {
+                // SAFETY: a `Str` program wrote a whole `PinpStr` into the 16-byte buffer.
+                let mut pinp_str = unsafe { result_ptr.cast::<PinpStr>().read() };
+                let text = String::from_utf8_lossy(pinp_str.as_bytes()).into_owned();
+                // SAFETY: the descriptor is live, owned here, and freed exactly once.
+                unsafe { pinp_str_free(&mut pinp_str) };
+                PinpValue::Str(text)
+            }
             PinpType::Void => PinpValue::Void,
             PinpType::Range => unreachable!("a program cannot evaluate to a range"),
             PinpType::Matrix(elem_type, row_count, col_count) => {
-                let matrix_ptr = result_buf as *const u8;
+                let matrix_ptr = result_buf[0] as *const u8;
                 let total = row_count * col_count;
                 let mut elements = Vec::with_capacity(total);
                 for i in 0..total {
@@ -192,7 +209,7 @@ impl PinpJit {
             }
             PinpType::Array(elem_type, n) => {
                 // The entry wrote the heap pointer into result_buf (already a `u64`).
-                let array_ptr = result_buf as *const u8;
+                let array_ptr = result_buf[0] as *const u8;
                 let mut elements = Vec::with_capacity(n);
                 for i in 0..n {
                     let element = match elem_type {
