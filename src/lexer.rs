@@ -9,9 +9,20 @@ use logos::Logos;
 // indentation logic; the comment text itself is discarded.
 #[logos(skip("#[^\n]*", allow_greedy = true))]
 enum Lexeme {
-    // newline followed by the line's leading spaces; the count drives indent/dedent
-    #[regex(r"\n *", |lex| lex.slice().len() - 1)]
+    // A newline followed by the line's leading spaces; the count drives indent/dedent. `\r\n` is a
+    // line terminator too, so a file written on Windows lexes identically — a lone `\r` matches
+    // nothing and stays an error rather than being guessed at.
+    #[regex(r"\r?\n *", |lex| {
+        let slice = lex.slice();
+        slice.len() - slice.rfind('\n').expect("a newline lexeme contains its newline") - 1
+    })]
     NewlineIndent(usize),
+
+    // A tab in a line's leading whitespace. pinp's layout is space-based, and the general
+    // whitespace skip would otherwise swallow this and leave the line looking unindented — so it is
+    // matched here (longest-match beats `NewlineIndent`) purely to be reported as an error.
+    #[regex(r"\r?\n *\t")]
+    TabIndent,
 
     // Plain integer literal; non-negative scientific notation is allowed.
     // Examples: 1234  12E3
@@ -35,6 +46,22 @@ enum Lexeme {
     // test before touching it.
     #[regex(r"([0-9]{1,3}(_[0-9]{3})+|[0-9]+)?\.([0-9]{1,3}(_[0-9]{3})+|[0-9]+)([eE][+-]?([0-9]{1,3}(_[0-9]{3})+|[0-9]+))?")]
     Float,
+
+    // A string literal between matching quotes: any run not containing its own delimiter. Single
+    // and double quotes are interchangeable, and the body **may span physical lines** — a newline
+    // between the delimiters is content, so it never reaches the indent/dedent logic. The accepted
+    // cost is that an unterminated literal matches nothing until end of input; it still surfaces as
+    // a lex error at the opening quote.
+    #[regex(r"'[^']*'")]
+    #[regex("\"[^\"]*\"")]
+    Str,
+
+    // An f-string (interpolation) literal: the `f` prefix immediately before a string body, which
+    // may span lines just the same. Longest-match keeps a bare `f` not followed by a quote an
+    // `Identifier`.
+    #[regex(r"f'[^']*'")]
+    #[regex("f\"[^\"]*\"")]
+    FStr,
 
     // Identifier: optional leading `_`s, then a letter, then letters/digits/`_`.
     // Examples: a  Fu  _BAR  _baz_baz_  _fu12_11_bar
@@ -131,6 +158,10 @@ enum Lexeme {
 pub enum TokenKind {
     Int,
     Float,
+    /// A string literal, delimiters included in `text` (the parser strips them).
+    Str,
+    /// An f-string literal (`f'…'`), prefix and delimiters included in `text`.
+    FStr,
     Identifier,
     Plus,
     Minus,
@@ -253,8 +284,19 @@ pub fn lex(src: &str) -> Result<Vec<Token<'_>>, LexError> {
                 }
                 continue;
             }
+            Lexeme::TabIndent => {
+                // The lexeme spans the newline and any spaces before the tab; report the tab itself.
+                let (tab_line, tab_col) = locate(lexer.span().end - 1);
+                return Err(LexError {
+                    message: "Tabs are not allowed in indentation.".into(),
+                    line: tab_line,
+                    col: tab_col,
+                });
+            }
             Lexeme::Int => TokenKind::Int,
             Lexeme::Float => TokenKind::Float,
+            Lexeme::Str => TokenKind::Str,
+            Lexeme::FStr => TokenKind::FStr,
             Lexeme::Identifier => match token_text {
                 "div" => TokenKind::KwDiv,
                 "mod" => TokenKind::KwMod,
@@ -701,6 +743,215 @@ mod tests {
         );
         // Existing tokens are undisturbed around `;`.
         assert_eq!(kinds("a; b"), vec![Identifier, Semicolon, Identifier, Eof]);
+    }
+
+    // ── string literals ─────────────────────────────────────────────────────
+
+    #[test]
+    fn string_both_quote_styles() {
+        use TokenKind::*;
+        // Single and double quotes are interchangeable; only the captured slice differs.
+        assert_eq!(kinds("'hello'"), vec![Str, Eof]);
+        assert_eq!(kinds("\"hello\""), vec![Str, Eof]);
+        assert_eq!(lex("'hello'").unwrap()[0].text, "'hello'");
+        assert_eq!(lex("\"hello\"").unwrap()[0].text, "\"hello\"");
+    }
+
+    #[test]
+    fn empty_string_literal() {
+        use TokenKind::*;
+        // `''`/`""` is a single empty-string token — the two delimiters with no content between —
+        // not two separate quote characters.
+        assert_eq!(kinds("''"), vec![Str, Eof]);
+        assert_eq!(lex("''").unwrap()[0].text, "''");
+        assert_eq!(kinds("\"\""), vec![Str, Eof]);
+        assert_eq!(lex("\"\"").unwrap()[0].text, "\"\"");
+    }
+
+    #[test]
+    fn string_content_is_opaque() {
+        use TokenKind::*;
+        // Spaces, operators, digits, keywords, and `#` inside a literal are all just content:
+        // no whitespace skipping, no comment, no sub-tokenisation.
+        assert_eq!(kinds("'if 1 + 2  # x'"), vec![Str, Eof]);
+        assert_eq!(lex("'if 1 + 2  # x'").unwrap()[0].text, "'if 1 + 2  # x'");
+    }
+
+    #[test]
+    fn opposite_quote_allowed_inside() {
+        // The non-delimiter quote is ordinary content — no escaping, no mixed delimiters.
+        assert_eq!(lex("\"can't\"").unwrap()[0].text, "\"can't\"");
+        assert_eq!(lex("'say \"hi\"'").unwrap()[0].text, "'say \"hi\"'");
+    }
+
+    #[test]
+    fn fstring_both_quote_styles() {
+        use TokenKind::*;
+        assert_eq!(kinds("f'hi'"), vec![FStr, Eof]);
+        assert_eq!(kinds("f\"hi\""), vec![FStr, Eof]);
+        assert_eq!(lex("f'hi'").unwrap()[0].text, "f'hi'");
+    }
+
+    #[test]
+    fn bare_f_stays_identifier() {
+        use TokenKind::*;
+        // Longest-match yields FStr only when a quote immediately follows `f`.
+        assert_eq!(kinds("f"), vec![Identifier, Eof]);
+        assert_eq!(kinds("f + 1"), vec![Identifier, Plus, Int, Eof]);
+        assert_eq!(kinds("foo"), vec![Identifier, Eof]);
+        // A space splits it into an identifier and a plain string.
+        assert_eq!(kinds("f 'hi'"), vec![Identifier, Str, Eof]);
+    }
+
+    #[test]
+    fn string_adjacent_to_tokens() {
+        use TokenKind::*;
+        assert_eq!(kinds("a + 'b'"), vec![Identifier, Plus, Str, Eof]);
+        assert_eq!(kinds("'a' 'b'"), vec![Str, Str, Eof]);
+        // `.len` on a literal is unaffected: Str, Dot, Identifier.
+        assert_eq!(kinds("'hi'.len"), vec![Str, Dot, Identifier, Eof]);
+    }
+
+    #[test]
+    fn unterminated_string_is_error_at_opening_quote() {
+        // No closing quote before end of input: the opening quote is the failure site.
+        let err = lex("'abc").unwrap_err();
+        assert_eq!((err.line, err.col), (1, 1));
+        assert!(lex("\"abc").is_err());
+        assert!(lex("f'abc").is_err());
+    }
+
+    // ── multiline string literals ───────────────────────────────────────────
+    //
+    // The lexer's job here ends at the token: it captures the whole literal, delimiters included,
+    // and leaves the surrounding layout stream untouched. What the *content* becomes — stripping
+    // the delimiters, auto-dedenting the continuation lines — belongs to the parser, and is tested
+    // there against the AST rather than here against a raw slice.
+
+    #[test]
+    fn a_multiline_literal_is_one_token() {
+        use TokenKind::*;
+        let src = "'first\nsecond\nthird'";
+        assert_eq!(kinds(src), vec![Str, Eof]);
+        assert_eq!(
+            lex(src).unwrap()[0].text,
+            src,
+            "the whole literal, verbatim"
+        );
+        // Both quote styles, and the opposite quote is still ordinary content across lines.
+        assert_eq!(kinds("\"first\nsecond\""), vec![Str, Eof]);
+        assert_eq!(lex("'it\"s\nfine'").unwrap()[0].text, "'it\"s\nfine'");
+    }
+
+    #[test]
+    fn a_multiline_fstring_is_one_token() {
+        use TokenKind::*;
+        let src = "f'first {x}\nsecond'";
+        assert_eq!(kinds(src), vec![FStr, Eof]);
+        assert_eq!(lex(src).unwrap()[0].text, src);
+    }
+
+    #[test]
+    fn a_multiline_literal_leaves_the_layout_stream_intact() {
+        use TokenKind::*;
+        // The newlines inside the literal are content, not statement boundaries, so they must not
+        // reach the indent/dedent logic: the block below opens once and closes once.
+        let src = indoc! {"
+            f() is
+                x = 'first
+                     second'
+                y = 2
+            z = 3
+        "};
+        assert_eq!(
+            kinds(src),
+            vec![
+                Identifier, LParen, RParen, KwIs, Newline, Indent, // f() is
+                Identifier, Equal, Str, Newline, // x = '…' spanning two physical lines
+                Identifier, Equal, Int, Newline, Dedent, // y = 2, then back out
+                Identifier, Equal, Int, Newline, // z = 3
+                Eof
+            ]
+        );
+    }
+
+    #[test]
+    fn positions_after_a_multiline_literal_stay_correct() {
+        // Everything downstream locates from its own byte offset, so a token following a literal
+        // that spanned three lines still reports the line it is actually on.
+        let src = "x = 'one\ntwo\nthree'\ny = 2";
+        let tokens = lex(src).unwrap();
+        let literal = tokens
+            .iter()
+            .find(|token| token.kind == TokenKind::Str)
+            .unwrap();
+        assert_eq!((literal.line, literal.col), (1, 5), "the opening quote");
+        let last = tokens
+            .iter()
+            .rfind(|token| token.kind == TokenKind::Identifier)
+            .unwrap();
+        assert_eq!(last.text, "y");
+        assert_eq!((last.line, last.col), (4, 1));
+    }
+
+    #[test]
+    fn an_unterminated_multiline_literal_fails_at_the_opening_quote() {
+        // The accepted trade-off of spanning lines: a forgotten closing quote is only discovered at
+        // end of input, but it is still reported where the literal began.
+        let err = lex("x = 'abc\nmore text\n").unwrap_err();
+        assert_eq!((err.line, err.col), (1, 5));
+        assert!(lex("\"abc\nmore").is_err());
+        assert!(lex("f'abc\nmore").is_err());
+    }
+
+    // ── tabs and CRLF ───────────────────────────────────────────────────────
+
+    #[test]
+    fn a_tab_in_indentation_is_rejected() {
+        // pinp's layout is space-based. A tab used for indentation would otherwise be skipped as
+        // ordinary whitespace, leaving the line at indent 0 and failing later with a confusing
+        // "Expected Indent"; naming it here is far more useful.
+        let err = lex("f() is\n\tx = 1\n").unwrap_err();
+        assert_eq!((err.line, err.col), (2, 1));
+        assert!(err.message.contains("Tab"), "message was {:?}", err.message);
+        // A tab after some spaces is still indentation.
+        assert!(lex("f() is\n    \tx = 1\n").is_err());
+    }
+
+    #[test]
+    fn a_tab_between_tokens_is_ordinary_whitespace() {
+        use TokenKind::*;
+        // Only leading whitespace is layout; aligning inside a line is nobody's business.
+        assert_eq!(kinds("a\t+\tb"), vec![Identifier, Plus, Identifier, Eof]);
+        assert_eq!(
+            kinds("'a\tb'"),
+            vec![Str, Eof],
+            "and a tab inside a literal"
+        );
+    }
+
+    #[test]
+    fn crlf_line_endings_are_accepted() {
+        use TokenKind::*;
+        // A Windows checkout must compile. `\r\n` is a line terminator like `\n`, indentation and
+        // all.
+        let src = "f() is\r\n    x = 1\r\n    x\r\ny = 2\r\n";
+        assert_eq!(
+            kinds(src),
+            vec![
+                Identifier, LParen, RParen, KwIs, Newline, Indent, // f() is
+                Identifier, Equal, Int, Newline, // x = 1
+                Identifier, Newline, Dedent, // x, then back out
+                Identifier, Equal, Int, Newline, // y = 2
+                Eof
+            ]
+        );
+    }
+
+    #[test]
+    fn a_lone_carriage_return_is_still_an_error() {
+        // Only `\r\n` is a line ending; a bare `\r` (old-Mac style) is not something to guess at.
+        assert!(lex("a = 1\rb = 2").is_err());
     }
 
     #[test]

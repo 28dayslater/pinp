@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: MIT
 
 use super::*;
-use crate::lexer::TokenKind;
+use crate::lexer::{TokenKind, lex};
 
 // ---------------------------------------------------------------------------
 // Operator tables and binding powers
@@ -456,6 +456,20 @@ impl<'src> Parser<'src> {
                 self.advance();
                 Ok(self.ast.push(Node::Bool(false)))
             }
+            TokenKind::Str => {
+                // Strip the matching quotes, then auto-dedent: the interior may span lines.
+                let text = self.advance().text;
+                let content = dedent(&text[1..text.len() - 1]);
+                let str_id = self.ast.push_string_literal(content);
+                Ok(self.ast.push(Node::Str(str_id)))
+            }
+            TokenKind::FStr => {
+                // Strip the leading `f` and the matching quotes, then split into segments.
+                let text = self.advance().text;
+                let content = &text[2..text.len() - 1];
+                let segments = self.parse_fstring_segments(content)?;
+                Ok(self.ast.push(Node::FStr { segments }))
+            }
             TokenKind::Identifier => {
                 if self.at(1) == TokenKind::LParen {
                     return self.parse_call();
@@ -626,4 +640,173 @@ impl<'src> Parser<'src> {
         self.expect(TokenKind::RParen)?;
         Ok(self.ast.push(Node::Call { callee, args }))
     }
+
+    // Split an f-string's inter-delimiter content into alternating literal/interpolation segments.
+    // A `{` opens a `{name}`/`{::name}` hole closed by the next `}`; every other character is literal
+    // text. Adjacent holes (and a leading/trailing `{`) emit no empty literal run.
+    //
+    // The walk is line by line, which is what applies the same auto-dedent a plain literal gets:
+    // each line contributes its own text minus the shared indent, joined by the newlines between
+    // them. A hole therefore never spans lines — its `}` must arrive on the line that opened it.
+    fn parse_fstring_segments(
+        &mut self,
+        content: &'src str,
+    ) -> Result<Vec<FStrSegment>, ParseError> {
+        let lines = content_lines(content);
+        let common = common_indent(&lines);
+        let mut segments = Vec::new();
+        let mut run = String::new();
+        for (index, line) in lines.iter().enumerate() {
+            if index > 0 {
+                run.push('\n');
+            }
+            let line = &line[strip_count(line, index, common)..];
+            self.split_holes(line, &mut run, &mut segments)?;
+        }
+        if !run.is_empty() {
+            segments.push(FStrSegment::Literal(self.ast.push_string_literal(run)));
+        }
+        Ok(segments)
+    }
+
+    // Split one line into literal text and holes. Literal text accumulates into `run` — which may
+    // already hold earlier lines — and is flushed as a segment each time a hole interrupts it.
+    fn split_holes(
+        &mut self,
+        line: &'src str,
+        run: &mut String,
+        segments: &mut Vec<FStrSegment>,
+    ) -> Result<(), ParseError> {
+        let bytes = line.as_bytes(); // `{` and `}` are ASCII, so byte scanning is UTF-8-safe
+        let mut literal_start = 0;
+        let mut index = 0;
+        while index < bytes.len() {
+            match bytes[index] {
+                b'{' => {
+                    run.push_str(&line[literal_start..index]);
+                    if !run.is_empty() {
+                        let text = std::mem::take(run);
+                        segments.push(FStrSegment::Literal(self.ast.push_string_literal(text)));
+                    }
+                    let rest = &line[index + 1..];
+                    let close = rest.find('}').ok_or_else(|| {
+                        ParseError::Unexpected("Unterminated `{` in f-string.".into())
+                    })?;
+                    let place = self.fstring_place(&rest[..close])?;
+                    segments.push(FStrSegment::Interp(place));
+                    index += 1 + close + 1; // step past the `}`
+                    literal_start = index;
+                }
+                b'}' => {
+                    return Err(ParseError::Unexpected("Unmatched `}` in f-string.".into()));
+                }
+                _ => index += 1,
+            }
+        }
+        run.push_str(&line[literal_start..]);
+        Ok(())
+    }
+
+    // Resolve one f-string hole to its [`Place`]. The hole's text is re-lexed — the lexer is the
+    // single source of truth for what a name is — so it must tokenise to exactly `name` (a local) or
+    // `::name` (a global); anything else (empty, a number, an operator, two names) is a parse error.
+    fn fstring_place(&mut self, hole: &'src str) -> Result<Place, ParseError> {
+        let invalid = || {
+            ParseError::Unexpected(format!(
+                "Invalid f-string interpolation `{{{hole}}}`; expected a name."
+            ))
+        };
+        // The lexer skips comments, so an unguarded `#` would truncate the hole instead of failing:
+        // `{x#note}` would lex to just `x` and silently interpolate it.
+        if hole.contains('#') {
+            return Err(invalid());
+        }
+        let tokens = lex(hole).map_err(|error| ParseError::Lex(error.message))?;
+        match tokens.as_slice() {
+            [name, eof] if name.kind == TokenKind::Identifier && eof.kind == TokenKind::Eof => {
+                Ok(Place::Local(self.ast.intern(name.text)))
+            }
+            [marker, name, eof]
+                if marker.kind == TokenKind::ColonColon
+                    && name.kind == TokenKind::Identifier
+                    && eof.kind == TokenKind::Eof =>
+            {
+                Ok(Place::Global(self.ast.intern(name.text)))
+            }
+            _ => Err(invalid()),
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// String literal content: auto-dedent
+// ---------------------------------------------------------------------------
+//
+// A literal may span physical lines, so it can be indented to line up with the code around it. That
+// indentation is layout, not value: the run of spaces every continuation line shares comes off.
+//
+// The first line is exempt — it starts immediately after the opening quote and carries no indent of
+// its own. Lines that are nothing but spaces say nothing about the intended indent, so they do not
+// constrain the shared prefix, and they come out empty rather than keeping a stray remainder (the
+// same normalisation Python's `textwrap.dedent` applies). Tabs are not spaces: pinp's own layout is
+// space-based, so a tab is content and a tab-led line simply shares no prefix.
+
+/// Splits a literal's content into lines, dropping the `\r` of any CRLF pair so a file written on
+/// Windows yields the same string as one written on Unix. A `\r` anywhere else is content.
+fn content_lines(content: &str) -> Vec<&str> {
+    let count = content.split('\n').count();
+    content
+        .split('\n')
+        .enumerate()
+        .map(|(index, line)| match index + 1 < count {
+            true => line.strip_suffix('\r').unwrap_or(line),
+            false => line,
+        })
+        .collect()
+}
+
+/// True for a line made of nothing but spaces (including an empty one).
+fn is_blank(line: &str) -> bool {
+    line.chars().all(|character| character == ' ')
+}
+
+/// The number of spaces `line` opens with.
+fn leading_spaces(line: &str) -> usize {
+    line.len() - line.trim_start_matches(' ').len()
+}
+
+/// The indent shared by every non-blank continuation line — what auto-dedent removes.
+fn common_indent(lines: &[&str]) -> usize {
+    lines[1..]
+        .iter()
+        .filter(|line| !is_blank(line))
+        .map(|line| leading_spaces(line))
+        .min()
+        .unwrap_or(0)
+}
+
+/// How many leading bytes to drop from the line at `index`.
+fn strip_count(line: &str, index: usize, common: usize) -> usize {
+    if index == 0 {
+        0 // the first line's spacing is content
+    } else if is_blank(line) {
+        line.len() // whitespace-only: leave the newline, drop the spaces
+    } else {
+        common.min(leading_spaces(line))
+    }
+}
+
+/// Applies auto-dedent to a literal's content. Single-line content comes back verbatim: with no
+/// continuation lines there is no shared indent to remove.
+fn dedent(content: &str) -> String {
+    let lines = content_lines(content);
+    let common = common_indent(&lines);
+    let mut dedented = String::with_capacity(content.len());
+    for (index, line) in lines.iter().enumerate() {
+        if index > 0 {
+            dedented.push('\n');
+        }
+        dedented.push_str(&line[strip_count(line, index, common)..]);
+    }
+    dedented
 }

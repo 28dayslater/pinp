@@ -3,8 +3,8 @@
 //! AST → LLVM IR lowering: the heart of the codegen backend.
 //!
 //! *Lowering* is the compiler term for rewriting a program into a lower-level form — here the typed
-//! [`Ast`] into LLVM IR, one step "down" toward the machine. Sema has already resolved names and
-//! inferred every type, so lowering carries no analysis: it is a mechanical walk that emits, for
+//! [`ProgramAst`] into LLVM IR, one step "down" toward the machine. Sema has already resolved names
+//! and inferred every type, so lowering carries no analysis: it is a mechanical walk that emits, for
 //! each construct, the IR that computes it. LLVM then optimises that IR and machine-codes it.
 //!
 //! This file holds the `CodeGen` state and its construction, the small scope and LLVM-type helpers
@@ -28,7 +28,7 @@ impl<'ctx, 'ast> CodeGen<'ctx, 'ast> {
     // -------------------------------------------------------------------------
 
     /// Creates an empty code generator lowering `ast` into a module in `context`.
-    pub(super) fn new(context: &'ctx Context, ast: &'ast Ast<'ast>) -> Self {
+    pub(super) fn new(context: &'ctx Context, ast: &'ast ProgramAst<'ast>) -> Self {
         CodeGen {
             context,
             module: context.create_module("pinp"),
@@ -71,11 +71,64 @@ impl<'ctx, 'ast> CodeGen<'ctx, 'ast> {
             .find_map(|frame| frame.get(&sym).copied())
     }
 
+    /// The slot+type a name resolves to: `::name` is always a global, while a bare name is the
+    /// nearest enclosing local, falling back to a global at the top level (where top-level bindings
+    /// *are* module globals).
+    pub(super) fn var_slot(&self, sym_id: SymId, global: bool) -> (PointerValue<'ctx>, PinpType) {
+        if global {
+            self.globals[&sym_id]
+        } else if let Some(slot) = self.find_local(sym_id) {
+            slot
+        } else {
+            self.globals[&sym_id]
+        }
+    }
+
     /// Allocates a slot in the current function's entry block (not at the live insert point), so the
     /// alloca dominates every use and is not re-run — growing the stack — inside a loop body.
     pub(super) fn alloca_at_entry(
         &self,
         pinp_type: PinpType,
+    ) -> Result<PointerValue<'ctx>, String> {
+        let slot = self.alloca_at_entry_type(self.basic_type(pinp_type))?;
+        // A string slot is freed before it is overwritten and again when its scope ends, so it must
+        // start out as a valid descriptor rather than whatever the stack held. All-zero is the empty
+        // inline string, which frees to nothing.
+        if pinp_type == PinpType::Str {
+            self.store_at_entry(slot, self.zero(PinpType::Str))?;
+        }
+        Ok(slot)
+    }
+
+    /// Stores an initial value into a slot right where the slot was allocated, so the store runs
+    /// once on entry rather than every time execution reaches the code that uses it.
+    pub(super) fn store_at_entry(
+        &self,
+        slot: PointerValue<'ctx>,
+        value: BasicValueEnum<'ctx>,
+    ) -> Result<(), String> {
+        let current = self.builder.get_insert_block().expect("an active block");
+        let alloca = slot
+            .as_instruction()
+            .expect("a slot is an alloca instruction");
+        match alloca.get_next_instruction() {
+            Some(next) => self.builder.position_before(&next),
+            None => self.builder.position_at_end(
+                alloca
+                    .get_parent()
+                    .expect("an instruction belongs to a block"),
+            ),
+        }
+        self.builder.build_store(slot, value).map_err(err)?;
+        self.builder.position_at_end(current);
+        Ok(())
+    }
+
+    /// [`alloca_at_entry`](Self::alloca_at_entry) for an LLVM type with no pinp type of its own —
+    /// the array of `PinpStr`s a concatenation gathers its parts into, for instance.
+    pub(super) fn alloca_at_entry_type(
+        &self,
+        llvm_type: impl BasicType<'ctx>,
     ) -> Result<PointerValue<'ctx>, String> {
         let current = self.builder.get_insert_block().expect("an active block");
         let entry = current
@@ -87,10 +140,7 @@ impl<'ctx, 'ast> CodeGen<'ctx, 'ast> {
             Some(first) => self.builder.position_before(&first),
             None => self.builder.position_at_end(entry),
         }
-        let slot = self
-            .builder
-            .build_alloca(self.basic_type(pinp_type), "local")
-            .map_err(err)?;
+        let slot = self.builder.build_alloca(llvm_type, "local").map_err(err)?;
         self.builder.position_at_end(current);
         Ok(slot)
     }
@@ -114,6 +164,20 @@ impl<'ctx, 'ast> CodeGen<'ctx, 'ast> {
         self.context.bool_type() // i1
     }
 
+    /// The LLVM opaque pointer, used for every address the backend passes around.
+    pub(super) fn ptr_type(&self) -> inkwell::types::PointerType<'ctx> {
+        self.context.ptr_type(AddressSpace::default())
+    }
+
+    /// The LLVM type of a `PinpStr`: two INTEGER eightbytes, matching the runtime's 16-byte wire
+    /// struct. The shape is load-bearing, not cosmetic — `{ i64, i64 }` is what the SysV ABI
+    /// returns in `rax:rdx`, whereas the equally 16-byte `[16 x i8]` classifies as MEMORY and would
+    /// be returned through a hidden pointer the runtime does not expect.
+    pub(super) fn str_type(&self) -> StructType<'ctx> {
+        let int = self.int_type().into();
+        self.context.struct_type(&[int, int], false)
+    }
+
     // A range value is the aggregate `{ start, stop, step, inclusive }`: three `i64`s and an `i1`.
     // The operator's direction/inclusivity is baked into these fields at construction, so iteration
     // and membership read a uniform shape.
@@ -129,6 +193,7 @@ impl<'ctx, 'ast> CodeGen<'ctx, 'ast> {
             PinpType::Bool => self.bool_type().into(),
             PinpType::Int => self.int_type().into(),
             PinpType::Float => self.float_type().into(),
+            PinpType::Str => self.str_type().into(),
             PinpType::Void => unreachable!("Void is not a storable value type."),
             PinpType::Range => self.range_type().into(),
             // Array and matrix variables hold a heap pointer (opaque ptr, 64-bit on all targets).
@@ -270,7 +335,8 @@ impl<'ctx, 'ast> CodeGen<'ctx, 'ast> {
         }
 
         for stmt in &func.body.stmts {
-            self.gen_stmt(stmt)?;
+            let value = self.gen_stmt(stmt)?;
+            self.free_discarded_str(stmt, value)?;
         }
 
         let result = func
@@ -279,10 +345,17 @@ impl<'ctx, 'ast> CodeGen<'ctx, 'ast> {
             .expect("a function body always ends in a result expression");
         if func.return_type == PinpType::Void {
             self.gen_expr(result)?; // side effects only
+            self.free_scope_strings()?;
             self.builder.build_return(None).map_err(err)?;
         } else {
-            let value = self.expect_value(result)?;
+            // A returned string is moved out: it is owned before the frame's own strings are
+            // released, so returning a local's value hands back a copy rather than a freed one.
+            let value = match func.return_type {
+                PinpType::Str => self.gen_owned_str(result)?,
+                _ => self.expect_value(result)?,
+            };
             let value = self.promote(value, self.ast.type_of(result), func.return_type);
+            self.free_scope_strings()?;
             self.builder.build_return(Some(&value)).map_err(err)?;
         }
         self.in_function = false;
@@ -323,12 +396,23 @@ impl<'ctx, 'ast> CodeGen<'ctx, 'ast> {
                 let value = self.gen_stmt(stmt)?;
                 if i == last {
                     result = value;
+                } else {
+                    self.free_discarded_str(stmt, value)?;
                 }
             }
         }
 
         if result_type != PinpType::Void {
             let result_value = result.expect("A non-void program must yield a value.");
+            // The program's value is moved out to the host, which frees it — so it must be owned
+            // before the top-level bindings and globals are released just below.
+            let result_value = match result_type {
+                PinpType::Str => {
+                    let owned = self.stmt_result_owns_str(self.ast.top_level.last());
+                    self.own_str(result_value, owned)?
+                }
+                _ => result_value,
+            };
             let result_ptr = entry_fn
                 .get_first_param()
                 .expect("result pointer parameter")
@@ -337,6 +421,8 @@ impl<'ctx, 'ast> CodeGen<'ctx, 'ast> {
                 .build_store(result_ptr, result_value)
                 .map_err(err)?;
         }
+        self.free_scope_strings()?;
+        self.free_global_strings()?;
         self.builder.build_return(None).map_err(err)?;
         Ok(result_type)
     }

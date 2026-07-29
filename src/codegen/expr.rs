@@ -34,6 +34,8 @@ impl<'ctx, 'ast> CodeGen<'ctx, 'ast> {
             Node::Int(int_value) => self.int_type().const_int(*int_value as u64, true).into(),
             Node::Float(float_value) => self.float_type().const_float(*float_value).into(),
             Node::Bool(bool_value) => self.bool_type().const_int(*bool_value as u64, false).into(),
+            Node::Str(str_id) => self.gen_str_literal(*str_id)?,
+            Node::FStr { .. } => self.gen_fstring(expr_id)?,
             Node::Var(sym_id) => self.load_var(*sym_id, false)?,
             Node::Global(sym_id) => self.load_var(*sym_id, true)?,
             Node::Unary {
@@ -66,11 +68,18 @@ impl<'ctx, 'ast> CodeGen<'ctx, 'ast> {
                 self.builder.build_not(value, "not").map_err(err)?.into()
             }
             Node::Bin { op, lhs, rhs } => self.gen_bin(expr_id, *op, *lhs, *rhs)?,
+            // Sema forbids defining a function with a built-in's name, so matching on the callee's
+            // spelling here cannot shadow a user function.
             Node::Call { callee, args } => {
-                if self.ast.names[callee.value()] == "identity" {
-                    return Ok(Some(self.gen_identity(expr_id)?));
-                }
-                return self.gen_call(*callee, args);
+                return match self.ast.names[callee.value()] {
+                    "identity" => Ok(Some(self.gen_identity(expr_id)?)),
+                    "str" => Ok(Some(self.gen_str_conversion(args[0])?)),
+                    "meminfo" => {
+                        self.gen_meminfo()?;
+                        Ok(None)
+                    }
+                    _ => self.gen_call(*callee, args),
+                };
             }
             Node::If { .. } => return self.gen_if(expr_id),
             Node::Range { .. } => self.gen_range(expr_id)?,
@@ -148,18 +157,25 @@ impl<'ctx, 'ast> CodeGen<'ctx, 'ast> {
 
     // Loads the current value of a variable.
     fn load_var(&self, sym_id: SymId, global: bool) -> Result<BasicValueEnum<'ctx>, String> {
-        // `::name` always reads a global; a bare name reads the nearest enclosing local, falling
-        // back to a global only at the top level (where top-level vars are module globals).
-        let (pointer, value_type) = if global {
-            self.globals[&sym_id]
-        } else if let Some(slot) = self.find_local(sym_id) {
-            slot
-        } else {
-            self.globals[&sym_id]
-        };
+        let (pointer, value_type) = self.var_slot(sym_id, global);
         self.builder
             .build_load(self.basic_type(value_type), pointer, "load")
             .map_err(err)
+    }
+
+    /// Loads the value behind a place, along with its type — what an f-string hole needs to know in
+    /// order to render its binding.
+    pub(super) fn load_place(
+        &self,
+        place: Place,
+    ) -> Result<(BasicValueEnum<'ctx>, PinpType), String> {
+        let (pointer, value_type) =
+            self.var_slot(place_sym(place), matches!(place, Place::Global(_)));
+        let value = self
+            .builder
+            .build_load(self.basic_type(value_type), pointer, "load")
+            .map_err(err)?;
+        Ok((value, value_type))
     }
 
     // Lowers a call, promoting each argument to its parameter type.
@@ -195,6 +211,8 @@ impl<'ctx, 'ast> CodeGen<'ctx, 'ast> {
     ) -> Result<BasicValueEnum<'ctx>, String> {
         let result_type = self.ast.type_of(expr_id);
         let value = match op {
+            // Concatenation is the only operator a string has; sema rejected the rest.
+            BinOp::Add if result_type == PinpType::Str => self.gen_str_concat(expr_id)?,
             BinOp::Add | BinOp::Sub | BinOp::Mul if result_type == PinpType::Float => {
                 let left = self.as_float(lhs)?;
                 let right = self.as_float(rhs)?;
@@ -286,6 +304,10 @@ impl<'ctx, 'ast> CodeGen<'ctx, 'ast> {
         rhs: ExprId,
     ) -> Result<BasicValueEnum<'ctx>, String> {
         use inkwell::{FloatPredicate as FloatPred, IntPredicate as IntPred};
+        // Strings compare through the runtime; sema has already required both sides to be strings.
+        if self.ast.type_of(lhs) == PinpType::Str {
+            return self.gen_str_compare(op, lhs, rhs);
+        }
         let float =
             self.ast.type_of(lhs) == PinpType::Float || self.ast.type_of(rhs) == PinpType::Float;
         let value = if float {
@@ -1412,8 +1434,9 @@ impl<'ctx, 'ast> CodeGen<'ctx, 'ast> {
         Ok(dst_ptr.into())
     }
 
-    // Compiler built-in pseudo-members like .len, .ndim, etc
-    fn gen_builtin_member(&self, expr_id: ExprId) -> Result<BasicValueEnum<'ctx>, String> {
+    // Compiler built-in pseudo-members like .len, .ndim, etc. Takes `&mut self` because a string's
+    // `.len` has to lower its object expression; the constant members only read its type.
+    fn gen_builtin_member(&mut self, expr_id: ExprId) -> Result<BasicValueEnum<'ctx>, String> {
         let Node::Member {
             object: object_id, ..
         } = self.ast.node(expr_id)
@@ -1428,6 +1451,11 @@ impl<'ctx, 'ast> CodeGen<'ctx, 'ast> {
             .ast
             .builtin_member_of(expr_id)
             .expect("Sema must resolve every Node::Member to a BuiltinMember");
+        // Every other member is a compile-time constant read off the object's type; a string's
+        // length is the one that has to be asked of the value itself.
+        if let (BuiltinMember::Len, PinpType::Str) = (builtin, self.ast.type_of(object_id)) {
+            return self.gen_str_len(object_id);
+        }
         let const_val: u64 = match (builtin, self.ast.type_of(object_id)) {
             (BuiltinMember::Len, PinpType::Array(_, n)) => n as u64,
             (BuiltinMember::Len, PinpType::Matrix(_, rows, cols)) => (rows * cols) as u64,
@@ -1586,6 +1614,8 @@ impl<'ctx, 'ast> CodeGen<'ctx, 'ast> {
             PinpType::Bool => self.bool_type().const_zero().into(),
             PinpType::Int => self.int_type().const_zero().into(),
             PinpType::Float => self.float_type().const_zero().into(),
+            // An all-zero descriptor is byte 15 == 0: inline storage, length 0 — the empty string.
+            PinpType::Str => self.str_type().const_zero().into(),
             PinpType::Void => unreachable!("Void has no zero value."),
             PinpType::Range => self.range_type().const_zero().into(),
             // Null pointer is the zero for array/matrix slots (must be overwritten before use).

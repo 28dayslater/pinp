@@ -189,13 +189,17 @@ impl<'src> Parser<'src> {
         Ok(params)
     }
 
-    // A type annotation: `bool` / `int` / `float` / `void`.
+    // A type annotation: `bool` / `int` / `float` / `str` / `void`. Resolving a type name is purely
+    // lexical; whether `str` is admissible in a given position (`str` *parameters* are out of scope
+    // this iteration, their freeing model deferred) is a sema-layer decision made in a later step,
+    // not here.
     pub(super) fn parse_type(&mut self) -> Result<PinpType, ParseError> {
         let token = self.expect(TokenKind::Identifier)?;
         match token.text {
             "bool" => Ok(PinpType::Bool),
             "int" => Ok(PinpType::Int),
             "float" => Ok(PinpType::Float),
+            "str" => Ok(PinpType::Str),
             "void" => Ok(PinpType::Void),
             other => Err(ParseError::Unexpected(format!("Unknown type `{other}`."))),
         }

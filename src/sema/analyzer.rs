@@ -2,8 +2,44 @@
 
 use super::*;
 use crate::parser::{
-    ArrayElementType, BinOp, Block, BuiltinMember, ExprId, FuncDef, Place, RangeKind, Stmt, UnOp,
+    ArrayElementType, BinOp, Block, BuiltinMember, ExprId, FStrSegment, FuncDef, Place, RangeKind,
+    Stmt, UnOp,
 };
+
+/// Types a binary operator where at least one operand is `Str`. Only concatenation (`+`) and the six
+/// comparisons are defined; `+` concatenates and implicitly `str()`-wraps a scalar right operand,
+/// while a comparison requires both operands to already be `Str`.
+fn string_bin_type(op: BinOp, left: PinpType, right: PinpType) -> Result<PinpType, SemaError> {
+    use BinOp::*;
+    use PinpType::*;
+    match op {
+        Eq | Ne | Lt | Gt | Le | Ge => {
+            if left == Str && right == Str {
+                Ok(Bool)
+            } else {
+                Err(SemaError::Type(format!(
+                    "Cannot compare str with {:?}.",
+                    if left == Str { right } else { left }
+                )))
+            }
+        }
+        // `str + x`: the left operand drives concatenation and the right is implicitly `str()`-wrapped,
+        // so it must itself be a scalar or a `str`. `x + str` with a non-`str` left is an error.
+        Add if left == Str => {
+            if right == Str || numeric(right) {
+                Ok(Str)
+            } else {
+                Err(SemaError::Type(format!(
+                    "Cannot concatenate {right:?} to a str."
+                )))
+            }
+        }
+        Add => Err(SemaError::Type(
+            "Left operand of `+` must be a str when the right is.".into(),
+        )),
+        _ => Err(SemaError::Type(format!("`{op:?}` is not defined for str."))),
+    }
+}
 
 impl Analyzer<'_, '_> {
     // -------------------------------------------------------------------------
@@ -19,15 +55,11 @@ impl Analyzer<'_, '_> {
         // Built-in names are reserved; a user definition with same name is an error.
         // NOTE: when the list of buil-ins grows, we will need to consult internal
         //       list of built-in headers.
-        #[allow(clippy::single_match)]
-        match self.name(func.name) {
-            "identity" => {
-                return Err(SemaError::Type(format!(
-                    "Cannot define a function named `{}`: conflicts with a built-in.",
-                    self.name(func.name)
-                )));
-            }
-            _ => {}
+        if matches!(self.name(func.name), "identity" | "str" | "meminfo") {
+            return Err(SemaError::Type(format!(
+                "Cannot define a function named `{}`: conflicts with a built-in.",
+                self.name(func.name)
+            )));
         }
         let mut frame = FxHashMap::default();
         for param in &func.params {
@@ -38,6 +70,13 @@ impl Analyzer<'_, '_> {
                     "Function argument `{}` cannot be void.",
                     self.name(param.name)
                 )));
+            }
+            // `str` parameters are deferred this iteration (their cross-call freeing model is out of
+            // scope). The annotation parses; rejecting it here keeps `Str` from reaching codegen.
+            if param.param_type == PinpType::Str {
+                return Err(SemaError::Type(
+                    "String parameters are not yet supported.".into(),
+                ));
             }
             frame.insert(param.name, param.param_type); // duplicate params already rejected by the parser
         }
@@ -162,6 +201,16 @@ impl Analyzer<'_, '_> {
                 if self.name(*binders.last().unwrap()) == "_" {
                     return Err(SemaError::Type("Value binder must not be `_`.".into()));
                 }
+                // Binders share one scope frame, so a repeated name would silently keep only the
+                // last position's value. `_` is the discard binder and may repeat freely.
+                for (position, binder) in binders.iter().enumerate() {
+                    if binders[..position].contains(binder) && self.name(*binder) != "_" {
+                        return Err(SemaError::Type(format!(
+                            "Duplicate binder `{}`.",
+                            self.name(*binder)
+                        )));
+                    }
+                }
                 self.scopes.push(frame);
                 for binder in binders.iter() {
                     self.loop_vars.push(*binder);
@@ -284,6 +333,22 @@ impl Analyzer<'_, '_> {
             Node::Int(_) => PinpType::Int,
             Node::Float(_) => PinpType::Float,
             Node::Bool(_) => PinpType::Bool,
+            Node::Str(_) => PinpType::Str,
+            Node::FStr { segments } => {
+                // Every interpolation hole must name a binding that stringifies — a scalar or another
+                // `str`. An aggregate/`Void`/`Range` hole has no defined rendering and is an error.
+                for segment in &segments {
+                    if let FStrSegment::Interp(place) = segment {
+                        let place_type = self.place_type(*place)?;
+                        if !(numeric(place_type) || place_type == PinpType::Str) {
+                            return Err(SemaError::Type(format!(
+                                "Cannot interpolate {place_type:?} into an f-string."
+                            )));
+                        }
+                    }
+                }
+                PinpType::Str
+            }
             Node::Var(sym_id) => self.lookup_local(sym_id)?,
             Node::Global(sym_id) => self.lookup_global(sym_id)?,
             Node::Unary { op, operand } => {
@@ -765,6 +830,7 @@ impl Analyzer<'_, '_> {
         let result_type = match (builtin, object_type) {
             (BuiltinMember::Len, PinpType::Array(..)) => Ok(PinpType::Int),
             (BuiltinMember::Len, PinpType::Matrix(..)) => Ok(PinpType::Int),
+            (BuiltinMember::Len, PinpType::Str) => Ok(PinpType::Int),
             (BuiltinMember::Ndim, PinpType::Array(..)) => Ok(PinpType::Int),
             (BuiltinMember::Ndim, PinpType::Matrix(..)) => Ok(PinpType::Int),
             (BuiltinMember::Rows, PinpType::Matrix(..)) => Ok(PinpType::Int),
@@ -802,6 +868,13 @@ impl Analyzer<'_, '_> {
         if var_type == PinpType::Bool {
             return Err(SemaError::Type(
                 "Cannot promote range variable to bool.".into(),
+            ));
+        }
+        // A range counter is an `i64`; it has no meaningful promotion to a string. (Independently,
+        // string values are not yet wired through codegen, so this also stops `Str` reaching it.)
+        if var_type == PinpType::Str {
+            return Err(SemaError::Type(
+                "Cannot promote range variable to string.".into(),
             ));
         }
         let source_type = self.analyze_expr(source)?;
@@ -1029,6 +1102,14 @@ impl Analyzer<'_, '_> {
         })
     }
 
+    /// The type a [`Place`] reads — a bare local or a `::global`. Used to resolve f-string holes.
+    fn place_type(&self, place: Place) -> Result<PinpType, SemaError> {
+        match place {
+            Place::Local(sym_id) => self.lookup_local(sym_id),
+            Place::Global(sym_id) => self.lookup_global(sym_id),
+        }
+    }
+
     /// The result type of a unary operator applied to `operand_type`.
     fn unary_type(&self, op: UnOp, operand_type: PinpType) -> Result<PinpType, SemaError> {
         match op {
@@ -1038,7 +1119,8 @@ impl Analyzer<'_, '_> {
                 PinpType::Bool | PinpType::Int => Ok(PinpType::Int),
                 PinpType::Float => Ok(PinpType::Float),
                 // TODO: element-wise negation on arrays/matrices may be allowed for matrix algebra later.
-                PinpType::Void
+                PinpType::Str
+                | PinpType::Void
                 | PinpType::Range
                 | PinpType::Array(_, _)
                 | PinpType::Matrix(_, _, _) => Err(SemaError::Type(format!(
@@ -1077,6 +1159,11 @@ impl Analyzer<'_, '_> {
                 )))
             };
         }
+        // String operations — concatenation (`+`) and the six comparisons — sit before the numeric
+        // gate, since `Str` is not numeric.
+        if left_type == Str || right_type == Str {
+            return string_bin_type(op, left_type, right_type);
+        }
         // Arithmetic and comparison both require scalar operands — never `Void` or a `Range`.
         if !numeric(left_type) || !numeric(right_type) {
             return Err(SemaError::Type(format!(
@@ -1107,9 +1194,10 @@ impl Analyzer<'_, '_> {
     /// Types a call: the callee must be defined, with matching arity and assignable arguments.
     /// Compiler built-ins are intercepted by name before the normal user-function path.
     fn call_type(&mut self, callee: SymId, args: &[ExprId]) -> Result<PinpType, SemaError> {
-        #[allow(clippy::single_match)]
         match self.name(callee) {
             "identity" => return self.identity_call_type(args),
+            "str" => return self.str_call_type(args),
+            "meminfo" => return self.meminfo_call_type(args),
             _ => {}
         }
         let signature = self.funcs.get(&callee).cloned().ok_or_else(|| {
@@ -1179,5 +1267,34 @@ impl Analyzer<'_, '_> {
             }
         };
         Ok(PinpType::Matrix(elem_type, size, size))
+    }
+
+    /// Types the `str(x)` conversion built-in: one scalar or `str` argument, yielding `Str`.
+    fn str_call_type(&mut self, args: &[ExprId]) -> Result<PinpType, SemaError> {
+        let [arg] = args else {
+            return Err(SemaError::Type(format!(
+                "`str` takes exactly 1 argument, got {}.",
+                args.len()
+            )));
+        };
+        let arg_type = self.analyze_expr(*arg)?;
+        if numeric(arg_type) || arg_type == PinpType::Str {
+            Ok(PinpType::Str)
+        } else {
+            Err(SemaError::Type(format!(
+                "`str` cannot convert {arg_type:?}."
+            )))
+        }
+    }
+
+    /// Types the `meminfo()` diagnostic built-in: no arguments, evaluating to `Void`.
+    fn meminfo_call_type(&self, args: &[ExprId]) -> Result<PinpType, SemaError> {
+        if !args.is_empty() {
+            return Err(SemaError::Type(format!(
+                "`meminfo` takes no arguments, got {}.",
+                args.len()
+            )));
+        }
+        Ok(PinpType::Void)
     }
 }

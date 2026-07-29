@@ -112,6 +112,96 @@ fn runtime_allocator_is_reachable_from_the_jit() {
 }
 
 #[test]
+fn string_runtime_symbols_are_reachable_from_the_jit() {
+    // The string runtime is Rust `#[no_mangle]` code inside this binary, and a Linux executable
+    // does not put those names in its dynamic symbol table unless the link asks for it. Without
+    // build.rs's `--export-dynamic-symbol`, JIT-compiled pinp code would fail to resolve them —
+    // so every symbol codegen emits a call to is looked up here.
+    let jit = Jit::new().unwrap();
+    for name in [
+        "pinp_str_from_cstr",
+        "pinp_str_free",
+        "pinp_str_concat",
+        "pinp_str_concat_n",
+        "pinp_str_len",
+        "pinp_str_eq",
+        "pinp_str_cmp",
+        "pinp_str_from_int",
+        "pinp_str_from_float",
+        "pinp_meminfo",
+    ] {
+        // SAFETY: the address is only checked for presence, never called, so no signature applies.
+        let address: usize = unsafe { jit.lookup(name) }
+            .unwrap_or_else(|error| panic!("`{name}` is not exported to the JIT: {error}"));
+        assert_ne!(address, 0, "`{name}` resolved to a null address");
+    }
+}
+
+/// Lowers `src` and returns the module's IR as text, for the shape assertions below.
+fn src_to_ir(src: &str) -> String {
+    let mut ast = parse(src).unwrap();
+    crate::sema::analyze(&mut ast).unwrap();
+    let context = Context::create();
+    let mut codegen = CodeGen::new(&context, &ast);
+    codegen.generate().unwrap();
+    codegen.into_module().print_to_string().to_string()
+}
+
+/// How many times `ir_text` *calls* `callee` — declarations and definitions are not calls.
+fn call_count(ir_text: &str, callee: &str) -> usize {
+    let target = format!("@{callee}(");
+    ir_text
+        .lines()
+        .filter(|line| line.contains("call ") && line.contains(&target))
+        .count()
+}
+
+#[test]
+fn pinp_str_is_two_eightbytes_in_ir() {
+    // `{ i64, i64 }` is what makes the SysV ABI return a `PinpStr` in `rax:rdx`, matching the C
+    // struct; `[16 x i8]` would classify as MEMORY and silently mismatch the runtime.
+    let ir_text = src_to_ir(indoc! {"
+            greet(): str is 'hi'
+            greet()
+        "});
+    assert!(
+        ir_text.contains("declare { i64, i64 } @pinp_str_from_cstr(ptr"),
+        "runtime declaration is not two eightbytes:\n{ir_text}"
+    );
+    assert!(
+        ir_text.contains("define { i64, i64 } @greet()"),
+        "a str-returning pinp function is not two eightbytes:\n{ir_text}"
+    );
+}
+
+#[test]
+fn a_concat_chain_lowers_to_a_single_call() {
+    // The flatten bonus: `a + b + c + d` is one N-way concatenation (one allocation), not three
+    // pairwise ones.
+    let ir_text = src_to_ir("'a' + 'b' + 'c' + 'd'");
+    assert_eq!(
+        call_count(&ir_text, "pinp_str_concat_n"),
+        1,
+        "IR:\n{ir_text}"
+    );
+    assert_eq!(call_count(&ir_text, "pinp_str_concat"), 0, "IR:\n{ir_text}");
+}
+
+#[test]
+fn an_fstring_lowers_to_a_single_call() {
+    let ir_text = src_to_ir(indoc! {"
+            a = 'x'
+            b = 2
+            f'<{a}|{b}>'
+        "});
+    assert_eq!(
+        call_count(&ir_text, "pinp_str_concat_n"),
+        1,
+        "IR:\n{ir_text}"
+    );
+}
+
+#[test]
 fn syntax_error_is_reported_before_codegen() {
     // A malformed parameter list (missing `:`) fails in the parser, so the flow
     // never reaches code generation. PinpJit must surface that as a normal

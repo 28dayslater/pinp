@@ -10,10 +10,10 @@
 //! use `right == left`. Prefix `-` is handled in `parse_prefix` at `UNARY_MINUS_BP`.
 //!
 //! Output is an arena, not a tree of boxes:
-//! - **AST arena** — nodes live in `Ast::nodes: Vec<Node>` and reference each other by
+//! - **AST arena** — nodes live in `ProgramAst::nodes: Vec<Node>` and reference each other by
 //!   [`ExprId`] (an index), so there is no `Box`/`Rc`. The inferred [`PinpType`] of each node
-//!   sits in the parallel `Ast::types` vec at the same index.
-//! - **Interner** — identifiers map to [`SymId`] via `Ast::symbols`, backed by `&'src str`
+//!   sits in the parallel `ProgramAst::types` vec at the same index.
+//! - **Interner** — identifiers map to [`SymId`] via `ProgramAst::symbols`, backed by `&'src str`
 //!   slices borrowed straight from the source (no string copies).
 //!
 //! Parsing is **purely syntactic**: it builds the structural AST and reports only lexical/layout
@@ -52,14 +52,15 @@ pub enum ParseError {
     TooManyArms(String),
 }
 
-/// Lexes and parses `src` into a structural [`Ast`] (its `types` left for [`crate::sema::analyze`]
-/// to fill). The returned AST borrows `src`. Stops at and returns the first [`ParseError`].
-pub fn parse(src: &str) -> Result<Ast<'_>, ParseError> {
+/// Lexes and parses `src` into a structural [`ProgramAst`] (its `types` left for
+/// [`crate::sema::analyze`] to fill). The returned AST borrows `src`. Stops at and returns the first
+/// [`ParseError`].
+pub fn parse(src: &str) -> Result<ProgramAst<'_>, ParseError> {
     let tokens = lex(src).map_err(|error| ParseError::Lex(error.message))?;
     let mut parser = Parser {
         tokens,
         pos: 0,
-        ast: Ast::default(),
+        ast: ProgramAst::default(),
         pending_dedents: 0,
         depth: 0,
     };
@@ -70,7 +71,7 @@ pub fn parse(src: &str) -> Result<Ast<'_>, ParseError> {
 struct Parser<'src> {
     tokens: Vec<Token<'src>>,
     pos: usize,
-    ast: Ast<'src>,
+    ast: ProgramAst<'src>,
     // A wrapped one-line conditional (`… if c` then `else …` on the next line, aligned to the
     // expression's column) opens an `Indent` the layout will later close with a `Dedent`. That
     // `Dedent` is *not* a block terminator, so `parse_conditional` records it here and the

@@ -25,12 +25,27 @@ use std::time::SystemTime;
 
 /// The runtime entry points made visible to the JIT; everything else (mimalloc)
 /// stays out of the dynamic symbol table.
-const EXPORTED_SYMBOLS: [&str; 5] = [
+/// Every runtime symbol JIT-compiled pinp code calls. The C shim's names come from
+/// `src/runtime/shim.c`; the `pinp_str_*` and `pinp_meminfo` names are Rust `#[no_mangle]`
+/// functions in `src/runtime/string.rs`. Both kinds need publishing either way: a Linux executable
+/// keeps its symbols out of the dynamic symbol table unless the link asks for them, and the JIT's
+/// `dlsym`-based generator can only find what is in that table.
+const EXPORTED_SYMBOLS: [&str; 15] = [
     "pinp_alloc",
     "pinp_free",
     "pinp_memory_info",
     "pinp_runtime_error",
     "pinp_run",
+    "pinp_str_from_cstr",
+    "pinp_str_free",
+    "pinp_str_concat",
+    "pinp_str_concat_n",
+    "pinp_str_len",
+    "pinp_str_eq",
+    "pinp_str_cmp",
+    "pinp_str_from_int",
+    "pinp_str_from_float",
+    "pinp_meminfo",
 ];
 
 fn main() {

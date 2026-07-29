@@ -3,11 +3,11 @@
 use super::*;
 use indoc::indoc;
 
-fn parse_ok(src: &str) -> Ast<'_> {
+fn parse_ok(src: &str) -> ProgramAst<'_> {
     parse(src).unwrap()
 }
 
-fn func<'ast>(ast: &'ast Ast, index: usize) -> &'ast FuncDef {
+fn func<'ast>(ast: &'ast ProgramAst, index: usize) -> &'ast FuncDef {
     match &ast.top_level[index] {
         TopLevel::Func(func_def) => func_def,
         other => panic!("Top-level element {index} is not a function: {other:?}."),
@@ -15,7 +15,7 @@ fn func<'ast>(ast: &'ast Ast, index: usize) -> &'ast FuncDef {
 }
 
 // ExprId of the last top-level statement's expression.
-fn root(ast: &Ast) -> ExprId {
+fn root(ast: &ProgramAst) -> ExprId {
     match ast.top_level.last().unwrap() {
         TopLevel::Stmt(Stmt::Expr(expr_id)) => *expr_id,
         TopLevel::Stmt(Stmt::Assign { values, .. }) => *values.last().unwrap(),
@@ -354,7 +354,7 @@ fn compound_assign_desugars_to_read_and_op() {
 
 // --- multiple-target assignment ------------------------------------------------------
 
-fn last_assign<'a>(ast: &'a Ast) -> (&'a Vec<Vec<Place>>, &'a Vec<ExprId>) {
+fn last_assign<'a>(ast: &'a ProgramAst) -> (&'a Vec<Vec<Place>>, &'a Vec<ExprId>) {
     let TopLevel::Stmt(Stmt::Assign {
         target_lists,
         values,
@@ -1446,4 +1446,333 @@ fn for_array_both_index_binders_underscore_parses() {
     assert_eq!(binders.len(), 3);
     assert_eq!(ast.names[binders[0].value()], "_");
     assert_eq!(ast.names[binders[1].value()], "_");
+}
+
+// --- string & f-string literals ------------------------------------------------------
+
+fn str_content<'ast>(ast: &'ast ProgramAst) -> &'ast str {
+    match ast.node(root(ast)) {
+        Node::Str(str_id) => ast.string_literal(*str_id),
+        other => panic!("Expected a Str node, got {other:?}."),
+    }
+}
+
+fn fstr_segments<'ast>(ast: &'ast ProgramAst) -> &'ast [FStrSegment] {
+    match ast.node(root(ast)) {
+        Node::FStr { segments } => segments,
+        other => panic!("Expected an FStr node, got {other:?}."),
+    }
+}
+
+#[test]
+fn string_literal_both_quotes() {
+    for src in ["'hello'", "\"hello\""] {
+        assert_eq!(str_content(&parse_ok(src)), "hello");
+    }
+}
+
+#[test]
+fn empty_string_literal_has_empty_content() {
+    assert_eq!(str_content(&parse_ok("''")), "");
+}
+
+#[test]
+fn string_content_is_verbatim() {
+    // Delimiters stripped; everything between is kept exactly — spaces, punctuation, a `#`.
+    assert_eq!(str_content(&parse_ok("'a b, 1.  #x'")), "a b, 1.  #x");
+}
+
+#[test]
+fn opposite_quote_is_content() {
+    assert_eq!(str_content(&parse_ok("\"can't\"")), "can't");
+}
+
+#[test]
+fn string_is_an_assignable_value() {
+    let ast = parse_ok("x = 'hi'");
+    let TopLevel::Stmt(Stmt::Assign { values, .. }) = ast.top_level.last().unwrap() else {
+        panic!("Expected an assignment.");
+    };
+    assert!(matches!(ast.node(values[0]), Node::Str(_)));
+}
+
+#[test]
+fn distinct_literals_get_distinct_ids() {
+    let ast = parse_ok(indoc! {"
+        'a'
+        'bb'
+    "});
+    let ids: Vec<StrId> = ast
+        .top_level
+        .iter()
+        .filter_map(|item| match item {
+            TopLevel::Stmt(Stmt::Expr(expr_id)) => match ast.node(*expr_id) {
+                Node::Str(str_id) => Some(*str_id),
+                _ => None,
+            },
+            _ => None,
+        })
+        .collect();
+    assert_eq!(ids.len(), 2);
+    assert_ne!(ids[0], ids[1]);
+    assert_eq!(ast.string_literal(ids[0]), "a");
+    assert_eq!(ast.string_literal(ids[1]), "bb");
+}
+
+#[test]
+fn member_access_on_string_literal() {
+    // `.len` postfix is reused unchanged: a Member over a Str object.
+    let ast = parse_ok("'hi'.len");
+    let Node::Member { object, .. } = ast.node(root(&ast)) else {
+        panic!("Expected a Member node.");
+    };
+    assert!(matches!(ast.node(*object), Node::Str(_)));
+}
+
+#[test]
+fn function_can_return_str() {
+    let ast = parse_ok("greet(): str is 'hi'");
+    assert_eq!(func(&ast, 0).return_type, PinpType::Str);
+}
+
+#[test]
+fn bare_f_is_a_variable() {
+    let ast = parse_ok("f");
+    assert!(matches!(ast.node(root(&ast)), Node::Var(_)));
+}
+
+#[test]
+fn fstring_literal_only() {
+    let ast = parse_ok("f'hello'");
+    let segments = fstr_segments(&ast);
+    assert_eq!(segments.len(), 1);
+    let FStrSegment::Literal(str_id) = segments[0] else {
+        panic!("Expected a literal segment.");
+    };
+    assert_eq!(ast.string_literal(str_id), "hello");
+}
+
+#[test]
+fn fstring_empty_has_no_segments() {
+    assert!(fstr_segments(&parse_ok("f''")).is_empty());
+}
+
+#[test]
+fn fstring_single_local_hole() {
+    let ast = parse_ok("f'{x}'");
+    let segments = fstr_segments(&ast);
+    assert_eq!(segments.len(), 1);
+    let FStrSegment::Interp(Place::Local(sym_id)) = segments[0] else {
+        panic!("Expected a local interpolation.");
+    };
+    assert_eq!(ast.names[sym_id.value()], "x");
+}
+
+#[test]
+fn fstring_global_hole() {
+    let ast = parse_ok("f'{::g}'");
+    let FStrSegment::Interp(Place::Global(sym_id)) = fstr_segments(&ast)[0] else {
+        panic!("Expected a global interpolation.");
+    };
+    assert_eq!(ast.names[sym_id.value()], "g");
+}
+
+#[test]
+fn fstring_hole_tolerates_whitespace() {
+    // The hole text is re-lexed, so `{ x }` resolves to the same name as `{x}`.
+    let ast = parse_ok("f'{ x }'");
+    let FStrSegment::Interp(Place::Local(sym_id)) = fstr_segments(&ast)[0] else {
+        panic!("Expected a local interpolation.");
+    };
+    assert_eq!(ast.names[sym_id.value()], "x");
+}
+
+#[test]
+fn fstring_literals_around_holes() {
+    let ast = parse_ok("f'a{x}b{y}c'");
+    let segments = fstr_segments(&ast);
+    assert_eq!(segments.len(), 5); // "a", x, "b", y, "c"
+    let FStrSegment::Literal(mid) = segments[2] else {
+        panic!("Expected a literal between the holes.");
+    };
+    assert_eq!(ast.string_literal(mid), "b");
+}
+
+#[test]
+fn fstring_adjacent_holes_have_no_empty_literal() {
+    let ast = parse_ok("f'{x}{y}'");
+    let segments = fstr_segments(&ast);
+    assert_eq!(segments.len(), 2);
+    assert!(segments.iter().all(|s| matches!(s, FStrSegment::Interp(_))));
+}
+
+#[test]
+fn fstring_empty_hole_is_error() {
+    assert!(parse("f'{}'").is_err());
+}
+
+#[test]
+fn fstring_unterminated_hole_is_error() {
+    assert!(parse("f'{x'").is_err());
+}
+
+#[test]
+fn fstring_non_name_holes_are_errors() {
+    for src in ["f'{1}'", "f'{a b}'", "f'{a+b}'", "f'{::}'", "f'{_}'"] {
+        assert!(parse(src).is_err(), "expected `{src}` to be rejected");
+    }
+}
+
+#[test]
+fn fstring_stray_close_brace_is_error() {
+    assert!(parse("f'}'").is_err());
+}
+
+#[test]
+fn fstring_hole_with_comment_is_error() {
+    // Re-lexing the hole must not let `#` start a comment: `f'{x#note}'` would otherwise silently
+    // interpolate `x` and swallow the rest of the hole.
+    for src in ["f'{x#note}'", "f'{ x # note }'", "f'{#}'"] {
+        assert!(parse(src).is_err(), "expected `{src}` to be rejected");
+    }
+}
+
+// --- multiline literals and auto-dedent ----------------------------------------------
+//
+// A literal may span physical lines, and its continuation lines are auto-dedented so the literal
+// can be indented to match the code around it without that indentation leaking into the value.
+// The first line is exempt: it begins right after the opening quote and carries no indent of its
+// own.
+
+#[test]
+fn single_line_content_is_never_dedented() {
+    // With no newline there are no continuation lines, so leading spaces are content.
+    assert_eq!(str_content(&parse_ok("'   padded'")), "   padded");
+    assert_eq!(str_content(&parse_ok("'  a  b  '")), "  a  b  ");
+}
+
+#[test]
+fn continuation_lines_lose_the_common_indent() {
+    let ast = parse_ok(indoc! {"
+        x = 'first
+             second
+             third'
+        x
+    "});
+    let Some(TopLevel::Stmt(Stmt::Assign { values, .. })) = ast.top_level.first() else {
+        panic!("Expected an assignment.");
+    };
+    let Node::Str(str_id) = ast.node(values[0]) else {
+        panic!("Expected a Str node.");
+    };
+    assert_eq!(ast.string_literal(*str_id), "first\nsecond\nthird");
+}
+
+#[test]
+fn the_common_indent_is_the_shallowest_continuation_line() {
+    // Indentation beyond the shared prefix is content: only what every continuation line has in
+    // common comes off.
+    assert_eq!(
+        str_content(&parse_ok("'first\n    second\n        third'")),
+        "first\nsecond\n    third"
+    );
+    assert_eq!(
+        str_content(&parse_ok("'first\n        second\n    third'")),
+        "first\n    second\nthird"
+    );
+}
+
+#[test]
+fn the_first_line_keeps_its_own_spacing() {
+    // The first line's leading spaces sit right after the opening quote and are deliberate.
+    assert_eq!(
+        str_content(&parse_ok("'   first\n   second'")),
+        "   first\nsecond"
+    );
+}
+
+#[test]
+fn blank_lines_do_not_constrain_the_common_indent() {
+    // An empty line and a whitespace-only line say nothing about the intended indent; without this
+    // exemption a single blank line would defeat dedenting entirely.
+    assert_eq!(
+        str_content(&parse_ok("'first\n\n    second'")),
+        "first\n\nsecond"
+    );
+    assert_eq!(
+        str_content(&parse_ok("'first\n  \n    second'")),
+        "first\n\nsecond",
+        "a whitespace-only line loses its spaces rather than keeping a stray prefix"
+    );
+}
+
+#[test]
+fn a_trailing_newline_inside_a_literal_is_kept() {
+    // The literal's own content ends where the closing quote is; an empty final line is real.
+    assert_eq!(str_content(&parse_ok("'first\n    '")), "first\n");
+    assert_eq!(str_content(&parse_ok("'first\n'")), "first\n");
+}
+
+#[test]
+fn a_line_with_no_indent_disables_dedenting() {
+    // Nothing is shared, so nothing comes off.
+    assert_eq!(
+        str_content(&parse_ok("'first\nsecond\n    third'")),
+        "first\nsecond\n    third"
+    );
+}
+
+#[test]
+fn tabs_are_not_spaces_and_are_left_alone() {
+    // Dedenting counts spaces only (pinp's own layout is space-based), so a tab-led continuation
+    // line shares no prefix and the literal keeps every byte.
+    assert_eq!(
+        str_content(&parse_ok("'first\n\tsecond'")),
+        "first\n\tsecond"
+    );
+    assert_eq!(
+        str_content(&parse_ok("'first\n    \tsecond\n    \tthird'")),
+        "first\n\tsecond\n\tthird",
+        "the shared spaces still come off; the tabs after them stay"
+    );
+}
+
+#[test]
+fn crlf_inside_a_literal_is_normalised() {
+    // A Windows checkout must not put stray `\r`s into string values.
+    assert_eq!(
+        str_content(&parse_ok("'first\r\n     second'")),
+        "first\nsecond"
+    );
+    // And the `\r` of a CRLF pair is the only one that goes; a lone `\r` is ordinary content.
+    assert_eq!(str_content(&parse_ok("'a\rb'")), "a\rb");
+}
+
+#[test]
+fn a_multiline_fstring_dedents_before_splitting() {
+    // Dedent applies to the whole inter-delimiter content, so a hole sitting mid-line is untouched
+    // and the literal runs around it come out consistently.
+    let ast = parse_ok("f'first {x}\n     second {y} tail'");
+    let segments = fstr_segments(&ast);
+    let literals: Vec<&str> = segments
+        .iter()
+        .filter_map(|segment| match segment {
+            FStrSegment::Literal(str_id) => Some(ast.string_literal(*str_id)),
+            FStrSegment::Interp(_) => None,
+        })
+        .collect();
+    assert_eq!(literals, vec!["first ", "\nsecond ", " tail"]);
+    assert_eq!(
+        segments
+            .iter()
+            .filter(|segment| matches!(segment, FStrSegment::Interp(_)))
+            .count(),
+        2
+    );
+}
+
+#[test]
+fn a_hole_may_not_span_lines() {
+    // A newline inside `{…}` cannot be part of a name, so the hole is not a name.
+    assert!(parse("f'{a\nb}'").is_err());
 }
