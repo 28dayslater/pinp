@@ -81,6 +81,18 @@ pub trait Analysis<'ast> {
     /// How a block's terminator transforms a fact — a `Branch` reads its condition, a `Return` its
     /// result expression.
     fn transfer_terminator(&self, terminator: &Terminator, fact: &mut Self::Fact);
+
+    /// Which of `block_id`'s successors control can actually take.
+    ///
+    /// Every one of them, unless an analysis knows better: an analysis that can decide a condition
+    /// before the program runs prunes the edge that is never taken, which is what makes anything
+    /// unreachable at all. Whether an edge is feasible is an analysis's judgement rather than the
+    /// graph's, so it lives here — the graph records what the program *says*.
+    ///
+    /// [`solve`] honours this in both directions: an edge dropped here carries no facts either way.
+    fn live_successors(&self, cfg: &Cfg<'ast>, block_id: BlockId) -> Vec<BlockId> {
+        cfg.successors(block_id)
+    }
 }
 
 /// The facts either side of every block, in **program order**: `before` holds just before a block's
@@ -146,10 +158,16 @@ pub fn solve<'ast, A: Analysis<'ast>>(cfg: &Cfg<'ast>, analysis: &A) -> Solution
 
         match A::DIRECTION {
             Direction::Forward => {
-                // Input is everything the predecessors produced.
+                // Input is everything the predecessors produced — over the edges that can be
+                // taken, so a predecessor whose branch never comes this way contributes nothing.
                 let mut incoming = A::Fact::nothing_known();
                 for predecessor in cfg.predecessors(block_id) {
-                    incoming.merge(&after[predecessor.value()]);
+                    if analysis
+                        .live_successors(cfg, *predecessor)
+                        .contains(&block_id)
+                    {
+                        incoming.merge(&after[predecessor.value()]);
+                    }
                 }
                 if block_id == cfg.entry() {
                     incoming.merge(&analysis.boundary());
@@ -164,13 +182,13 @@ pub fn solve<'ast, A: Analysis<'ast>>(cfg: &Cfg<'ast>, analysis: &A) -> Solution
 
                 if fact != after[block_id.value()] {
                     after[block_id.value()] = fact;
-                    worklist.extend(cfg.successors(block_id));
+                    worklist.extend(analysis.live_successors(cfg, block_id));
                 }
             }
             Direction::Backward => {
-                // Input is everything the successors will need.
+                // Input is everything the reachable successors will need.
                 let mut incoming = A::Fact::nothing_known();
-                for successor in cfg.successors(block_id) {
+                for successor in analysis.live_successors(cfg, block_id) {
                     incoming.merge(&before[successor.value()]);
                 }
                 if block_id == cfg.exit() {

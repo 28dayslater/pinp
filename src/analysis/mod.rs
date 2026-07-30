@@ -18,6 +18,7 @@
 //! The layer depends on [`crate::parser`] only, so it builds and tests without the `llvm` feature.
 
 pub mod cfg;
+pub mod checks;
 pub mod dataflow;
 pub mod diagnostic;
 
