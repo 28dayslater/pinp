@@ -18,6 +18,26 @@ The code is a teaching showcase — favor clear, explicit names over terse ones.
   `type`, `match`, …), spell out a descriptive alternative — `else_block`, `pinp_type` — not a
   truncation like `els`/`ty`. A bare truncation is a last resort only.
 - **Grammar-production methods are prefixed `parse_*`** (e.g. `parse_block`); plain helpers stay bare.
+- **Name a pass by what it produces — never a bare "lower".** *Lowering* is a family (AST → CFG is
+  as much a lowering as AST → LLVM IR), so the unqualified word stopped being an identifier the day
+  a second target existed. Each pass owns a distinct verb and method prefix:
+
+  | pass | verb | prefix |
+  |---|---|---|
+  | AST → LLVM IR | *generate* / "lower **to LLVM IR**" | `gen_*` (`src/codegen/`) |
+  | AST → control-flow graph | *build* / "CFG **construction**" | `build_*` (`src/analysis/cfg.rs`) |
+  | CFG × analysis → facts | *solve* | `solve` (`src/analysis/dataflow.rs`) |
+  | facts → diagnostics | *check* | `check_*` (`src/analysis/checks/`) |
+
+  In prose, "lowering" without a named target is a review comment.
+
+## Known issues ledger
+
+[dev-docs/known-issues-todos.md](dev-docs/known-issues-todos.md) is the **live** list of deferred
+problems — one `KI-NNNN` row each. `specs/` is the frozen decision record; the ledger is what is
+wrong *now*. Add a row when consciously deferring something real, mark the code site with
+`// TODO(KI-NNNN): …`, and **delete** the row when it is fixed. Its own header states the full
+convention, including where an item belongs when it is a missing feature rather than a defect.
 
 ## Messages & comments
 
