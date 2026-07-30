@@ -23,3 +23,34 @@ pub mod dataflow;
 pub mod diagnostic;
 
 pub use diagnostic::{Diagnostic, DiagnosticCode, Severity};
+
+use crate::parser::{ProgramAst, TopLevel};
+
+/// Runs every checker over a program, returning all findings in source order.
+///
+/// One control-flow graph per function plus one for the top level, each handed to every checker.
+/// The AST must already have been through [`crate::sema::analyze`]: the checkers read types and
+/// assume names resolve.
+pub fn check(ast: &ProgramAst) -> Vec<Diagnostic> {
+    let escaping = checks::liveness::escaping_symbols(ast);
+    let mut graphs = vec![cfg::Cfg::build_entry(ast)];
+    for item in &ast.top_level {
+        if let TopLevel::Func(func) = item {
+            graphs.push(cfg::Cfg::build_function(ast, func));
+        }
+    }
+
+    let mut diagnostics = Vec::new();
+    for graph in &graphs {
+        diagnostics.extend(checks::reachability::check(ast, graph));
+        diagnostics.extend(checks::liveness::check(ast, graph, &escaping));
+    }
+
+    // Report top to bottom. Findings are produced per graph and per checker, which is neither of
+    // those orders; a position with no span sorts last rather than to the top of the file.
+    diagnostics.sort_by_key(|diagnostic| match diagnostic.span.is_unknown() {
+        true => (u32::MAX, u32::MAX),
+        false => (diagnostic.span.start, diagnostic.span.end),
+    });
+    diagnostics
+}

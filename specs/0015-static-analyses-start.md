@@ -23,9 +23,9 @@ In scope:
   functions, and a worklist solver run to fixpoint.
 - **Reachability checker** — unreachable statements (`while false`, a constant-false `if` arm, a
   `for` over an empty literal range).
+- A `check` entry point that runs every checker over a program and reports all findings at once.
 - **Liveness checker** — dead stores (a value overwritten before it is read) and unused bindings
   (never read at all).
-- **SARIF 2.1.0 output** for the collected diagnostics.
 
 Deferred (see the closing section for the full list):
 - Ownership/lifetime as a dataflow analysis — the successor iteration, and the one that retires
@@ -210,13 +210,13 @@ pub struct Diagnostic {
 }
 ```
 
-`DiagnosticCode` carries `code_str()` (`"PINP0101"`) and `title()` (a short rule name), so rendering
-and SARIF share one source of truth. This is the structured-error-code refactor that has been on the
+`DiagnosticCode` carries `code()` (`"PINP0101"`), `name()` (a kebab-case rule name), and
+`description()`, so every consumer of a finding shares one source of truth. This is the structured-error-code refactor that has been on the
 backlog; `SemaError` is **not** migrated in this iteration (it stays fail-fast and message-only) to
 keep the diff to the new layer, but the enum is designed so it can absorb sema's errors later.
 
-A plain text renderer (`code`, severity, `line:col`, message, then notes) is enough for tests and
-for the future runner; SARIF is step 7.
+A plain text renderer (`line:col`, severity, `code`, message, then notes) is all the output this
+iteration needs — for the tests now and the runner later.
 
 **Tests:** rendering, and a test asserting every `DiagnosticCode` has a distinct numeric code — the
 kind of thing that silently breaks when a variant is inserted in the middle.
@@ -444,37 +444,30 @@ then diagnostic-level tests for each finding and each suppression.
 
 ---
 
-## Step 7 — SARIF and the `check` entry point ([src/analysis/sarif.rs](src/analysis/sarif.rs))
+## Step 7 — The `check` entry point ([src/analysis/mod.rs](src/analysis/mod.rs))
 
 ```rust
 /// Runs every checker over an analysed program, returning all findings in source order.
-pub fn check(ast: &ProgramAst, source: &str) -> Vec<Diagnostic>;
-
-/// Serialises findings as SARIF 2.1.0.
-pub fn to_sarif(diagnostics: &[Diagnostic], source_path: &str, source: &str) -> String;
+pub fn check(ast: &ProgramAst) -> Vec<Diagnostic>;
 ```
 
-SARIF is the interchange format static-analysis tooling consumes, which is the reason for choosing
-it over a bespoke JSON shape. The emitted document carries `version`, one `run`, a `tool.driver`
-with `rules` derived from `DiagnosticCode` (id, name, short description), and one `result` per
-finding with `ruleId`, `level`, `message.text`, and a `physicalLocation` carrying both the byte
-`region` (`charOffset`/`charLength`) and the resolved `startLine`/`startColumn`.
+One graph per function plus one for the top level, each handed to both checkers, with the results
+sorted by source position so a run reads top to bottom. Rendering is the text form from step 2.
 
-**Written by hand, without `serde_json`.** The document shape is fixed and small, the only subtlety
-is string escaping, and the project's dependency list is deliberately short. The escaping helper is
-tested directly against quotes, backslashes, newlines, and a non-ASCII byte.
+**Tests:** end-to-end in [tests/analysis.rs](tests/analysis.rs) — source in, findings out, checked
+by code and resolved line/column; a clean program yields none; a program with several findings
+reports them all, in source order. That last one is the batch-reporting property, and the one thing
+fail-fast sema structurally cannot demonstrate.
 
-**Tests:** a golden-ish test asserting the SARIF for a two-finding program contains the expected
-rule ids, levels, offsets, and resolved line/columns; a test that the output parses as JSON (a
-minimal recursive-descent validator in the test module, or a byte-level check that quotes and braces
-balance — cheap insurance against a malformed escape).
+*(SARIF output was specified here and dropped: it serialises findings for other analysis tools to
+ingest, and pinp has no such consumer. See Deferred.)*
 
 ---
 
 ## Step 8 — README
 
-A short **Analyses** section: what the layer does, the current finding list with codes, and the
-SARIF output. The analyses are invisible from the language surface, so nothing else advertises them.
+A short **Analyses** section: what the layer does and the current finding list with codes. The
+analyses are invisible from the language surface, so nothing else advertises them.
 
 ---
 
@@ -486,7 +479,6 @@ src/analysis/
     diagnostic.rs           — Severity, DiagnosticCode, Diagnostic, text rendering
     cfg.rs                  — BasicBlock, Terminator, Cfg, construction, dot dump
     dataflow.rs             — Lattice, Direction, Analysis, BitSet, the worklist solver
-    sarif.rs                — SARIF 2.1.0 emitter
     checks/
         reachability.rs
         liveness.rs
@@ -513,7 +505,6 @@ Per the project test policy, each step's tests are written and reviewed before i
   and resolved line/column for each finding; a clean program yields none; a program with several
   findings reports them all, in source order (the batch-reporting property, which is the one thing
   fail-fast sema cannot demonstrate).
-- **SARIF**: as described in step 7.
 
 ## Deferred
 
@@ -536,6 +527,10 @@ Per the project test policy, each step's tests are written and reviewed before i
 - **Interprocedural analysis** — a call graph and cross-function fact propagation. pinp has no
   recursion (signatures are recorded after each definition), so the call graph is a DAG and a
   bottom-up summary-based approach is straightforward.
+- **SARIF output** — the standard JSON interchange format for static-analysis findings, which is
+  what other tools ingest. Dropped from this iteration as a serialisation format with no consumer;
+  the `DiagnosticCode` metadata it would need (stable id, rule name, one-line description) is
+  already in place, so adding an emitter later is self-contained.
 - **Suppression** — a comment pragma (`# pinp: allow(dead-store)`) once there are enough findings
   for it to matter. Comments are currently discarded by the lexer, so this needs them retained.
 - **Taint analysis** — deferred until the language has I/O; there are no sources or sinks to
