@@ -2,6 +2,13 @@
 
 # Static analysis foundations — CFG, dataflow framework, diagnostics
 
+> **Superseded in places by [0016](0016-diagnostics.md):** the diagnostic codes throughout this
+> document were renumbered `PINP0101`–`PINP0103` → `PINP1001`–`PINP1003`, and
+> `src/analysis/diagnostic.rs` moved to [src/diagnostic.rs](src/diagnostic.rs). The
+> `unused-binding` rule was also renamed **`unused-variable`**, reports at the symbol's first
+> write rather than its last, and no longer suppresses the dead stores at a never-read symbol's
+> other writes — see 0016's implementation note 8. Everything else recorded here stands.
+
 This iteration is an internal rework and does not add any language features.
 
 pinp checks its programs with a recursive, syntax-directed walk: [sema](src/sema/analyzer.rs) carries

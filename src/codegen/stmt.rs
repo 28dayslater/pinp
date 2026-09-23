@@ -172,6 +172,7 @@ impl<'ctx, 'ast> CodeGen<'ctx, 'ast> {
                 index,
                 value,
                 compound_op,
+                ..
             } => {
                 // Look up the array variable's alloca slot and confirm it is an array.
                 let (slot_ptr, array_pinp_type) = match *target {
@@ -237,6 +238,7 @@ impl<'ctx, 'ast> CodeGen<'ctx, 'ast> {
                 col,
                 value,
                 compound_op,
+                ..
             } => self.gen_indexed_assign2d(*target, *row, *col, *value, *compound_op),
         }
     }

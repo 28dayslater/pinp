@@ -2,28 +2,37 @@
 
 //! Liveness: which bindings still have a read ahead of them.
 //!
-//! A backward analysis — the fact at a point is the set of symbols something later will read. A
-//! read makes a symbol live, a write kills it (whatever was there is gone), and at a merge the sets
-//! union, because a symbol read on *any* onward path is still needed.
+//! A backward analysis: its fact is the set of live symbols, and a read makes a symbol live while
+//! a write kills it. Terms shared across this layer — fact, merge, direction, finding — are defined
+//! in [`crate::analysis`]; the graph terms in [`crate::cfg`].
 //!
-//! Two findings fall out of the solution:
+//! Vocabulary particular to liveness:
 //!
-//! * a write to a symbol that is not live immediately afterwards is a **dead store** — the value is
-//!   replaced or discarded before anything looks at it;
-//! * a symbol with no read anywhere is an **unused binding**.
+//! * Binding: a symbol with a value. An assignment creates or updates one.
+//! * Read, write: a use of a symbol's value, and a store into it.
+//! * Live: a symbol some later read reaches on at least one path. Merging unions the sets, because
+//!   a symbol read on *any* onward path is still needed.
+//! * Kill: what a write does to the value that was there.
+//! * Escaping: a symbol outliving this graph — a global another function may read. Live wherever
+//!   the graph ends; see [`escaping_symbols`].
+//! * Dead store: a write to a symbol that is not live immediately afterwards — the value is
+//!   replaced or discarded before anything looks at it.
+//! * Unused variable: a symbol with no read anywhere.
 //!
-//! They are separate rules because the fix differs, and because reporting every store to a
-//! never-read binding would bury the one line worth changing.
+//! The last two are this module's findings, kept as separate rules. The remedies differ: a dead
+//! store is one assignment to delete; an unused variable is the binding and every write to it.
+//! A symbol nothing reads yields an unused-variable finding at its introduction and a dead store
+//! at each later write, matching what `rustc` reports for the same shape.
 
-use rustc_hash::FxHashSet;
+use rustc_hash::{FxHashMap, FxHashSet};
 
-use crate::analysis::cfg::{Action, Cfg, Terminator};
 use crate::analysis::dataflow::{Analysis, Direction, MergeableFact, SymbolSetFact, solve};
-use crate::analysis::diagnostic::{Diagnostic, DiagnosticCode};
+use crate::cfg::{Action, Cfg, Terminator};
+use crate::diagnostic::{Diagnostic, DiagnosticCode};
 use crate::lexer::Span;
 use crate::parser::{Block, ExprId, FStrSegment, Node, Place, ProgramAst, Stmt, SymId};
 
-/// Reports dead stores and unused bindings in one graph.
+/// Reports dead stores and unused variables in one graph.
 ///
 /// `escaping` are symbols that outlive this graph — globals, which another function may read — and
 /// are treated as live wherever the graph ends. Compute them once with [`escaping_symbols`].
@@ -31,7 +40,7 @@ pub fn check(ast: &ProgramAst, cfg: &Cfg, escaping: &FxHashSet<SymId>) -> Vec<Di
     let analysis = Liveness { ast, escaping };
     let solution = solve(cfg, &analysis);
 
-    // Every symbol anything reads, anywhere in this graph: what tells an unused binding from a
+    // Every symbol anything reads, anywhere in this graph: what tells an unused variable from a
     // merely dead store.
     let mut ever_read: FxHashSet<SymId> = FxHashSet::default();
     for block_id in cfg.block_ids() {
@@ -41,8 +50,30 @@ pub fn check(ast: &ProgramAst, cfg: &Cfg, escaping: &FxHashSet<SymId>) -> Vec<Di
         analysis.reads_of_terminator(&cfg.block(block_id).terminator, &mut ever_read);
     }
 
+    // Where each symbol is introduced: its lowest write position. The blocks are walked backwards
+    // below, so the first write reached is the last one written — not where a reader would delete
+    // the variable from.
+    let mut introduction: FxHashMap<SymId, Span> = FxHashMap::default();
+    for block_id in cfg.block_ids() {
+        for action in &cfg.block(block_id).actions {
+            let Action::Statement(stmt) = action else {
+                continue;
+            };
+            for (sym_id, span) in analysis.writes_of_stmt(stmt) {
+                introduction
+                    .entry(sym_id)
+                    .and_modify(|first| {
+                        if span.start < first.start {
+                            *first = span;
+                        }
+                    })
+                    .or_insert(span);
+            }
+        }
+    }
+
     let mut diagnostics = Vec::new();
-    // First write per symbol, so an unused binding is reported once, where it is introduced.
+    // One unused-variable finding per symbol, at its introduction.
     let mut reported_unused: FxHashSet<SymId> = FxHashSet::default();
 
     for block_id in cfg.block_ids() {
@@ -61,14 +92,15 @@ pub fn check(ast: &ProgramAst, cfg: &Cfg, escaping: &FxHashSet<SymId>) -> Vec<Di
                 if analysis.is_exempt(sym_id) {
                     continue;
                 }
-                if !ever_read.contains(&sym_id) {
-                    if reported_unused.insert(sym_id) {
-                        diagnostics.push(Diagnostic::new(
-                            DiagnosticCode::UnusedBinding,
-                            span,
-                            format!("Binding `{}` is never read.", analysis.name(sym_id)),
-                        ));
-                    }
+                // A symbol whose value is never read is an unused variable at its introduction;
+                // every later write to it is a dead store like any other.
+                let introduces = introduction.get(&sym_id) == Some(&span);
+                if !ever_read.contains(&sym_id) && introduces && reported_unused.insert(sym_id) {
+                    diagnostics.push(Diagnostic::new(
+                        DiagnosticCode::UnusedVariable,
+                        span,
+                        format!("Variable `{}` is never used.", analysis.name(sym_id)),
+                    ));
                 } else if !live.contains(sym_id) {
                     diagnostics.push(Diagnostic::new(
                         DiagnosticCode::DeadStore,
@@ -378,7 +410,7 @@ fn place_sym(place: Place) -> SymId {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::analysis::diagnostic::DiagnosticCode;
+    use crate::diagnostic::DiagnosticCode;
     use crate::parser::{TopLevel, parse};
     use indoc::indoc;
 
@@ -391,7 +423,10 @@ mod tests {
             .into_iter()
             .map(|diagnostic| {
                 (
-                    diagnostic.code.name(),
+                    diagnostic
+                        .code
+                        .expect("a checker finding always carries a code")
+                        .name(),
                     diagnostic.span.text(src).to_string(),
                 )
             })
@@ -412,7 +447,10 @@ mod tests {
             .into_iter()
             .map(|diagnostic| {
                 (
-                    diagnostic.code.name(),
+                    diagnostic
+                        .code
+                        .expect("a checker finding always carries a code")
+                        .name(),
                     diagnostic.span.text(src).to_string(),
                 )
             })
@@ -434,19 +472,43 @@ mod tests {
     }
 
     #[test]
-    fn a_binding_nothing_reads_is_unused() {
+    fn a_symbol_nothing_reads_is_an_unused_variable() {
         assert_eq!(
             findings("a = 1\n0"),
-            vec![("unused-binding", "a".to_string())]
+            vec![("unused-variable", "a".to_string())]
         );
     }
 
     #[test]
-    fn an_unused_binding_is_reported_once_however_many_stores() {
-        // Three stores, one message: the fix is to the binding, not to each line.
-        let found = findings("a = 1\na = 2\na = 3\n0");
-        assert_eq!(found.len(), 1);
-        assert_eq!(found[0].0, "unused-binding");
+    fn a_never_read_symbol_reports_its_introduction_then_dead_stores() {
+        // One unused-variable where the symbol is introduced, one dead store per later write —
+        // the later writes are dead whether or not anything ever reads the symbol.
+        let mut found = findings("a = 1\na = 2\na = 3\n0");
+        found.sort();
+        assert_eq!(
+            found,
+            vec![
+                ("dead-store", "a".to_string()),
+                ("dead-store", "a".to_string()),
+                ("unused-variable", "a".to_string()),
+            ]
+        );
+    }
+
+    #[test]
+    fn an_unused_variable_is_reported_at_its_introduction() {
+        // Not at the last write: the backward walk reaches that one first, but the reader deletes
+        // the binding from where it starts.
+        let src = "alpha = 1\nalpha = 2\nalpha = 3\n0";
+        let ast = parse(src).unwrap();
+        let cfg = Cfg::build_entry(&ast);
+        let escaping = escaping_symbols(&ast);
+        let unused: Vec<u32> = check(&ast, &cfg, &escaping)
+            .into_iter()
+            .filter(|diagnostic| diagnostic.code == Some(DiagnosticCode::UnusedVariable))
+            .map(|diagnostic| diagnostic.span.start)
+            .collect();
+        assert_eq!(unused, vec![0], "the first `alpha`, at offset 0");
     }
 
     #[test]
@@ -563,7 +625,7 @@ mod tests {
                     n
                 f(1)
             "}),
-            vec![("unused-binding", "unused".to_string())]
+            vec![("unused-variable", "unused".to_string())]
         );
     }
 
@@ -630,7 +692,7 @@ mod tests {
         "});
         let codes: Vec<&str> = found.iter().map(|(code, _)| *code).collect();
         assert!(codes.contains(&DiagnosticCode::DeadStore.name()));
-        assert!(codes.contains(&DiagnosticCode::UnusedBinding.name()));
+        assert!(codes.contains(&DiagnosticCode::UnusedVariable.name()));
         assert_eq!(found.len(), 2);
     }
 }

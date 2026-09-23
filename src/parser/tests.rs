@@ -8,6 +8,15 @@ fn parse_ok(src: &str) -> ProgramAst<'_> {
     parse(src).unwrap()
 }
 
+/// Parse (expecting failure), returning the kind of error. Tests assert on the kind rather than
+/// the whole error so a span change is not a change to every expectation.
+fn parse_error(src: &str) -> ParseErrorKind {
+    match parse(src) {
+        Err(error) => error.kind,
+        Ok(_) => panic!("Source should not parse."),
+    }
+}
+
 fn func<'ast>(ast: &'ast ProgramAst, index: usize) -> &'ast FuncDef {
     match &ast.top_level[index] {
         TopLevel::Func(func_def) => func_def,
@@ -175,7 +184,7 @@ fn for_four_binders_is_parse_error() {
         for a, b, c, d in arr
             a
     "};
-    assert!(matches!(parse(src), Err(ParseError::Unexpected(_))));
+    assert!(matches!(parse_error(src), ParseErrorKind::Unexpected(_)));
 }
 
 #[test]
@@ -211,7 +220,7 @@ fn for_missing_first_binder_is_parse_error() {
         for , val in arr
             val
     "};
-    assert!(matches!(parse(src), Err(ParseError::Unexpected(_))));
+    assert!(matches!(parse_error(src), ParseErrorKind::Unexpected(_)));
 }
 
 #[test]
@@ -221,7 +230,7 @@ fn for_trailing_binder_comma_is_parse_error() {
         for idx, in arr
             val
     "};
-    assert!(matches!(parse(src), Err(ParseError::Unexpected(_))));
+    assert!(matches!(parse_error(src), ParseErrorKind::Unexpected(_)));
 }
 
 #[test]
@@ -231,7 +240,7 @@ fn for_non_identifier_binder_is_parse_error() {
         for idx, 42 in arr
             val
     "};
-    assert!(matches!(parse(src), Err(ParseError::Unexpected(_))));
+    assert!(matches!(parse_error(src), ParseErrorKind::Unexpected(_)));
 }
 
 #[test]
@@ -250,6 +259,7 @@ fn indexed_assign2d_compound_add_eq_parses() {
     let ast = parse_ok("m[0, 1] += 5");
     let TopLevel::Stmt(Stmt::IndexedAssign2D {
         target,
+        target_span,
         row,
         col,
         value,
@@ -259,6 +269,7 @@ fn indexed_assign2d_compound_add_eq_parses() {
         panic!("Expected IndexedAssign2D.");
     };
     assert!(matches!(target, Place::Local(_)));
+    assert_eq!(target_span.text("m[0, 1] += 5"), "m");
     assert_eq!(*ast.node(*row), Node::Int(0));
     assert_eq!(*ast.node(*col), Node::Int(1));
     assert_eq!(*compound_op, Some(BinOp::Add));
@@ -406,31 +417,40 @@ fn single_assignment_is_degenerate_multi() {
 
 #[test]
 fn arity_mismatch_is_error() {
-    assert!(matches!(parse("a, b = 1"), Err(ParseError::Unexpected(_))));
     assert!(matches!(
-        parse("a, b = c = 1, 2"),
-        Err(ParseError::Unexpected(_))
+        parse_error("a, b = 1"),
+        ParseErrorKind::Unexpected(_)
+    ));
+    assert!(matches!(
+        parse_error("a, b = c = 1, 2"),
+        ParseErrorKind::Unexpected(_)
     ));
 }
 
 #[test]
 fn non_place_target_is_error() {
-    assert!(matches!(parse("1 = 2"), Err(ParseError::Unexpected(_))));
-    assert!(matches!(parse("a + b = 1"), Err(ParseError::Unexpected(_))));
+    assert!(matches!(
+        parse_error("1 = 2"),
+        ParseErrorKind::Unexpected(_)
+    ));
+    assert!(matches!(
+        parse_error("a + b = 1"),
+        ParseErrorKind::Unexpected(_)
+    ));
 }
 
 #[test]
 fn compound_assign_in_multi_target_is_error() {
     // Compound assignment is single-target only; `a, b += 1, 2` is rejected.
     assert!(matches!(
-        parse("a, b += 1, 2"),
-        Err(ParseError::Unexpected(_))
+        parse_error("a, b += 1, 2"),
+        ParseErrorKind::Unexpected(_)
     ));
 }
 
 #[test]
 fn bare_comma_list_without_assignment_is_error() {
-    assert!(matches!(parse("a, b"), Err(ParseError::Unexpected(_))));
+    assert!(matches!(parse_error("a, b"), ParseErrorKind::Unexpected(_)));
 }
 
 // --- multiple-target assignment: line continuation -----------------------------------
@@ -479,7 +499,7 @@ fn misaligned_continuation_is_error() {
             a, b = 1,
               2
         "};
-    assert!(matches!(parse(src), Err(ParseError::Layout(_))));
+    assert!(matches!(parse_error(src), ParseErrorKind::Layout(_)));
 }
 
 #[test]
@@ -488,7 +508,7 @@ fn comma_starting_a_line_is_error() {
             a, b
             , c = 1, 2, 3
         "};
-    assert!(matches!(parse(src), Err(ParseError::Layout(_))));
+    assert!(matches!(parse_error(src), ParseErrorKind::Layout(_)));
 }
 
 #[test]
@@ -496,7 +516,7 @@ fn trailing_comma_without_continuation_is_error() {
     let src = indoc! {"
             a, b = 1, 2,
         "};
-    assert!(matches!(parse(src), Err(ParseError::Layout(_))));
+    assert!(matches!(parse_error(src), ParseErrorKind::Layout(_)));
 }
 
 // --- bool literals, logical & comparison operators -----------------------------------
@@ -619,14 +639,17 @@ fn monotonic_chains_parse() {
 
 #[test]
 fn non_monotonic_chains_are_errors() {
-    assert!(matches!(parse("a < b > c"), Err(ParseError::Unexpected(_))));
     assert!(matches!(
-        parse("a <= b == c"),
-        Err(ParseError::Unexpected(_))
+        parse_error("a < b > c"),
+        ParseErrorKind::Unexpected(_)
     ));
     assert!(matches!(
-        parse("a != b != c"),
-        Err(ParseError::Unexpected(_))
+        parse_error("a <= b == c"),
+        ParseErrorKind::Unexpected(_)
+    ));
+    assert!(matches!(
+        parse_error("a != b != c"),
+        ParseErrorKind::Unexpected(_)
     ));
 }
 
@@ -667,7 +690,7 @@ fn wrapped_conditional_alignment() {
             fu = 42 + 142 if a > 42
                else 42
         "};
-    assert!(matches!(parse(misaligned), Err(ParseError::Layout(_))));
+    assert!(matches!(parse_error(misaligned), ParseErrorKind::Layout(_)));
 }
 
 #[test]
@@ -749,12 +772,12 @@ fn body_ending_in_statement_has_no_result() {
 #[test]
 fn loop_without_trailing_condition_is_error() {
     assert!(matches!(
-        parse(indoc! {"
+        parse_error(indoc! {"
                 loop
                     a
                 b
             "}),
-        Err(ParseError::Unexpected(_))
+        ParseErrorKind::Unexpected(_)
     ));
 }
 
@@ -763,7 +786,10 @@ fn deeply_nested_input_errors_rather_than_overflowing() {
     // Thousands of nested parens would blow the stack without the depth guard; instead the
     // parser bails fast with an error well before the real stack is exhausted.
     let deep = format!("{}1{}", "(".repeat(5_000), ")".repeat(5_000));
-    assert!(matches!(parse(&deep), Err(ParseError::TooDeeplyNested(_))));
+    assert!(matches!(
+        parse_error(&deep),
+        ParseErrorKind::TooDeeplyNested(_)
+    ));
 }
 
 #[test]
@@ -781,7 +807,7 @@ fn excessive_if_arms_are_rejected() {
         src.push_str("elif a > 0\n    1\n");
     }
     src.push_str("else\n    1\n");
-    assert!(matches!(parse(&src), Err(ParseError::TooManyArms(_))));
+    assert!(matches!(parse_error(&src), ParseErrorKind::TooManyArms(_)));
 }
 
 #[test]
@@ -814,7 +840,7 @@ fn single_line_function() {
         panic!("Expected a missing-return-type error, but parsing succeeded.");
     };
     assert!(
-        matches!(&err, ParseError::Unexpected(msg) if msg.contains("return type")),
+        matches!(&err.kind, ParseErrorKind::Unexpected(msg) if msg.contains("return type")),
         "Expected an explicit missing-return-type error, got {err:?}."
     );
 }
@@ -916,7 +942,7 @@ fn misaligned_param_is_error() {
             f(aa: int,
                bb: int): int is aa+bb
         "};
-    assert!(matches!(parse(src), Err(ParseError::Layout(_))));
+    assert!(matches!(parse_error(src), ParseErrorKind::Layout(_)));
 }
 
 #[test]
@@ -927,22 +953,22 @@ fn hung_first_param_not_indented_is_error() {
             aa: int,
             bb: int): int is aa+bb
         "};
-    assert!(matches!(parse(src), Err(ParseError::Layout(_))));
+    assert!(matches!(parse_error(src), ParseErrorKind::Layout(_)));
 }
 
 #[test]
 fn duplicate_param_is_error() {
     assert!(matches!(
-        parse("f(a: int, a: int): int is a"),
-        Err(ParseError::Unexpected(_))
+        parse_error("f(a: int, a: int): int is a"),
+        ParseErrorKind::Unexpected(_)
     ));
 }
 
 #[test]
 fn unknown_type_name_is_error() {
     assert!(matches!(
-        parse("f(a: blah): int is a"),
-        Err(ParseError::Unexpected(_))
+        parse_error("f(a: blah): int is a"),
+        ParseErrorKind::Unexpected(_)
     ));
 }
 
@@ -950,18 +976,18 @@ fn unknown_type_name_is_error() {
 fn integer_literal_overflow_is_error() {
     // Lexically valid but out of i64 range, in every base — rejected, not panicked.
     assert!(matches!(
-        parse("99999999999999999999"),
-        Err(ParseError::Unexpected(_))
+        parse_error("99999999999999999999"),
+        ParseErrorKind::Unexpected(_)
     )); // decimal > i64::MAX
     assert!(matches!(
-        parse("0xFFFF_FFFF_FFFF_FFFF_F"),
-        Err(ParseError::Unexpected(_))
+        parse_error("0xFFFF_FFFF_FFFF_FFFF_F"),
+        ParseErrorKind::Unexpected(_)
     )); // 68-bit hex
-    assert!(matches!(parse("9E99"), Err(ParseError::Unexpected(_)))); // mantissa*10^exp overflows
+    assert!(matches!(parse_error("9E99"), ParseErrorKind::Unexpected(_))); // mantissa*10^exp overflows
     let wide_binary = format!("0b{}", "1".repeat(65));
     assert!(matches!(
-        parse(&wide_binary),
-        Err(ParseError::Unexpected(_))
+        parse_error(&wide_binary),
+        ParseErrorKind::Unexpected(_)
     )); // 65-bit binary
 }
 
@@ -1099,6 +1125,7 @@ fn indexed_assign_parse_shape() {
     let ast = parse_ok("a[0] = 99");
     let TopLevel::Stmt(Stmt::IndexedAssign {
         target,
+        target_span,
         index,
         value,
         compound_op,
@@ -1108,6 +1135,7 @@ fn indexed_assign_parse_shape() {
     };
     assert_eq!(*compound_op, None);
     assert!(matches!(target, Place::Local(_)));
+    assert_eq!(target_span.text("a[0] = 99"), "a");
     assert_eq!(*ast.node(*index), Node::Int(0));
     assert_eq!(*ast.node(*value), Node::Int(99));
 }
@@ -1186,8 +1214,8 @@ fn indexed_assign2d_global_target() {
 fn indexed_assign2d_non_place_target_is_error() {
     // A matrix literal is not a valid 2D assign target.
     assert!(matches!(
-        parse("[1, 2; 3, 4][0, 1] = 5"),
-        Err(ParseError::Unexpected(_))
+        parse_error("[1, 2; 3, 4][0, 1] = 5"),
+        ParseErrorKind::Unexpected(_)
     ));
 }
 
@@ -1277,8 +1305,8 @@ fn trailing_semicolon_is_parse_error() {
 fn trailing_comma_before_semicolon_is_parse_error() {
     // `[1, 2,; 3, 4]` — a dangling `,` before a row separator is invalid.
     assert!(matches!(
-        parse("[1, 2,; 3, 4]"),
-        Err(ParseError::Unexpected(_))
+        parse_error("[1, 2,; 3, 4]"),
+        ParseErrorKind::Unexpected(_)
     ));
 }
 
@@ -1289,7 +1317,7 @@ fn matrix_multiline_misaligned_row_is_layout_error() {
         [1, 2, 3;
            4, 5, 6]
     "};
-    assert!(matches!(parse(src), Err(ParseError::Layout(_))));
+    assert!(matches!(parse_error(src), ParseErrorKind::Layout(_)));
 }
 
 // --- 2D indexing and slicing -----------------------------------------------------------
@@ -1383,6 +1411,7 @@ fn indexed_assign_1d_compound_add_eq_parses() {
     let ast = parse_ok("ary[i] += 1");
     let TopLevel::Stmt(Stmt::IndexedAssign {
         target,
+        target_span,
         index,
         value,
         compound_op,
@@ -1391,6 +1420,7 @@ fn indexed_assign_1d_compound_add_eq_parses() {
         panic!("Expected IndexedAssign.");
     };
     assert!(matches!(target, Place::Local(_)));
+    assert_eq!(target_span.text("ary[i] += 1"), "ary");
     assert!(matches!(ast.node(*index), Node::Var(_)));
     assert_eq!(*compound_op, Some(BinOp::Add));
     assert_eq!(*ast.node(*value), Node::Int(1));
@@ -1782,10 +1812,9 @@ fn a_hole_may_not_span_lines() {
 
 // --- source spans --------------------------------------------------------------------
 //
-// Spans are recorded for the node kinds a diagnostic points at — `Node::Var` and `Node::Global` —
-// and everything else carries `Span::UNKNOWN` for now (a deliberate one-day compromise, see
-// specs/0015-static-analyses-start.md). Assignment targets take their span from the expression they
-// were parsed as, so they come along for free.
+// Every expression node records the source text it was parsed from; a composite node covers its
+// full extent (`left.start .. right.end`), not just its operator. Assignment targets take their
+// span from the expression they were parsed as, so they come along for free.
 
 #[test]
 fn variable_reads_carry_their_span() {
@@ -1861,14 +1890,62 @@ fn compound_assignment_keeps_the_target_span() {
 }
 
 #[test]
-fn unrecorded_node_kinds_are_unknown_for_now() {
-    // Documents the compromise: an integer literal has no span yet, and reports as unknown rather
-    // than pointing at the start of the file.
-    let ast = parse_ok("41 + 1");
+fn a_plain_2d_element_assignment_records_its_target_span() {
+    // The one indexed-assign construction path the shape tests above do not reach.
+    let src = "m = [[1, 2], [3, 4]]\nm[0, 1] = 5";
+    let ast = parse_ok(src);
+    let TopLevel::Stmt(Stmt::IndexedAssign2D { target_span, .. }) = ast.top_level.last().unwrap()
+    else {
+        panic!("Expected IndexedAssign2D.");
+    };
+    assert_eq!(target_span.text(src), "m");
+    assert_eq!(
+        *target_span,
+        Span::new(21, 22),
+        "the second `m`, not the first"
+    );
+}
+
+#[test]
+fn a_function_records_the_span_of_its_name() {
+    let src = "answer(): int is 42";
+    let ast = parse_ok(src);
+    let TopLevel::Func(func) = ast.top_level.last().unwrap() else {
+        panic!("Expected a function.");
+    };
+    assert_eq!(func.name_span.text(src), "answer");
+}
+
+#[test]
+fn every_expression_node_carries_a_span() {
+    // 0015 filled the arena only for `Var`/`Global`; 0016 fills it for every node, which is what
+    // lets a sema error point at the expression that failed rather than at nothing.
+    let src = "41 + 1";
+    let ast = parse_ok(src);
+    for (index, node) in ast.nodes.iter().enumerate() {
+        assert!(
+            !ast.spans[index].is_unknown(),
+            "node {index} ({node:?}) has no span"
+        );
+    }
     let literal = ast
         .nodes
         .iter()
         .position(|node| matches!(node, Node::Int(41)))
         .expect("the literal");
-    assert!(ast.spans[literal].is_unknown());
+    assert_eq!(ast.spans[literal].text(src), "41");
+}
+
+#[test]
+fn a_composite_node_covers_both_its_operands() {
+    // A binary operator spans the whole expression, not just the operator: what a reader needs to
+    // see is the two operands that failed to combine.
+    let src = "41 + 1";
+    let ast = parse_ok(src);
+    let binary = ast
+        .nodes
+        .iter()
+        .position(|node| matches!(node, Node::Bin { .. }))
+        .expect("the operator");
+    assert_eq!(ast.spans[binary].text(src), "41 + 1");
 }

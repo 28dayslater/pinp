@@ -19,7 +19,7 @@
 
 use rustc_hash::FxHashSet;
 
-use crate::analysis::cfg::{Action, BlockId, Cfg, Terminator};
+use crate::cfg::{Action, BlockId, Cfg, Terminator};
 use crate::parser::SymId;
 
 /// What [`solve`] needs from a fact type — and the whole of what it needs.

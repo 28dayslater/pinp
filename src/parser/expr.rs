@@ -121,13 +121,13 @@ fn comparison_symbol(op: BinOp) -> &'static str {
 // A chain of more than one comparison must be monotonic: every operator shares one direction
 // (all ascending `< <=`, all descending `> >=`, or all `==`), and `!=` never chains. A lone
 // comparison is always fine — including `!=`.
-fn check_monotonic(operators: &[BinOp]) -> Result<(), ParseError> {
+fn check_monotonic(operators: &[BinOp]) -> Result<(), ParseErrorKind> {
     if operators.len() < 2 {
         return Ok(());
     }
     let first = operators[0];
     let direction = chain_direction(first).ok_or_else(|| {
-        ParseError::Unexpected(format!(
+        ParseErrorKind::Unexpected(format!(
             "Cannot chain `{}`; it is not transitive.",
             comparison_symbol(first)
         ))
@@ -135,13 +135,13 @@ fn check_monotonic(operators: &[BinOp]) -> Result<(), ParseError> {
     for &op in &operators[1..] {
         match chain_direction(op) {
             None => {
-                return Err(ParseError::Unexpected(format!(
+                return Err(ParseErrorKind::Unexpected(format!(
                     "Cannot chain `{}`; it is not transitive.",
                     comparison_symbol(op)
                 )));
             }
             Some(op_direction) if op_direction != direction => {
-                return Err(ParseError::Unexpected(format!(
+                return Err(ParseErrorKind::Unexpected(format!(
                     "Cannot chain `{}` with `{}`.",
                     comparison_symbol(first),
                     comparison_symbol(op)
@@ -160,9 +160,9 @@ fn check_monotonic(operators: &[BinOp]) -> Result<(), ParseError> {
 // Convert a lexically-valid integer literal to its value, rejecting anything that does not fit in
 // an `i64` (a too-large decimal, an over-long hex/binary string, or an overflowing `mantissa*10^exp`)
 // rather than panicking.
-fn parse_int(text: &str) -> Result<i64, ParseError> {
+fn parse_int(text: &str) -> Result<i64, ParseErrorKind> {
     let out_of_range =
-        || ParseError::Unexpected(format!("Integer literal `{text}` is out of range."));
+        || ParseErrorKind::Unexpected(format!("Integer literal `{text}` is out of range."));
     let digits: String = text.chars().filter(|&ch| ch != '_').collect();
     if let Some(hex) = digits
         .strip_prefix("0x")
@@ -198,7 +198,8 @@ impl<'src> Parser<'src> {
     // -------------------------------------------------------------------------
 
     // `if <cond> <block> (elif <cond> <block>)* (else <block>)?` — the block-form if-expression.
-    fn parse_if(&mut self) -> Result<ExprId, ParseError> {
+    fn parse_if(&mut self) -> Result<ExprId, ParseErrorKind> {
+        let start = self.peek().span();
         self.advance(); // 'if'
         let cond = self.parse_expr(0)?;
         let body = self.parse_block()?;
@@ -212,7 +213,7 @@ impl<'src> Parser<'src> {
                     let body = self.parse_block()?;
                     arms.push(IfArm { cond, body });
                     if arms.len() > MAX_IF_ARMS {
-                        return Err(ParseError::TooManyArms(format!(
+                        return Err(ParseErrorKind::TooManyArms(format!(
                             "Excessive number of if-elif constructs. The maximum is {MAX_IF_ARMS}."
                         )));
                     }
@@ -225,7 +226,8 @@ impl<'src> Parser<'src> {
                 _ => break,
             }
         }
-        Ok(self.ast.push(Node::If { arms, else_block }))
+        let span = self.span_from(start);
+        Ok(self.ast.push(Node::If { arms, else_block }, span))
     }
 
     // Tail of the one-line conditional `then_val if cond else else_val`, entered at `if` with
@@ -235,7 +237,7 @@ impl<'src> Parser<'src> {
         &mut self,
         then_val: ExprId,
         start_col: u32,
-    ) -> Result<ExprId, ParseError> {
+    ) -> Result<ExprId, ParseErrorKind> {
         self.advance(); // 'if'
         let cond = self.parse_expr(0)?;
         // `else` may sit on the next line. Skip the continuation's layout tokens, recording any
@@ -252,12 +254,12 @@ impl<'src> Parser<'src> {
             self.pos += 1;
         }
         if self.peek().kind != TokenKind::KwElse {
-            return Err(ParseError::Unexpected(
+            return Err(ParseErrorKind::Unexpected(
                 "Expected `else` in a conditional expression.".into(),
             ));
         }
         if wrapped && self.peek().col != start_col {
-            return Err(ParseError::Layout(format!(
+            return Err(ParseErrorKind::Layout(format!(
                 "Continuation `else` at column {} must align to the conditional's column {}.",
                 self.peek().col,
                 start_col
@@ -273,13 +275,17 @@ impl<'src> Parser<'src> {
             stmts: Vec::new(),
             result: Some(else_val),
         };
-        Ok(self.ast.push(Node::If {
-            arms: vec![IfArm {
-                cond,
-                body: then_block,
-            }],
-            else_block: Some(else_block),
-        }))
+        let span = self.joined_span(then_val, else_val);
+        Ok(self.ast.push(
+            Node::If {
+                arms: vec![IfArm {
+                    cond,
+                    body: then_block,
+                }],
+                else_block: Some(else_block),
+            },
+            span,
+        ))
     }
 
     // -------------------------------------------------------------------------
@@ -289,7 +295,7 @@ impl<'src> Parser<'src> {
     // Precedence-climbing: parse a prefix, then fold operators binding at or above `min_bp`. The
     // chaining bands (conditional, comparison, range, `in`) are handled explicitly before the
     // `infix` binding-power table.
-    pub(super) fn parse_expr(&mut self, min_bp: u8) -> Result<ExprId, ParseError> {
+    pub(super) fn parse_expr(&mut self, min_bp: u8) -> Result<ExprId, ParseErrorKind> {
         self.enter_nesting()?;
         let start_col = self.peek().col;
         let mut lhs = self.parse_prefix()?;
@@ -318,7 +324,8 @@ impl<'src> Parser<'src> {
             if self.peek().kind == TokenKind::KwIn && MEMBERSHIP_BP >= min_bp {
                 self.advance(); // 'in'
                 let range = self.parse_expr(MEMBERSHIP_BP + 1)?;
-                lhs = self.ast.push(Node::Membership { value: lhs, range });
+                let span = self.joined_span(lhs, range);
+                lhs = self.ast.push(Node::Membership { value: lhs, range }, span);
                 continue;
             }
             // Postfix `lhs[…]` — 1D element/slice, or 2D `lhs[row_sel, col_sel]`.
@@ -329,17 +336,25 @@ impl<'src> Parser<'src> {
                     self.advance(); // ','
                     let col = self.parse_dim_selector()?;
                     self.expect(TokenKind::RBracket)?;
-                    lhs = self.ast.push(Node::Index2D {
-                        matrix: lhs,
-                        row: row_or_index,
-                        col,
-                    });
+                    let span = self.span_from(self.ast.span_of(lhs));
+                    lhs = self.ast.push(
+                        Node::Index2D {
+                            matrix: lhs,
+                            row: row_or_index,
+                            col,
+                        },
+                        span,
+                    );
                 } else {
                     self.expect(TokenKind::RBracket)?;
-                    lhs = self.ast.push(Node::Index {
-                        array: lhs,
-                        index: row_or_index,
-                    });
+                    let span = self.span_from(self.ast.span_of(lhs));
+                    lhs = self.ast.push(
+                        Node::Index {
+                            array: lhs,
+                            index: row_or_index,
+                        },
+                        span,
+                    );
                 }
                 continue;
             }
@@ -348,10 +363,14 @@ impl<'src> Parser<'src> {
                 self.advance(); // '.'
                 let member_name = self.expect(TokenKind::Identifier)?.text;
                 let member = self.ast.intern(member_name);
-                lhs = self.ast.push(Node::Member {
-                    object: lhs,
-                    member,
-                });
+                let span = self.span_from(self.ast.span_of(lhs));
+                lhs = self.ast.push(
+                    Node::Member {
+                        object: lhs,
+                        member,
+                    },
+                    span,
+                );
                 continue;
             }
             let Some((left_bp, right_bp, op)) = infix(self.peek().kind) else {
@@ -362,7 +381,8 @@ impl<'src> Parser<'src> {
             }
             self.advance();
             let rhs = self.parse_expr(right_bp)?;
-            lhs = self.ast.push(Node::Bin { op, lhs, rhs });
+            let span = self.joined_span(lhs, rhs);
+            lhs = self.ast.push(Node::Bin { op, lhs, rhs }, span);
         }
         self.depth -= 1;
         Ok(lhs)
@@ -371,7 +391,7 @@ impl<'src> Parser<'src> {
     // Parse `first op1 e1 op2 e2 …` (`first` already parsed) and desugar it to the `and` of its
     // adjacent comparisons: `a < b < c` becomes `(a < b) and (b < c)`, with the middle operand
     // shared. A chain of one comparison is just that comparison — no `and` is introduced.
-    fn parse_comparison_chain(&mut self, first: ExprId) -> Result<ExprId, ParseError> {
+    fn parse_comparison_chain(&mut self, first: ExprId) -> Result<ExprId, ParseErrorKind> {
         let mut prev = first;
         let mut operators: Vec<BinOp> = Vec::new();
         let mut result: Option<ExprId> = None;
@@ -380,18 +400,30 @@ impl<'src> Parser<'src> {
             // Operands bind just above the band so a following comparison starts a new link
             // rather than nesting inside this one.
             let next = self.parse_expr(COMPARISON_BP + 1)?;
-            let comparison = self.ast.push(Node::Bin {
-                op,
-                lhs: prev,
-                rhs: next,
-            });
+            let comparison_span = self.joined_span(prev, next);
+            let comparison = self.ast.push(
+                Node::Bin {
+                    op,
+                    lhs: prev,
+                    rhs: next,
+                },
+                comparison_span,
+            );
             result = Some(match result {
                 None => comparison,
-                Some(accumulated) => self.ast.push(Node::Bin {
-                    op: BinOp::And,
-                    lhs: accumulated,
-                    rhs: comparison,
-                }),
+                Some(accumulated) => {
+                    // The desugared `and` covers the whole chain parsed so far, not the link that
+                    // closed it: `a < b < c` reports as `a < b < c`.
+                    let span = self.joined_span(accumulated, comparison);
+                    self.ast.push(
+                        Node::Bin {
+                            op: BinOp::And,
+                            lhs: accumulated,
+                            rhs: comparison,
+                        },
+                        span,
+                    )
+                }
             });
             operators.push(op);
             prev = next;
@@ -403,7 +435,11 @@ impl<'src> Parser<'src> {
     // Tail of a range, entered at the range operator with `start` already parsed. The stop bound
     // (and the optional `:step`) bind one power above `RANGE_BP`, so neither swallows a following
     // range, comparison, or `in`.
-    fn parse_range_tail(&mut self, start: ExprId, kind: RangeKind) -> Result<ExprId, ParseError> {
+    fn parse_range_tail(
+        &mut self,
+        start: ExprId,
+        kind: RangeKind,
+    ) -> Result<ExprId, ParseErrorKind> {
         self.advance(); // '..' / '..<' / '..>'
         let stop = self.parse_expr(RANGE_BP + 1)?;
         let step = if self.peek().kind == TokenKind::Colon {
@@ -412,12 +448,18 @@ impl<'src> Parser<'src> {
         } else {
             None
         };
-        Ok(self.ast.push(Node::Range {
-            start,
-            stop,
-            step,
-            kind,
-        }))
+        // Through the step when there is one, so `1..10:2` covers the step rather than stopping
+        // at the stop bound.
+        let span = self.joined_span(start, step.unwrap_or(stop));
+        Ok(self.ast.push(
+            Node::Range {
+                start,
+                stop,
+                step,
+                kind,
+            },
+            span,
+        ))
     }
 
     // -------------------------------------------------------------------------
@@ -425,50 +467,56 @@ impl<'src> Parser<'src> {
     // -------------------------------------------------------------------------
 
     // A prefix operator (`-` / `not`) applied to an operand, or else a primary.
-    fn parse_prefix(&mut self) -> Result<ExprId, ParseError> {
+    fn parse_prefix(&mut self) -> Result<ExprId, ParseErrorKind> {
         let op = match self.peek().kind {
             TokenKind::Minus => UnOp::Neg,
             TokenKind::KwNot => UnOp::Not,
             _ => return self.parse_primary(),
         };
+        let start = self.peek().span();
         self.advance();
         let operand = self.parse_expr(UNARY_MINUS_BP)?;
-        Ok(self.ast.push(Node::Unary { op, operand }))
+        let span = self.span_from(start);
+        Ok(self.ast.push(Node::Unary { op, operand }, span))
     }
 
     // An atom: a literal, a name or `::global`, a parenthesised expression, a call, or a block-form
     // `if`.
-    fn parse_primary(&mut self) -> Result<ExprId, ParseError> {
+    fn parse_primary(&mut self) -> Result<ExprId, ParseErrorKind> {
         match self.peek().kind {
             TokenKind::Int => {
-                let value = parse_int(self.advance().text)?;
-                Ok(self.ast.push(Node::Int(value)))
+                let token = self.advance();
+                let value = parse_int(token.text)?;
+                Ok(self.ast.push(Node::Int(value), token.span()))
             }
             TokenKind::Float => {
-                let value = parse_float(self.advance().text);
-                Ok(self.ast.push(Node::Float(value)))
+                let token = self.advance();
+                let value = parse_float(token.text);
+                Ok(self.ast.push(Node::Float(value), token.span()))
             }
             TokenKind::KwTrue => {
-                self.advance();
-                Ok(self.ast.push(Node::Bool(true)))
+                let token = self.advance();
+                Ok(self.ast.push(Node::Bool(true), token.span()))
             }
             TokenKind::KwFalse => {
-                self.advance();
-                Ok(self.ast.push(Node::Bool(false)))
+                let token = self.advance();
+                Ok(self.ast.push(Node::Bool(false), token.span()))
             }
             TokenKind::Str => {
                 // Strip the matching quotes, then auto-dedent: the interior may span lines.
-                let text = self.advance().text;
+                let token = self.advance();
+                let text = token.text;
                 let content = dedent(&text[1..text.len() - 1]);
                 let str_id = self.ast.push_string_literal(content);
-                Ok(self.ast.push(Node::Str(str_id)))
+                Ok(self.ast.push(Node::Str(str_id), token.span()))
             }
             TokenKind::FStr => {
                 // Strip the leading `f` and the matching quotes, then split into segments.
-                let text = self.advance().text;
+                let token = self.advance();
+                let text = token.text;
                 let content = &text[2..text.len() - 1];
                 let segments = self.parse_fstring_segments(content)?;
-                Ok(self.ast.push(Node::FStr { segments }))
+                Ok(self.ast.push(Node::FStr { segments }, token.span()))
             }
             TokenKind::Identifier => {
                 if self.at(1) == TokenKind::LParen {
@@ -477,7 +525,7 @@ impl<'src> Parser<'src> {
                 let name_token = self.advance();
                 let (name, span) = (name_token.text, name_token.span());
                 let sym_id = self.ast.intern(name);
-                Ok(self.ast.push_spanned(Node::Var(sym_id), span))
+                Ok(self.ast.push(Node::Var(sym_id), span))
             }
             TokenKind::ColonColon => {
                 let marker = self.advance(); // '::'
@@ -485,7 +533,7 @@ impl<'src> Parser<'src> {
                 // The span covers `::name`, which is how the binding is written.
                 let span = Span::new(marker.start, name_token.span().end);
                 let sym_id = self.ast.intern(name_token.text);
-                Ok(self.ast.push_spanned(Node::Global(sym_id), span))
+                Ok(self.ast.push(Node::Global(sym_id), span))
             }
             // `if` opening an expression is the block form; the one-line ternary is reached from
             // the `parse_expr` loop instead, after a left operand.
@@ -497,7 +545,7 @@ impl<'src> Parser<'src> {
                 Ok(expr_id)
             }
             TokenKind::LBracket => self.parse_array_or_comprehension(),
-            other => Err(ParseError::Unexpected(format!(
+            other => Err(ParseErrorKind::Unexpected(format!(
                 "Unexpected token {other:?}."
             ))),
         }
@@ -509,12 +557,13 @@ impl<'src> Parser<'src> {
     // Comprehension: `[element for var[:type] in source]` — the `for` keyword after the first
     // element is the discriminator. The `:type` annotation promotes the loop variable; without it
     // the variable type defaults to `Int` (the range's native element type).
-    fn parse_array_or_comprehension(&mut self) -> Result<ExprId, ParseError> {
+    fn parse_array_or_comprehension(&mut self) -> Result<ExprId, ParseErrorKind> {
+        let start = self.peek().span();
         self.advance(); // '['
 
         // Empty `[]` is always an error — a zero-length array literal has no deducible element type.
         if self.peek().kind == TokenKind::RBracket {
-            return Err(ParseError::Unexpected(
+            return Err(ParseErrorKind::Unexpected(
                 "Array literal cannot be empty.".into(),
             ));
         }
@@ -537,12 +586,16 @@ impl<'src> Parser<'src> {
             self.expect(TokenKind::KwIn)?;
             let source = self.parse_expr(0)?;
             self.expect(TokenKind::RBracket)?;
-            return Ok(self.ast.push(Node::Comprehension {
-                element: first,
-                var,
-                var_type,
-                source,
-            }));
+            let span = self.span_from(start);
+            return Ok(self.ast.push(
+                Node::Comprehension {
+                    element: first,
+                    var,
+                    var_type,
+                    source,
+                },
+                span,
+            ));
         }
 
         // Array or matrix literal: parse the first row.
@@ -553,7 +606,7 @@ impl<'src> Parser<'src> {
                 break; // trailing comma before `]`
             }
             if self.peek().kind == TokenKind::Semicolon {
-                return Err(ParseError::Unexpected(
+                return Err(ParseErrorKind::Unexpected(
                     "Trailing `,` before `;` in matrix row.".into(),
                 ));
             }
@@ -567,13 +620,13 @@ impl<'src> Parser<'src> {
                 let sep_line = self.peek().line;
                 self.advance(); // ';'
                 if self.peek().kind == TokenKind::RBracket {
-                    return Err(ParseError::Unexpected(
+                    return Err(ParseErrorKind::Unexpected(
                         "Trailing `;` in matrix literal.".into(),
                     ));
                 }
                 // A row that begins on a new line must align its first element with row 0.
                 if self.peek().line != sep_line && self.peek().col != anchor_col {
-                    return Err(ParseError::Layout(format!(
+                    return Err(ParseErrorKind::Layout(format!(
                         "Matrix row at column {} must align with the first row at column {}.",
                         self.peek().col,
                         anchor_col,
@@ -586,7 +639,7 @@ impl<'src> Parser<'src> {
                         break; // trailing comma before `]`
                     }
                     if self.peek().kind == TokenKind::Semicolon {
-                        return Err(ParseError::Unexpected(
+                        return Err(ParseErrorKind::Unexpected(
                             "Trailing `,` before `;` in matrix row.".into(),
                         ));
                     }
@@ -595,33 +648,39 @@ impl<'src> Parser<'src> {
                 rows.push(row);
             }
             self.expect(TokenKind::RBracket)?;
-            return Ok(self.ast.push(Node::MatrixLiteral { rows }));
+            let span = self.span_from(start);
+            return Ok(self.ast.push(Node::MatrixLiteral { rows }, span));
         }
 
         // 1D array literal.
         self.expect(TokenKind::RBracket)?;
-        Ok(self.ast.push(Node::ArrayLiteral {
-            elements: first_row,
-        }))
+        let span = self.span_from(start);
+        Ok(self.ast.push(
+            Node::ArrayLiteral {
+                elements: first_row,
+            },
+            span,
+        ))
     }
 
     // One dimension selector inside `obj[…, …]`:
     //   `:` immediately followed by `,` or `]` → `Node::FullExtent` (full extent of that dimension)
     //   otherwise → an arbitrary expression (scalar index or range)
-    fn parse_dim_selector(&mut self) -> Result<ExprId, ParseError> {
+    fn parse_dim_selector(&mut self) -> Result<ExprId, ParseErrorKind> {
         if self.peek().kind == TokenKind::Colon
             && matches!(self.at(1), TokenKind::Comma | TokenKind::RBracket)
         {
-            self.advance(); // ':'
-            return Ok(self.ast.push(Node::FullExtent));
+            let colon = self.advance(); // ':'
+            return Ok(self.ast.push(Node::FullExtent, colon.span()));
         }
         self.parse_expr(0)
     }
 
     // `<name>(<args>)` — a function call.
-    fn parse_call(&mut self) -> Result<ExprId, ParseError> {
-        let name = self.advance().text; // Identifier
-        let callee = self.ast.intern(name);
+    fn parse_call(&mut self) -> Result<ExprId, ParseErrorKind> {
+        let name_token = self.advance(); // Identifier
+        let start = name_token.span();
+        let callee = self.ast.intern(name_token.text);
         self.expect(TokenKind::LParen)?;
         let mut args = Vec::new();
         if self.peek().kind != TokenKind::RParen {
@@ -633,7 +692,7 @@ impl<'src> Parser<'src> {
                     }
                     TokenKind::RParen => break,
                     other => {
-                        return Err(ParseError::Unexpected(format!(
+                        return Err(ParseErrorKind::Unexpected(format!(
                             "Unexpected token {other:?}."
                         )));
                     }
@@ -641,7 +700,8 @@ impl<'src> Parser<'src> {
             }
         }
         self.expect(TokenKind::RParen)?;
-        Ok(self.ast.push(Node::Call { callee, args }))
+        let span = self.span_from(start);
+        Ok(self.ast.push(Node::Call { callee, args }, span))
     }
 
     // Split an f-string's inter-delimiter content into alternating literal/interpolation segments.
@@ -654,7 +714,7 @@ impl<'src> Parser<'src> {
     fn parse_fstring_segments(
         &mut self,
         content: &'src str,
-    ) -> Result<Vec<FStrSegment>, ParseError> {
+    ) -> Result<Vec<FStrSegment>, ParseErrorKind> {
         let lines = content_lines(content);
         let common = common_indent(&lines);
         let mut segments = Vec::new();
@@ -679,7 +739,7 @@ impl<'src> Parser<'src> {
         line: &'src str,
         run: &mut String,
         segments: &mut Vec<FStrSegment>,
-    ) -> Result<(), ParseError> {
+    ) -> Result<(), ParseErrorKind> {
         let bytes = line.as_bytes(); // `{` and `}` are ASCII, so byte scanning is UTF-8-safe
         let mut literal_start = 0;
         let mut index = 0;
@@ -693,7 +753,7 @@ impl<'src> Parser<'src> {
                     }
                     let rest = &line[index + 1..];
                     let close = rest.find('}').ok_or_else(|| {
-                        ParseError::Unexpected("Unterminated `{` in f-string.".into())
+                        ParseErrorKind::Unexpected("Unterminated `{` in f-string.".into())
                     })?;
                     let place = self.fstring_place(&rest[..close])?;
                     segments.push(FStrSegment::Interp(place));
@@ -701,7 +761,9 @@ impl<'src> Parser<'src> {
                     literal_start = index;
                 }
                 b'}' => {
-                    return Err(ParseError::Unexpected("Unmatched `}` in f-string.".into()));
+                    return Err(ParseErrorKind::Unexpected(
+                        "Unmatched `}` in f-string.".into(),
+                    ));
                 }
                 _ => index += 1,
             }
@@ -713,9 +775,9 @@ impl<'src> Parser<'src> {
     // Resolve one f-string hole to its [`Place`]. The hole's text is re-lexed — the lexer is the
     // single source of truth for what a name is — so it must tokenise to exactly `name` (a local) or
     // `::name` (a global); anything else (empty, a number, an operator, two names) is a parse error.
-    fn fstring_place(&mut self, hole: &'src str) -> Result<Place, ParseError> {
+    fn fstring_place(&mut self, hole: &'src str) -> Result<Place, ParseErrorKind> {
         let invalid = || {
-            ParseError::Unexpected(format!(
+            ParseErrorKind::Unexpected(format!(
                 "Invalid f-string interpolation `{{{hole}}}`; expected a name."
             ))
         };
@@ -724,7 +786,7 @@ impl<'src> Parser<'src> {
         if hole.contains('#') {
             return Err(invalid());
         }
-        let tokens = lex(hole).map_err(|error| ParseError::Lex(error.message))?;
+        let tokens = lex(hole).map_err(|error| ParseErrorKind::Lex(error.message))?;
         match tokens.as_slice() {
             [name, eof] if name.kind == TokenKind::Identifier && eof.kind == TokenKind::Eof => {
                 Ok(Place::Local(self.ast.intern(name.text)))

@@ -1,17 +1,9 @@
 // SPDX-License-Identifier: MIT
 
-//! What an analysis reports: a [`Diagnostic`] carrying a stable [`DiagnosticCode`], a
-//! [`Severity`], the [`Span`] it is about, and a message.
-//!
-//! Unlike [`crate::sema`], which is fail-fast and stops at the first error, the analysis layer
-//! collects every finding in a run. That difference is the point: a tool that reports one defect
-//! and exits is of little use for reviewing a program.
+//! Error/Warning reporting layer.
 
 use crate::lexer::{LineIndex, Span};
 
-/// How much a finding matters. Everything the analysis layer produces today is a `Warning` —
-/// nothing here can stop a program from compiling — but the distinction exists so `sema`'s errors
-/// can move onto this type later without reshaping it.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Severity {
     Error,
@@ -19,6 +11,8 @@ pub enum Severity {
 }
 
 impl Severity {
+    // Lower case is expected in diagnostic messages, so we'd have to un-capitalise.
+    // Better to have static strings.
     pub fn label(self) -> &'static str {
         match self {
             Severity::Error => "error",
@@ -27,20 +21,30 @@ impl Severity {
     }
 }
 
-/// A class of finding.
+/// A class of a finding.
 ///
-/// The numeric code is what appears in output and what a future suppression pragma would key on,
-/// so **a code is never reused** — retiring a rule leaves its number spent. The `01xx` band is the
-/// dataflow checkers; later bands can group by analysis.
+/// Known codes for various errors issued by the parser, static analyser, etc.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum DiagnosticCode {
-    /// A statement that no execution can reach.
+    /// A statement that no execution path can reach.
     UnreachableCode,
     /// A value written to a binding that nothing reads before it is overwritten or goes out of
     /// scope.
     DeadStore,
-    /// A binding that is never read at all.
-    UnusedBinding,
+    /// A variable that is never used.
+    UnusedVariable,
+}
+
+/// Everything a rule is, in one row.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct RuleInfo {
+    /// The stable identifier, e.g. `PINP1001`.
+    pub code: &'static str,
+    /// Kebab-case, the form a suppression pragma would spell.
+    pub name: &'static str,
+    /// One line for the SARIF rule listing.
+    pub description: &'static str,
+    pub severity: Severity,
 }
 
 impl DiagnosticCode {
@@ -49,50 +53,78 @@ impl DiagnosticCode {
     pub const ALL: [DiagnosticCode; 3] = [
         DiagnosticCode::UnreachableCode,
         DiagnosticCode::DeadStore,
-        DiagnosticCode::UnusedBinding,
+        DiagnosticCode::UnusedVariable,
     ];
 
-    /// The stable identifier, e.g. `PINP0101`.
-    pub fn code(self) -> &'static str {
+    /// The rule's row. The accessors below read from here, so a variant is edited in one place.
+    pub const fn info(self) -> RuleInfo {
         match self {
-            DiagnosticCode::UnreachableCode => "PINP0101",
-            DiagnosticCode::DeadStore => "PINP0102",
-            DiagnosticCode::UnusedBinding => "PINP0103",
+            DiagnosticCode::UnreachableCode => RuleInfo {
+                code: "PINP1001",
+                name: "unreachable-code",
+                description: "Statements that no execution can reach.",
+                severity: Severity::Warning,
+            },
+            DiagnosticCode::DeadStore => RuleInfo {
+                code: "PINP1002",
+                name: "dead-store",
+                description: "Values written to a binding that nothing reads.",
+                severity: Severity::Warning,
+            },
+            DiagnosticCode::UnusedVariable => RuleInfo {
+                code: "PINP1003",
+                name: "unused-variable",
+                description: "Variables that are never used.",
+                severity: Severity::Warning,
+            },
         }
+    }
+
+    /// The stable identifier, e.g. `PINP1001`.
+    pub const fn code(self) -> &'static str {
+        self.info().code
     }
 
     /// The rule's short name — kebab-case, the form a suppression pragma would spell.
-    pub fn name(self) -> &'static str {
-        match self {
-            DiagnosticCode::UnreachableCode => "unreachable-code",
-            DiagnosticCode::DeadStore => "dead-store",
-            DiagnosticCode::UnusedBinding => "unused-binding",
-        }
+    pub const fn name(self) -> &'static str {
+        self.info().name
     }
 
     /// One line describing what the rule looks for, for the SARIF rule listing.
-    pub fn description(self) -> &'static str {
-        match self {
-            DiagnosticCode::UnreachableCode => "Statements that no execution can reach.",
-            DiagnosticCode::DeadStore => "Values written to a binding that nothing reads.",
-            DiagnosticCode::UnusedBinding => "Bindings that are never read.",
-        }
+    pub const fn description(self) -> &'static str {
+        self.info().description
     }
 
     /// How severe a finding of this class is. Everything is advisory for now.
-    pub fn severity(self) -> Severity {
-        match self {
-            DiagnosticCode::UnreachableCode
-            | DiagnosticCode::DeadStore
-            | DiagnosticCode::UnusedBinding => Severity::Warning,
-        }
+    pub const fn severity(self) -> Severity {
+        self.info().severity
+    }
+}
+
+/// A failure that can be reported: it knows where it happened and what to say.
+///
+/// Implemented by the lexer's, parser's, and sema's error types so that all three place and render
+/// identically. An implementor supplies only [`to_diagnostic`](Self::to_diagnostic); rendering is
+/// shared, which is the whole point of the trait — three copies of the same one-liner were what
+/// this replaced.
+pub trait Diagnose {
+    /// This failure as a [`Diagnostic`].
+    fn to_diagnostic(&self) -> Diagnostic;
+
+    /// `line:col: error: message`. Takes the [`LineIndex`] for the reason
+    /// [`Diagnostic::render`] gives, and is why no `Display` impl exists.
+    fn render(&self, line_index: &LineIndex) -> String {
+        self.to_diagnostic().render(line_index)
     }
 }
 
 /// One finding.
 #[derive(Debug, Clone, PartialEq)]
 pub struct Diagnostic {
-    pub code: DiagnosticCode,
+    /// The rule this finding belongs to, for the analysis layer's advisory checks. `None` for a
+    /// lexer, parser, or sema error: those are one-offs a suppression pragma would never key on,
+    /// and minting a permanent code for each would spend the namespace for nothing.
+    pub code: Option<DiagnosticCode>,
     pub severity: Severity,
     pub span: Span,
     pub message: String,
@@ -102,11 +134,22 @@ pub struct Diagnostic {
 }
 
 impl Diagnostic {
-    /// A finding at `span`, taking its severity from the rule.
+    /// A rule's finding at `span`, taking its severity from the rule.
     pub fn new(code: DiagnosticCode, span: Span, message: impl Into<String>) -> Diagnostic {
         Diagnostic {
-            code,
+            code: Some(code),
             severity: code.severity(),
+            span,
+            message: message.into(),
+            notes: Vec::new(),
+        }
+    }
+
+    /// An error at `span` belonging to no rule — what the lexer, parser, and sema report.
+    pub fn error(span: Span, message: impl Into<String>) -> Diagnostic {
+        Diagnostic {
+            code: None,
+            severity: Severity::Error,
             span,
             message: message.into(),
             notes: Vec::new(),
@@ -120,14 +163,22 @@ impl Diagnostic {
     }
 
     /// One line per finding: `line:col: severity[CODE]: message`, then one indented line per note.
-    /// A span that was never recorded prints without a position rather than pointing at byte 0.
+    /// A finding with no [`DiagnosticCode`] renders `line:col: severity: message` — nothing is
+    /// bracketed. A span that was never recorded prints without a position rather than pointing at
+    /// byte 0.
+    ///
+    /// Takes the [`LineIndex`] because a [`Span`] is byte offsets; this is why no `Display` impl
+    /// exists, since one could not reach the source to resolve them.
     pub fn render(&self, line_index: &LineIndex) -> String {
         let mut out = String::new();
         out.push_str(&position_prefix(self.span, line_index));
         out.push_str(self.severity.label());
-        out.push('[');
-        out.push_str(self.code.code());
-        out.push_str("]: ");
+        if let Some(code) = self.code {
+            out.push('[');
+            out.push_str(code.code());
+            out.push(']');
+        }
+        out.push_str(": ");
         out.push_str(&self.message);
         for (note, span) in &self.notes {
             out.push_str("\n  ");
@@ -157,9 +208,9 @@ mod tests {
     fn codes_are_unique_and_stable() {
         // The exact strings are the contract: they appear in output and a suppression pragma would
         // key on them, so a change here is a breaking change, not a rename.
-        assert_eq!(DiagnosticCode::UnreachableCode.code(), "PINP0101");
-        assert_eq!(DiagnosticCode::DeadStore.code(), "PINP0102");
-        assert_eq!(DiagnosticCode::UnusedBinding.code(), "PINP0103");
+        assert_eq!(DiagnosticCode::UnreachableCode.code(), "PINP1001");
+        assert_eq!(DiagnosticCode::DeadStore.code(), "PINP1002");
+        assert_eq!(DiagnosticCode::UnusedVariable.code(), "PINP1003");
 
         let codes: FxHashSet<&str> = DiagnosticCode::ALL.iter().map(|code| code.code()).collect();
         assert_eq!(
@@ -182,7 +233,7 @@ mod tests {
             let listed = match code {
                 DiagnosticCode::UnreachableCode
                 | DiagnosticCode::DeadStore
-                | DiagnosticCode::UnusedBinding => true,
+                | DiagnosticCode::UnusedVariable => true,
             };
             assert!(listed);
         }
@@ -200,7 +251,7 @@ mod tests {
         );
         assert_eq!(
             diagnostic.render(&line_index),
-            "2:1: warning[PINP0102]: Value assigned to `b` is never read."
+            "2:1: warning[PINP1002]: Value assigned to `b` is never read."
         );
     }
 
@@ -208,13 +259,13 @@ mod tests {
     fn an_unknown_span_renders_without_a_position() {
         let line_index = LineIndex::new("a = 1\n");
         let diagnostic = Diagnostic::new(
-            DiagnosticCode::UnusedBinding,
+            DiagnosticCode::UnusedVariable,
             Span::UNKNOWN,
-            "Binding `a` is never read.",
+            "Variable `a` is never used.",
         );
         assert_eq!(
             diagnostic.render(&line_index),
-            "warning[PINP0103]: Binding `a` is never read."
+            "warning[PINP1003]: Variable `a` is never used."
         );
     }
 
@@ -230,7 +281,7 @@ mod tests {
         .with_note("Overwritten here.", Span::new(6, 7));
         assert_eq!(
             diagnostic.render(&line_index),
-            "1:1: warning[PINP0102]: Value assigned to `a` is never read.\n  2:1: note: Overwritten here."
+            "1:1: warning[PINP1002]: Value assigned to `a` is never read.\n  2:1: note: Overwritten here."
         );
     }
 

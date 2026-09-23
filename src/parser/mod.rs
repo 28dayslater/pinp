@@ -22,7 +22,8 @@
 //! [`crate::sema::SemaError`]. Type annotations (`int`/`float`/`void`) are the one exception: they
 //! are resolved here while building the signature, since that is a fixed lexical mapping.
 
-use crate::lexer::{Token, TokenKind, lex};
+use crate::diagnostic::{Diagnose, Diagnostic};
+use crate::lexer::{Span, Token, TokenKind, lex};
 
 mod ast;
 mod expr;
@@ -33,10 +34,38 @@ mod tests;
 
 pub use ast::*;
 
-/// A syntactic failure from lexing or parsing. pinp is fail-fast: the first error returned stops
-/// the pass. Semantic errors live in [`crate::sema::SemaError`].
+/// A syntactic failure from lexing or parsing, and the source it is about. pinp is fail-fast: the
+/// first error returned stops the pass. Semantic errors live in [`crate::sema::SemaError`].
+///
+/// The span is attached centrally in [`parse`] rather than at each construction site: the parser
+/// unwinds the moment a rule fails and never advances afterwards, so the token it stopped on *is*
+/// the offending one. The exception is a rule that has already consumed its token — see
+/// [`ParseErrorKind::TooDeeplyNested`]'s neighbours in `parse_primary`, which peek before parsing
+/// so the literal is still current if it fails.
 #[derive(Debug, Clone, PartialEq)]
-pub enum ParseError {
+pub struct ParseError {
+    pub kind: ParseErrorKind,
+    pub span: Span,
+}
+
+impl Diagnose for ParseError {
+    fn to_diagnostic(&self) -> Diagnostic {
+        Diagnostic::error(self.span, self.kind.message())
+    }
+}
+
+/// Comparing an error to a bare kind ignores position, which is what a test asserting *which*
+/// failure occurred wants to say.
+impl PartialEq<ParseErrorKind> for ParseError {
+    fn eq(&self, kind: &ParseErrorKind) -> bool {
+        &self.kind == kind
+    }
+}
+
+/// What kind of syntactic failure occurred. The variants are what a test matches on; the message
+/// each carries is what a reader sees.
+#[derive(Debug, Clone, PartialEq)]
+pub enum ParseErrorKind {
     /// A lexing failure (carries the [`crate::lexer::LexError`] message).
     Lex(String),
     /// A syntax error: an unexpected/missing token, or a malformed declaration (a duplicate
@@ -52,11 +81,28 @@ pub enum ParseError {
     TooManyArms(String),
 }
 
+impl ParseErrorKind {
+    /// The human-readable text, which every variant carries.
+    pub fn message(&self) -> &str {
+        match self {
+            ParseErrorKind::Lex(message)
+            | ParseErrorKind::Unexpected(message)
+            | ParseErrorKind::Layout(message)
+            | ParseErrorKind::TooDeeplyNested(message)
+            | ParseErrorKind::TooManyArms(message) => message,
+        }
+    }
+}
+
 /// Lexes and parses `src` into a structural [`ProgramAst`] (its `types` left for
 /// [`crate::sema::analyze`] to fill). The returned AST borrows `src`. Stops at and returns the first
 /// [`ParseError`].
 pub fn parse(src: &str) -> Result<ProgramAst<'_>, ParseError> {
-    let tokens = lex(src).map_err(|error| ParseError::Lex(error.message))?;
+    // A lex failure already knows where it happened; carry that span rather than re-deriving one.
+    let tokens = lex(src).map_err(|error| ParseError {
+        kind: ParseErrorKind::Lex(error.message),
+        span: error.span,
+    })?;
     let mut parser = Parser {
         tokens,
         pos: 0,
@@ -64,8 +110,14 @@ pub fn parse(src: &str) -> Result<ProgramAst<'_>, ParseError> {
         pending_dedents: 0,
         depth: 0,
     };
-    parser.parse_program()?;
-    Ok(parser.ast)
+    match parser.parse_program() {
+        Ok(()) => Ok(parser.ast),
+        // The parse stopped here, so the current token is the one the rule objected to.
+        Err(kind) => Err(ParseError {
+            kind,
+            span: parser.error_span(),
+        }),
+    }
 }
 
 struct Parser<'src> {
@@ -115,10 +167,10 @@ impl<'src> Parser<'src> {
     // Enter one level of recursion (`parse_expr`/`parse_block`), failing fast past the depth limit.
     // The matching `self.depth -= 1` runs on the success path; an error aborts the whole parse, so a
     // leaked count is harmless.
-    fn enter_nesting(&mut self) -> Result<(), ParseError> {
+    fn enter_nesting(&mut self) -> Result<(), ParseErrorKind> {
         self.depth += 1;
         if self.depth > MAX_NESTING_DEPTH {
-            return Err(ParseError::TooDeeplyNested(format!(
+            return Err(ParseErrorKind::TooDeeplyNested(format!(
                 "Nesting is implausibly deep (over {MAX_NESTING_DEPTH} levels); the input looks unbounded."
             )));
         }
@@ -126,14 +178,56 @@ impl<'src> Parser<'src> {
     }
 
     // Consume the current token if it is `kind`, otherwise report a syntax error.
-    fn expect(&mut self, kind: TokenKind) -> Result<Token<'src>, ParseError> {
+    fn expect(&mut self, kind: TokenKind) -> Result<Token<'src>, ParseErrorKind> {
         if self.peek().kind == kind {
             Ok(self.advance())
         } else {
-            Err(ParseError::Unexpected(format!(
+            Err(ParseErrorKind::Unexpected(format!(
                 "Expected {kind:?}, found {:?}.",
                 self.peek().kind
             )))
+        }
+    }
+
+    // -------------------------------------------------------------------------
+    // Spans
+    // -------------------------------------------------------------------------
+
+    // Extent of a construct that began at `start` and has just been fully parsed: from `start`
+    // through the token most recently consumed. The `max` guards against synthetic layout tokens,
+    // which carry the offset of the position they were manufactured at rather than one they occupy,
+    // and so can sit behind the construct they close.
+    fn span_from(&self, start: Span) -> Span {
+        let last_end = self.tokens[self.pos - 1].span().end;
+        Span::new(start.start, last_end.max(start.end))
+    }
+
+    // Where to report a failure that stopped on the current token.
+    //
+    // A rule can object while the cursor sits on a synthetic layout token (`Newline`, `Indent`,
+    // `Dedent`), which occupies no source and would render as a zero-width position at the end of
+    // the previous line. Point at the next token that does occupy source: that is the one the
+    // reader has to look at. At end of input there is none, so the synthetic token stands.
+    fn error_span(&self) -> Span {
+        self.tokens[self.pos..]
+            .iter()
+            .find(|token| !token.text.is_empty())
+            .unwrap_or(self.peek())
+            .span()
+    }
+
+    // Extent of a composite node that has no token of its own: a binary operator covers both its
+    // operands rather than just the operator, which is what a reader needs to see when the two
+    // failed to combine. A child whose position was never recorded is skipped rather than dragging
+    // the parent's span back to offset 0.
+    fn joined_span(&self, lhs: ExprId, rhs: ExprId) -> Span {
+        let left_span = self.ast.span_of(lhs);
+        let right_span = self.ast.span_of(rhs);
+        match (left_span.is_unknown(), right_span.is_unknown()) {
+            (false, false) => Span::new(left_span.start, right_span.end),
+            (true, false) => right_span,
+            (false, true) => left_span,
+            (true, true) => Span::UNKNOWN,
         }
     }
 

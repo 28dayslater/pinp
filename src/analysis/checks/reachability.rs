@@ -4,16 +4,23 @@
 //!
 //! A forward analysis over the simplest fact there is — reached, or not. Every block starts knowing
 //! nothing (`false`), the entry is seeded as reached, and anything still `false` at fixpoint has no
-//! path leading to it.
+//! path leading to it. Terms shared across this layer are defined in [`crate::analysis`]; the graph
+//! terms in [`crate::cfg`].
+//!
+//! Vocabulary particular to reachability:
+//!
+//! * Reached: some path from the entry arrives at this point. Merging is "reached from anywhere",
+//!   so a point stays unreached only when no path whatsoever leads to it.
+//! * Unreachable: the finding — a statement no execution can arrive at.
 //!
 //! What makes anything unreachable in a language with no `return` or `break` is a condition that
 //! cannot vary. Only a **literal** `true`/`false` counts here, and an empty literal range: `while
 //! 1 > 2` is not folded, because doing constant arithmetic by hand would duplicate what constant
 //! propagation will do properly later. That is a deliberate first-iteration limit, not an oversight.
 
-use crate::analysis::cfg::{Action, BlockId, Cfg, Terminator};
 use crate::analysis::dataflow::{Analysis, Direction, ReachabilityFact, solve};
-use crate::analysis::diagnostic::{Diagnostic, DiagnosticCode};
+use crate::cfg::{Action, BlockId, Cfg, Terminator};
+use crate::diagnostic::{Diagnostic, DiagnosticCode};
 use crate::lexer::Span;
 use crate::parser::{ExprId, Node, ProgramAst, RangeKind, Stmt};
 

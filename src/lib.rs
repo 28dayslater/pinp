@@ -1,6 +1,8 @@
 // SPDX-License-Identifier: MIT
 
 pub mod analysis;
+pub mod cfg;
+pub mod diagnostic;
 pub mod lexer;
 pub mod parser;
 pub mod sema;

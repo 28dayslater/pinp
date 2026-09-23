@@ -2,6 +2,8 @@
 
 use logos::Logos;
 
+use crate::diagnostic::{Diagnose, Diagnostic};
+
 // Raw lexemes straight from logos.
 #[derive(Logos, Debug, PartialEq)]
 #[logos(skip r"[ \t]+")]
@@ -298,12 +300,20 @@ impl Token<'_> {
     }
 }
 
-/// A lexing failure: a [`message`](Self::message) plus the 1-based `line`/`col` where it occurred.
+/// A lexing failure: a [`message`](Self::message) plus the [`Span`] it is about.
+///
+/// A span rather than a resolved line/column, so every layer speaks one position type and the
+/// parser can carry this through without converting. [`LineIndex`] resolves it at render time.
 #[derive(Debug, PartialEq)]
 pub struct LexError {
     pub message: String,
-    pub line: u32,
-    pub col: u32,
+    pub span: Span,
+}
+
+impl Diagnose for LexError {
+    fn to_diagnostic(&self) -> Diagnostic {
+        Diagnostic::error(self.span, self.message.clone())
+    }
 }
 
 /// Lexes `src` into a flat `Vec` of [`Token`]s, turning indentation into `Indent`/`Dedent`
@@ -337,8 +347,7 @@ pub fn lex(src: &str) -> Result<Vec<Token<'_>>, LexError> {
         let (line, col) = locate(lexer.span().start);
         let lexeme = lexeme_result.map_err(|_| LexError {
             message: format!("Unexpected character `{token_text}`."),
-            line,
-            col,
+            span: Span::new(lexer.span().start as u32, lexer.span().end as u32),
         })?;
 
         let kind = match lexeme {
@@ -352,11 +361,10 @@ pub fn lex(src: &str) -> Result<Vec<Token<'_>>, LexError> {
             }
             Lexeme::TabIndent => {
                 // The lexeme spans the newline and any spaces before the tab; report the tab itself.
-                let (tab_line, tab_col) = locate(lexer.span().end - 1);
+                let tab_end = lexer.span().end as u32;
                 return Err(LexError {
                     message: "Tabs are not allowed in indentation.".into(),
-                    line: tab_line,
-                    col: tab_col,
+                    span: Span::new(tab_end - 1, tab_end),
                 });
             }
             Lexeme::Int => TokenKind::Int,
@@ -505,10 +513,12 @@ fn emit_indent(
             out.push(synthetic(TokenKind::Dedent, offset, line, col));
         }
         if *indents.last().unwrap() != indent {
+            // TODO(KI-0001): `offset` is the pending newline's, so this reports the end of the
+            // *previous* line rather than the offending indentation. Preserved by 0016 under its
+            // no-behaviour-change constraint; `tests/diagnostics.rs` locks in the current position.
             return Err(LexError {
                 message: "Inconsistent indentation.".into(),
-                line,
-                col,
+                span: Span::new(offset, offset + 1),
             });
         }
     }
@@ -876,7 +886,7 @@ mod tests {
     fn unterminated_string_is_error_at_opening_quote() {
         // No closing quote before end of input: the opening quote is the failure site.
         let err = lex("'abc").unwrap_err();
-        assert_eq!((err.line, err.col), (1, 1));
+        assert_eq!(LineIndex::new("'abc").locate(err.span.start), (1, 1));
         assert!(lex("\"abc").is_err());
         assert!(lex("f'abc").is_err());
     }
@@ -928,7 +938,7 @@ mod tests {
         let error = lex(src).unwrap_err();
         let index = LineIndex::new(src);
         let tab_offset = src.find('\t').unwrap() as u32;
-        assert_eq!((error.line, error.col), index.locate(tab_offset));
+        assert_eq!(index.locate(error.span.start), index.locate(tab_offset));
     }
 
     #[test]
@@ -1014,8 +1024,12 @@ mod tests {
     fn an_unterminated_multiline_literal_fails_at_the_opening_quote() {
         // The accepted trade-off of spanning lines: a forgotten closing quote is only discovered at
         // end of input, but it is still reported where the literal began.
-        let err = lex("x = 'abc\nmore text\n").unwrap_err();
-        assert_eq!((err.line, err.col), (1, 5));
+        let src = indoc! {"
+            x = 'abc
+            more text
+        "};
+        let err = lex(src).unwrap_err();
+        assert_eq!(LineIndex::new(src).locate(err.span.start), (1, 5));
         assert!(lex("\"abc\nmore").is_err());
         assert!(lex("f'abc\nmore").is_err());
     }
@@ -1027,8 +1041,12 @@ mod tests {
         // pinp's layout is space-based. A tab used for indentation would otherwise be skipped as
         // ordinary whitespace, leaving the line at indent 0 and failing later with a confusing
         // "Expected Indent"; naming it here is far more useful.
-        let err = lex("f() is\n\tx = 1\n").unwrap_err();
-        assert_eq!((err.line, err.col), (2, 1));
+        // Not `indoc!`: the tab is the subject of the test, and dedenting would obscure whether it
+        // survived into the source at all.
+        let src = "f() is\n\tx = 1\n";
+        let err = lex(src).unwrap_err();
+        assert_eq!(LineIndex::new(src).locate(err.span.start), (2, 1));
+        assert_eq!(err.span.text(src), "\t");
         assert!(err.message.contains("Tab"), "message was {:?}", err.message);
         // A tab after some spaces is still indentation.
         assert!(lex("f() is\n    \tx = 1\n").is_err());
