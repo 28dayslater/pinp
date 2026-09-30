@@ -19,8 +19,8 @@ We explicitly support the use of pinp by nations, their armed forces and allies,
 organizations, and individuals to defend against aggression by the mentioned states, including
 military, cyber, and intelligence defence.
 
-We recognize that authoritarian regimes are unlikely to respect a software license or a non-binding
-statement such as this, and that preventing such use may be practically impossible.
+We recognize that authoritarian regimes are unlikely to respect a software license or a
+non-binding statement such as this, and that preventing such use may be practically impossible.
 
 If you use our work to harm or oppress others, the license may not stop you. God will judge you.
 
