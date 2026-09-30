@@ -16,10 +16,10 @@ censorship, or other violations of human rights. This is not directed at the peo
 countries, who are often the first victims of such regimes.
 
 We explicitly support the use of pinp by nations, their armed forces and allies, civil-defence
-organizations, and individuals to defend against aggression by these states, including
+organizations, and individuals to defend against aggression by the mentioned states, including
 military, cyber, and intelligence defence.
 
-We recognize that such regimes are unlikely to respect a software license or a non-binding
+We recognize that authoritarian regimes are unlikely to respect a software license or a non-binding
 statement such as this, and that preventing such use may be practically impossible.
 
 If you use our work to harm or oppress others, the license may not stop you. God will judge you.
