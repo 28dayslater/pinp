@@ -8,12 +8,16 @@ pinp is open-source software released under the MIT License. The license imposes
 based on nationality, government, organization, or field of use, and this statement is not part
 of it and does not modify it.
 
-The project's maintainers nevertheless intend pinp to serve peaceful, civilian, democratic,
-educational, and scientific purposes. We oppose the use of pinp by the governments, armed forces,
-intelligence services, or security apparatuses of Russia, Iran, North Korea, China, or other
-authoritarian states for warfare, repression, surveillance, censorship, or other violations of
-human rights. This is not directed at the people of these countries, who are often the first
-victims of such regimes.
+The project's maintainers nevertheless intend pinp to serve democratic, educational, scientific,
+and other civilian purposes, and the defence of free societies. We oppose the use of pinp by the
+governments, armed forces, intelligence services, or security apparatuses of Russia, Iran,
+North Korea, China, or other authoritarian states for aggression, repression, surveillance,
+censorship, or other violations of human rights. This is not directed at the people of these
+countries, who are often the first victims of such regimes.
+
+We explicitly support the use of pinp by nations, their armed forces and allies, civil-defence
+organizations, and individuals to defend against aggression by these states, including
+military, cyber, and intelligence defence.
 
 We recognize that such regimes are unlikely to respect a software license or a non-binding
 statement such as this, and that preventing such use may be practically impossible.
