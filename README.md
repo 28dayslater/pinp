@@ -2,6 +2,24 @@
 
 ## A programming language project that starts small but aims beyond a toy implementation.
 
+### Project values
+
+pinp is open-source software released under the MIT License. The license imposes no restrictions
+based on nationality, government, organization, or field of use, and this statement is not part
+of it and does not modify it.
+
+The project's maintainers nevertheless intend pinp to serve peaceful, civilian, democratic,
+educational, and scientific purposes. We oppose the use of pinp by the governments, armed forces,
+intelligence services, or security apparatuses of Russia, Iran, North Korea, China, or other
+authoritarian states for warfare, repression, surveillance, censorship, or other violations of
+human rights. This is not directed at the people of these countries, who are often the first
+victims of such regimes.
+
+We recognize that such regimes are unlikely to respect a software license or a non-binding
+statement such as this, and that preventing such use may be practically impossible.
+
+If you use our work to harm or oppress others, the license may not stop you. God will judge you.
+
 ### My ambition is to implement a language that:
 
 - Reads like pseudocode.
