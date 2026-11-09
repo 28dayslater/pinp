@@ -1,8 +1,7 @@
 // SPDX-License-Identifier: MIT
-#![cfg(feature = "llvm")]
 
 //! End-to-end evidence that comments and blank lines are ignored: a program peppered with both
-//! computes the same value as its stripped-down equivalent. Requires the `llvm` feature.
+//! computes the same value as its stripped-down equivalent.
 
 mod common;
 use common::eval_int;

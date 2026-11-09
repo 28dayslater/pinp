@@ -1,9 +1,8 @@
 // SPDX-License-Identifier: MIT
-#![cfg(feature = "llvm")]
 
 //! End-to-end ranges: the `start..stop[:step]` value, the `for idx in <range>` loop, and the
 //! `value in <range>` membership test — including stepped, descending, first-class, variable, and
-//! empty ranges. Requires the `llvm` feature.
+//! empty ranges.
 
 mod common;
 use common::{eval_bool, eval_int};
@@ -143,7 +142,7 @@ fn inconsistent_variable_range_is_empty() {
 fn runtime_zero_step_is_a_runtime_error() {
     // A zero step is only reachable through a variable; building such a range raises a runtime error
     // (reported as `Err`), rather than looping forever or silently doing nothing.
-    let error = pinp::codegen::PinpJit::eval(indoc! {"
+    let error = common::eval_result(indoc! {"
         step = 0
         total = 0
         for idx in 1..10:step
@@ -210,4 +209,21 @@ fn membership_of_an_empty_range_is_false() {
         a, b = 5, 1
         3 in a..<b
     "}));
+}
+
+#[test]
+fn a_written_step_decides_an_exclusive_ranges_direction() {
+    // The step's sign wins over the `..<`/`..>` spelling: a range stepping away from its stop is
+    // empty, and one stepping toward it counts that way.
+    let sum = |range: &str| eval_int(&format!("t = 0\nfor i in {range}\n    t += i\nt"));
+    assert_eq!(sum("5..>1:2"), 0);
+    assert_eq!(sum("1..<5:0-2"), 0);
+    assert_eq!(sum("5..>1:0-2"), 5 + 3);
+    assert_eq!(sum("1..<5:2"), 1 + 3);
+}
+
+#[test]
+fn membership_follows_the_written_step_too() {
+    assert!(!eval_bool("r = 5..>1:2\n3 in r"));
+    assert!(eval_bool("r = 5..>1:0-2\n3 in r"));
 }

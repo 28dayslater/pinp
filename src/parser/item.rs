@@ -356,12 +356,15 @@ impl<'src> Parser<'src> {
     // 1 binder → `Stmt::For`; 2–3 binders → `Stmt::ForArray`; 4+ → `ParseError`.
     fn parse_for(&mut self) -> Result<Stmt, ParseErrorKind> {
         self.advance(); // 'for'
-        let first_sym = self.expect_binder()?;
+        let (first_sym, first_span) = self.expect_binder()?;
         if self.peek().kind == TokenKind::Comma {
             let mut binders = vec![first_sym];
+            let mut binder_spans = vec![first_span];
             while self.peek().kind == TokenKind::Comma {
                 self.advance(); // ','
-                binders.push(self.expect_binder()?);
+                let (binder, span) = self.expect_binder()?;
+                binders.push(binder);
+                binder_spans.push(span);
             }
             if binders.len() > 3 {
                 return Err(ParseErrorKind::Unexpected(
@@ -373,6 +376,7 @@ impl<'src> Parser<'src> {
             let body = self.parse_block()?;
             return Ok(Stmt::ForArray {
                 binders,
+                binder_spans,
                 source,
                 body,
             });
@@ -382,6 +386,7 @@ impl<'src> Parser<'src> {
         let body = self.parse_block()?;
         Ok(Stmt::For {
             var: first_sym,
+            var_span: first_span,
             source,
             body,
         })
@@ -390,15 +395,16 @@ impl<'src> Parser<'src> {
     // -------------------------------------------------------------------------
     // Statements and assignment
     // Consume the next token as a for-loop binder name: either a plain `Identifier` or the
-    // don't-care `_` (`Underscore`). Returns the interned `SymId`; errors on anything else.
-    fn expect_binder(&mut self) -> Result<SymId, ParseErrorKind> {
+    // don't-care `_` (`Underscore`). Returns the interned `SymId` and where it was written; errors
+    // on anything else.
+    fn expect_binder(&mut self) -> Result<(SymId, Span), ParseErrorKind> {
         let token = self.peek();
         match token.kind {
             TokenKind::Identifier | TokenKind::Underscore => {
-                let text = token.text;
+                let (text, span) = (token.text, token.span());
                 let sym = self.ast.intern(text);
                 self.advance();
-                Ok(sym)
+                Ok((sym, span))
             }
             _ => Err(ParseErrorKind::Unexpected(format!(
                 "Expected a binder name or `_`, found `{}`.",

@@ -7,12 +7,9 @@
 // per-thread heap in thread-local storage, and TLS accessed from JIT-compiled
 // code emits relocations ORC cannot resolve. So JIT-compiled pinp code instead
 // *calls* the runtime, with the `pinp_*` entry points resolved against the host
-// process by the JIT's dynamic-library search generator (see src/codegen/jit.rs).
+// process by the JIT's `dlsym`-based symbol lookup (see src/codegen/).
 // Only the `pinp_*` surface is exported into the dynamic symbol table, so
 // mimalloc's own symbols stay private to the binary.
-//
-// This runs only for the `llvm` feature: a front-end-only build
-// (`--no-default-features`) has no JIT and needs no allocator or C toolchain.
 //
 // Caching: compiling mimalloc is the slow step, so its object is kept in OUT_DIR
 // and recompiled only when missing or older than its source. Cargo already gates
@@ -49,11 +46,6 @@ const EXPORTED_SYMBOLS: [&str; 15] = [
 ];
 
 fn main() {
-    // The runtime is only needed by the LLVM backend.
-    if std::env::var_os("CARGO_FEATURE_LLVM").is_none() {
-        return;
-    }
-
     let out_dir = PathBuf::from(std::env::var_os("OUT_DIR").expect("OUT_DIR is set by Cargo"));
     let mimalloc = PathBuf::from("third_party/mimalloc");
     let mimalloc_src = mimalloc.join("src/static.c");

@@ -1,5 +1,4 @@
 // SPDX-License-Identifier: MIT
-#![cfg(feature = "llvm")]
 
 //! The `str` freeing model, checked against the runtime's own bookkeeping: every heap byte a
 //! program allocates must be released by the time the run is over, and released exactly once.
@@ -15,18 +14,13 @@
 //! The counters catch both failure directions: storage that is never released leaves
 //! `allocation_count` ahead of `free_count`, and storage released twice pushes `free_count` ahead
 //! (if mimalloc does not abort on the double free first). Each test also asserts the program's
-//! *value*, so a premature free that corrupts live content fails here too.
+//! *value*, so a premature free that corrupts live content fails here too. The frees are placed in
+//! the IR (0017-F).
 
 mod common;
 use common::memory_counts;
 use indoc::indoc;
 use pinp::codegen::{PinpJit, PinpValue};
-use std::sync::Mutex;
-
-/// The runtime counters are process-global and cargo runs a binary's tests on parallel threads, so
-/// every measurement in this file takes the same lock. Only this binary's tests are serialised;
-/// other test binaries are separate processes with their own counters.
-static COUNTERS: Mutex<()> = Mutex::new(());
 
 /// A literal comfortably past the 15-byte inline maximum, so it must be heap-allocated.
 const LONG: &str = "a string that is certainly longer than fifteen bytes";
@@ -35,13 +29,11 @@ const LONG: &str = "a string that is certainly longer than fifteen bytes";
 /// its value.
 ///
 /// The heap-traffic assertion is what stops a test from passing by allocating nothing at all — the
-/// reason every program in this file works with strings longer than the inline maximum. The lock is
-/// held across the whole measurement, and the JIT is dropped before the second reading so nothing
-/// the program allocated is still owned by a live handle.
+/// reason every program in this file works with strings longer than the inline maximum. The
+/// counters are per thread, so tests on other threads do not disturb the measurement; the JIT is
+/// dropped before the second reading so nothing the program allocated is still owned by a live
+/// handle.
 fn run_balanced(src: &str) -> PinpValue {
-    let _guard = COUNTERS
-        .lock()
-        .unwrap_or_else(|poisoned| poisoned.into_inner());
     let before = memory_counts();
 
     let value = {
@@ -440,4 +432,114 @@ fn a_concat_heavy_program_is_balanced() {
         LONG
     ));
     assert_eq!(as_str(value), "10/10: ..........");
+}
+
+// --- shapes the IR's ownership placement adds (0017-F) -----------------------------------------
+
+#[test]
+fn a_global_rebound_inside_a_function_is_balanced() {
+    let value = run_balanced(&format!(
+        indoc! {"
+            g = '{0}'
+            set(): int is
+                ::g = '{0}' + '{0}'
+                0
+            set() + set()
+            g.len
+        "},
+        LONG
+    ));
+    assert_eq!(value, PinpValue::Int(2 * LONG.len() as i64));
+}
+
+#[test]
+fn a_read_the_next_operand_rebinds_is_copied_first() {
+    // `g + f()`: `f` frees the value of `g` the concatenation has already read.
+    let value = run_balanced(&format!(
+        indoc! {"
+            g = 'first {0}'
+            f(): str is
+                ::g = 'second {0}'
+                '!'
+            g + f()
+        "},
+        LONG
+    ));
+    assert_eq!(as_str(value), format!("first {LONG}!"));
+}
+
+#[test]
+fn if_expression_strings_in_a_loop_are_balanced() {
+    let value = run_balanced(&format!(
+        indoc! {"
+            total = 0
+            for idx in 1..4
+                s = '{0}' if idx > 2 else '{0}' + '{0}'
+                total += s.len
+            total
+        "},
+        LONG
+    ));
+    assert_eq!(value, PinpValue::Int(6 * LONG.len() as i64));
+}
+
+#[test]
+fn a_comparison_with_a_literal_in_a_loop_condition_is_balanced() {
+    let value = run_balanced(&format!(
+        indoc! {"
+            s = ''
+            n = 0
+            while s != '{0}{0}'
+                s += '{0}'
+                n += 1
+            n
+        "},
+        LONG
+    ));
+    assert_eq!(value, PinpValue::Int(2));
+}
+
+#[test]
+fn interpolation_in_a_loop_is_balanced() {
+    let value = run_balanced(&format!(
+        indoc! {"
+            n = 0
+            for idx in 1..3
+                line = f'{0} {{idx}}'
+                n += line.len
+            n
+        "},
+        LONG
+    ));
+    assert_eq!(value, PinpValue::Int(3 * (LONG.len() as i64 + 2)));
+}
+
+#[test]
+fn a_string_bound_only_on_an_untaken_branch_is_balanced() {
+    let value = run_balanced(&format!(
+        indoc! {"
+            f(flag: bool): int is
+                n = 0
+                if flag
+                    s = '{0}'
+                    n = s.len
+                n
+            f(false) + f(true)
+        "},
+        LONG
+    ));
+    assert_eq!(value, PinpValue::Int(LONG.len() as i64));
+}
+
+#[test]
+fn swapping_strings_is_balanced() {
+    let value = run_balanced(&format!(
+        indoc! {"
+            a, b = 'a {0}', 'b {0}'
+            a, b = b, a
+            a + b
+        "},
+        LONG
+    ));
+    assert_eq!(as_str(value), format!("b {LONG}a {LONG}"));
 }

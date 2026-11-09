@@ -1,8 +1,7 @@
 // SPDX-License-Identifier: MIT
-#![cfg(feature = "llvm")]
 
 //! End-to-end multiple-target assignment: parallel (`a, b = 1, 2`), swap, and chained
-//! (`a = b = c`). Requires the `llvm` feature.
+//! (`a = b = c`).
 
 mod common;
 use common::{eval_float, eval_int};

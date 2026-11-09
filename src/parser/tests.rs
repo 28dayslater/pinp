@@ -1949,3 +1949,49 @@ fn a_composite_node_covers_both_its_operands() {
         .expect("the operator");
     assert_eq!(ast.spans[binary].text(src), "41 + 1");
 }
+
+#[test]
+fn a_for_loop_records_its_binder_span() {
+    let src = "t = 0\nfor idx in 1..3\n    t += idx\nt";
+    let ast = parse_ok(src);
+    let TopLevel::Stmt(Stmt::For { var_span, .. }) = &ast.top_level[1] else {
+        panic!("Expected a for loop.");
+    };
+    assert_eq!(var_span.text(src), "idx");
+}
+
+#[test]
+fn a_multi_binder_for_records_each_binder_span() {
+    let src = "m = [1, 2; 3, 4]\nt = 0\nfor row, _, value in m\n    t += value\nt";
+    let ast = parse_ok(src);
+    let TopLevel::Stmt(Stmt::ForArray {
+        binders,
+        binder_spans,
+        ..
+    }) = &ast.top_level[2]
+    else {
+        panic!("Expected a multi-binder for loop.");
+    };
+    assert_eq!(binder_spans.len(), binders.len());
+    let texts: Vec<&str> = binder_spans.iter().map(|span| span.text(src)).collect();
+    assert_eq!(texts, ["row", "_", "value"]);
+}
+
+#[test]
+fn a_comprehension_records_its_variable_span_without_the_annotation() {
+    for (src, expected) in [
+        ("[x * 2 for x in 0..3]", "x"),
+        ("[y for y: float in 0..3]", "y"),
+    ] {
+        let ast = parse_ok(src);
+        let var_span = ast
+            .nodes
+            .iter()
+            .find_map(|node| match node {
+                Node::Comprehension { var_span, .. } => Some(*var_span),
+                _ => None,
+            })
+            .expect("a comprehension");
+        assert_eq!(var_span.text(src), expected, "in {src}");
+    }
+}

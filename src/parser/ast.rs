@@ -10,7 +10,7 @@ use crate::lexer::Span;
 
 /// The scalar element types that an array may hold. A strict subset of [`PinpType`] so that
 /// `PinpType::Array` stays `Copy` (it stores an `ArrayElementType`, not a boxed `PinpType`).
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum ArrayElementType {
     Bool,
     Int,
@@ -29,7 +29,7 @@ impl From<ArrayElementType> for PinpType {
 
 /// The type of every expression and binding. `Void` is the type of a function with no declared
 /// return type (and of a call to one); a value-typed expression is never `Void`.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum PinpType {
     Bool,
     Int,
@@ -59,7 +59,7 @@ impl SymId {
 /// An index into [`ProgramAst::string_literals`]: the owned content of a [`Node::Str`] or of one
 /// literal run of a [`Node::FStr`]. Content is owned rather than a source slice because auto-dedent
 /// (and, later, escape processing) rewrite the bytes, so it cannot borrow the source.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct StrId(pub u32);
 
 impl StrId {
@@ -215,6 +215,8 @@ pub enum Node {
     Comprehension {
         element: ExprId,
         var: SymId,
+        /// Where the variable was written, without its type annotation.
+        var_span: Span,
         var_type: PinpType,
         source: ExprId,
     },
@@ -307,6 +309,8 @@ pub enum Stmt {
     /// loop variable), a 1D array (value only), or a 2D matrix (value only, row-major).
     For {
         var: SymId,
+        /// Where the binder was written; like a `Place`, a `SymId` has nowhere to hang a position.
+        var_span: Span,
         source: ExprId,
         body: Block,
     },
@@ -314,6 +318,8 @@ pub enum Stmt {
     /// 2 binders + 1D array → (index, value); 3 binders + 2D matrix → (row, col, value).
     ForArray {
         binders: Vec<SymId>,
+        /// Where each binder was written, in order.
+        binder_spans: Vec<Span>,
         source: ExprId,
         body: Block,
     },

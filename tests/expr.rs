@@ -1,8 +1,7 @@
 // SPDX-License-Identifier: MIT
-#![cfg(feature = "llvm")]
 
 //! End-to-end expression evaluation: pinp source is JIT-compiled and run, and the
-//! computed value is verified. Requires the `llvm` feature.
+//! computed value is verified.
 
 mod common;
 use common::{eval_float, eval_int};

@@ -2420,62 +2420,41 @@ fn literal_oob_write_index_on_2d_is_sema_error() {
 
 // ---- step 20 — loose ends -------------------------------------------------------
 
+// `_` as the value binder: a loop run once per element, the element unwanted (0017-D). It was
+// an error until the analyses began reporting unread loop values and needed a way to silence them.
+
 #[test]
-fn for_underscore_value_binder_on_1d_is_sema_error() {
-    assert_eq!(
-        sema_error(indoc! {"
-            a = [1, 2, 3]
-            for _ in a
-                0
-        "}),
-        SemaErrorKind::Type("Value binder must not be `_`.".into())
-    );
+fn an_underscore_value_binder_is_accepted_on_an_array() {
+    for binders in ["_", "idx, _", "_, _"] {
+        analyzed(&format!(
+            "a = [1, 2, 3]\nn = 0\nfor {binders} in a\n    n += 1\nn"
+        ));
+    }
 }
 
 #[test]
-fn for_idx_underscore_value_binder_on_1d_is_sema_error() {
-    assert_eq!(
-        sema_error(indoc! {"
-            a = [1, 2, 3]
-            for idx, _ in a
-                0
-        "}),
-        SemaErrorKind::Type("Value binder must not be `_`.".into())
-    );
+fn an_underscore_value_binder_is_accepted_on_a_matrix() {
+    for binders in ["_", "row, col, _", "_, _, _"] {
+        analyzed(&with_matrix4(&format!(
+            "n = 0\nfor {binders} in m\n    n += 1\nn"
+        )));
+    }
 }
 
 #[test]
-fn for_both_underscore_binders_on_1d_is_sema_error() {
-    assert_eq!(
-        sema_error(indoc! {"
-            a = [1, 2, 3]
-            for _, _ in a
-                0
-        "}),
-        SemaErrorKind::Type("Value binder must not be `_`.".into())
-    );
+fn an_underscore_value_binder_cannot_be_read() {
+    let src = "a = [1, 2, 3]\nn = 0\nfor _ in a\n    n += _\nn";
+    let mut ast = match parse(src) {
+        Ok(ast) => ast,
+        Err(_) => return, // `_` is not an expression at all
+    };
+    assert!(analyze(&mut ast).is_err(), "`_` names nothing to read");
 }
 
 #[test]
-fn for_underscore_value_binder_on_2d_is_sema_error() {
-    assert_eq!(
-        sema_error(&with_matrix4(indoc! {"
-            for row, col, _ in m
-                0
-        "})),
-        SemaErrorKind::Type("Value binder must not be `_`.".into())
-    );
-}
-
-#[test]
-fn for_all_underscore_binders_on_2d_is_sema_error() {
-    assert_eq!(
-        sema_error(&with_matrix4(indoc! {"
-            for _, _, _ in m
-                0
-        "})),
-        SemaErrorKind::Type("Value binder must not be `_`.".into())
-    );
+fn an_underscore_value_binder_does_not_hide_an_outer_name() {
+    let ast = analyzed("x = 5\na = [1, 2]\nt = 0\nfor _ in a\n    t += x\nt");
+    assert!(!ast.top_level.is_empty());
 }
 
 #[test]

@@ -1,67 +1,67 @@
 // SPDX-License-Identifier: MIT
 
-//! Liveness: which bindings still have a read ahead of them.
+//! Liveness: which variables still have a read ahead of them.
 //!
-//! A backward analysis: its fact is the set of live symbols, and a read makes a symbol live while
-//! a write kills it. Terms shared across this layer — fact, merge, direction, finding — are defined
-//! in [`crate::analysis`]; the graph terms in [`crate::cfg`].
+//! A backward analysis: its fact is the set of live variables, and a read makes a variable live
+//! while a write kills it. Terms shared across this layer — fact, merge, direction, finding — are
+//! defined in [`crate::analysis`].
 //!
 //! Vocabulary particular to liveness:
 //!
-//! * Binding: a symbol with a value. An assignment creates or updates one.
-//! * Read, write: a use of a symbol's value, and a store into it.
-//! * Live: a symbol some later read reaches on at least one path. Merging unions the sets, because
-//!   a symbol read on *any* onward path is still needed.
+//! * Variable: a local of the function — or, at the top level, a global no function touches,
+//!   which only the top level can read or write. Each binding is its own variable, even when two
+//!   share a name.
+//! * Read, write: a use of a variable's value, and a store into it.
+//! * Live: a variable some later read reaches on at least one path. Merging unions the sets,
+//!   because a variable read on *any* onward path is still needed.
 //! * Kill: what a write does to the value that was there.
-//! * Escaping: a symbol outliving this graph — a global another function may read. Live wherever
-//!   the graph ends; see [`escaping_symbols`].
-//! * Dead store: a write to a symbol that is not live immediately afterwards — the value is
+//! * Dead store: a write to a variable that is not live immediately afterwards — the value is
 //!   replaced or discarded before anything looks at it.
-//! * Unused variable: a symbol with no read anywhere.
+//! * Unused variable: a variable with no read anywhere.
 //!
 //! The last two are this module's findings, kept as separate rules. The remedies differ: a dead
 //! store is one assignment to delete; an unused variable is the binding and every write to it.
-//! A symbol nothing reads yields an unused-variable finding at its introduction and a dead store
-//! at each later write, matching what `rustc` reports for the same shape.
+//! A variable nothing reads yields an unused-variable finding at its introduction and a dead store
+//! at each later write, matching what `rustc` reports for the same shape. Compiler temporaries have
+//! no name and are never reported; nor is a variable named `_`.
 
 use rustc_hash::{FxHashMap, FxHashSet};
 
-use crate::analysis::dataflow::{Analysis, Direction, MergeableFact, SymbolSetFact, solve};
-use crate::cfg::{Action, Cfg, Terminator};
+use crate::analysis::dataflow::{
+    Analysis, Direction, MergeableFact, VariableSet, replay_backward, solve,
+};
 use crate::diagnostic::{Diagnostic, DiagnosticCode};
+use crate::ir::{
+    Flat, Function, GlobalId, LocalId, NodeId, Operation, Program, ProgramTables, RuntimeFunction,
+    Terminator,
+};
 use crate::lexer::Span;
-use crate::parser::{Block, ExprId, FStrSegment, Node, Place, ProgramAst, Stmt, SymId};
+use crate::parser::SymId;
 
-/// Reports dead stores and unused variables in one graph.
-///
-/// `escaping` are symbols that outlive this graph — globals, which another function may read — and
-/// are treated as live wherever the graph ends. Compute them once with [`escaping_symbols`].
-pub fn check(ast: &ProgramAst, cfg: &Cfg, escaping: &FxHashSet<SymId>) -> Vec<Diagnostic> {
-    let analysis = Liveness { ast, escaping };
-    let solution = solve(cfg, &analysis);
+/// Reports dead stores and unused variables in `function`. `owned_globals` are the globals
+/// analysed like its locals: at the top level, those no function reads or writes.
+pub fn check(
+    function: &Function<Flat>,
+    tables: &ProgramTables,
+    names: &[&str],
+    owned_globals: &FxHashSet<GlobalId>,
+) -> Vec<Diagnostic> {
+    let analysis = Liveness {
+        function,
+        owned_globals,
+    };
+    let solution = solve(function, &analysis);
+    let blocks = &function.shape.blocks;
 
-    // Every symbol anything reads, anywhere in this graph: what tells an unused variable from a
-    // merely dead store.
-    let mut ever_read: FxHashSet<SymId> = FxHashSet::default();
-    for block_id in cfg.block_ids() {
-        for action in &cfg.block(block_id).actions {
-            analysis.reads_of_action(action, &mut ever_read);
-        }
-        analysis.reads_of_terminator(&cfg.block(block_id).terminator, &mut ever_read);
-    }
-
-    // Where each symbol is introduced: its lowest write position. The blocks are walked backwards
-    // below, so the first write reached is the last one written — not where a reader would delete
-    // the variable from.
-    let mut introduction: FxHashMap<SymId, Span> = FxHashMap::default();
-    for block_id in cfg.block_ids() {
-        for action in &cfg.block(block_id).actions {
-            let Action::Statement(stmt) = action else {
-                continue;
-            };
-            for (sym_id, span) in analysis.writes_of_stmt(stmt) {
+    let mut ever_read = VariableSet::nothing_known();
+    let mut introduction: FxHashMap<usize, Span> = FxHashMap::default();
+    for (_, block) in blocks.iter() {
+        for &statement in function.arena.items(block.statements) {
+            analysis.reads_in(statement, &mut ever_read);
+            if let Some(variable) = analysis.written(statement) {
+                let span = function.arena.spans[statement];
                 introduction
-                    .entry(sym_id)
+                    .entry(variable)
                     .and_modify(|first| {
                         if span.start < first.start {
                             *first = span;
@@ -70,390 +70,209 @@ pub fn check(ast: &ProgramAst, cfg: &Cfg, escaping: &FxHashSet<SymId>) -> Vec<Di
                     .or_insert(span);
             }
         }
+        if let Some(operand) = block.terminator.operand() {
+            analysis.reads_in(operand, &mut ever_read);
+        }
     }
 
     let mut diagnostics = Vec::new();
-    // One unused-variable finding per symbol, at its introduction.
-    let mut reported_unused: FxHashSet<SymId> = FxHashSet::default();
-
-    for block_id in cfg.block_ids() {
-        // Re-walk the block backwards from its outgoing fact to get the fact at each action; the
-        // solver stores facts per block, and per-action facts are cheaper to recompute than to keep.
-        let mut live = solution.after(block_id).clone();
-        analysis.transfer_terminator(&cfg.block(block_id).terminator, &mut live);
-
-        for action in cfg.block(block_id).actions.iter().rev() {
-            // `live` is what is needed *after* this action — exactly the question a dead store asks.
-            let Action::Statement(stmt) = action else {
-                analysis.transfer_action(action, &mut live);
-                continue;
-            };
-            for (sym_id, span) in analysis.writes_of_stmt(stmt) {
-                if analysis.is_exempt(sym_id) {
-                    continue;
+    let mut reported_unused = FxHashSet::default();
+    for (block_id, _) in blocks.iter() {
+        replay_backward(
+            function,
+            &analysis,
+            &solution,
+            block_id,
+            |statement, live| {
+                let Some(variable) = analysis.written(statement) else {
+                    return;
+                };
+                let Some(name) = analysis.name(variable, tables, names) else {
+                    return;
+                };
+                if name == "_" {
+                    return;
                 }
-                // A symbol whose value is never read is an unused variable at its introduction;
-                // every later write to it is a dead store like any other.
-                let introduces = introduction.get(&sym_id) == Some(&span);
-                if !ever_read.contains(&sym_id) && introduces && reported_unused.insert(sym_id) {
+                let span = function.arena.spans[statement];
+                let introduces = introduction.get(&variable) == Some(&span);
+                if !ever_read.contains(variable) && introduces && reported_unused.insert(variable) {
                     diagnostics.push(Diagnostic::new(
                         DiagnosticCode::UnusedVariable,
                         span,
-                        format!("Variable `{}` is never used.", analysis.name(sym_id)),
+                        format!("Variable `{name}` is never used."),
                     ));
-                } else if !live.contains(sym_id) {
+                } else if !live.contains(variable) {
                     diagnostics.push(Diagnostic::new(
                         DiagnosticCode::DeadStore,
                         span,
-                        format!(
-                            "Value assigned to `{}` is never read.",
-                            analysis.name(sym_id)
-                        ),
+                        format!("Value assigned to `{name}` is never read."),
                     ));
                 }
-            }
-            analysis.transfer_action(action, &mut live);
-        }
+            },
+        );
     }
     diagnostics
 }
 
-/// Symbols whose life does not end with any one graph: everything named through `::`.
-///
-/// A function writing `::total` is not making a dead store even if it never reads it back, and a
-/// global the entry assigns may be read only from inside a function. Both directions are covered by
-/// treating every `::`-named symbol as live wherever a graph ends.
-///
-/// Deliberately coarse: it counts a `::name` on the left of an assignment as well as a read, so a
-/// global nothing ever reads is not reported. Over-approximating liveness only ever *suppresses* a
-/// finding, which is the safe direction.
-pub fn escaping_symbols(ast: &ProgramAst) -> FxHashSet<SymId> {
-    let mut escaping = FxHashSet::default();
-    for node in &ast.nodes {
-        if let Node::Global(sym_id) = node {
-            escaping.insert(*sym_id);
+/// The globals the top level owns: every global no other function reads or writes. Those are
+/// analysed like the top level's locals; any other is live wherever the top level ends.
+pub fn owned_globals(program: &Program<Flat>) -> FxHashSet<GlobalId> {
+    let mut owned: FxHashSet<GlobalId> = program
+        .tables
+        .globals
+        .iter()
+        .map(|(global_id, _)| global_id)
+        .collect();
+    for (_, function) in program.functions.iter() {
+        if function.id == program.entry {
+            continue;
         }
-    }
-    for item in &ast.top_level {
-        collect_global_targets(top_level_stmt(item), &mut escaping);
-    }
-    escaping
-}
-
-fn top_level_stmt(item: &crate::parser::TopLevel) -> Option<&Stmt> {
-    match item {
-        crate::parser::TopLevel::Stmt(stmt) => Some(stmt),
-        crate::parser::TopLevel::Func(_) => None,
-    }
-}
-
-fn collect_global_targets(stmt: Option<&Stmt>, escaping: &mut FxHashSet<SymId>) {
-    let Some(Stmt::Assign { target_lists, .. }) = stmt else {
-        return;
-    };
-    for group in target_lists {
-        for place in group {
-            if let Place::Global(sym_id) = place {
-                escaping.insert(*sym_id);
+        for (_, operation) in function.arena.operations.iter() {
+            if let Operation::ReadGlobal(global_id) | Operation::WriteGlobal { global_id, .. } =
+                operation
+            {
+                owned.remove(global_id);
             }
         }
     }
+    owned
 }
 
-struct Liveness<'a, 'ast> {
-    ast: &'a ProgramAst<'ast>,
-    escaping: &'a FxHashSet<SymId>,
+struct Liveness<'function> {
+    function: &'function Function<Flat>,
+    owned_globals: &'function FxHashSet<GlobalId>,
 }
 
-impl<'ast> Analysis<'ast> for Liveness<'_, 'ast> {
-    type Fact = SymbolSetFact;
+impl Analysis for Liveness<'_> {
+    type Fact = VariableSet;
     const DIRECTION: Direction = Direction::Backward;
 
-    fn boundary(&self) -> SymbolSetFact {
-        // Where the graph ends, everything that outlives it is still live.
-        let mut fact = SymbolSetFact::nothing_known();
-        for sym_id in self.escaping {
-            fact.insert(*sym_id);
-        }
-        fact
+    fn boundary(&self) -> VariableSet {
+        VariableSet::nothing_known()
     }
 
-    fn transfer_action(&self, action: &Action<'ast>, fact: &mut SymbolSetFact) {
-        match action {
-            Action::Statement(stmt) => {
-                // Kill first, then revive: a statement's own reads happen before its write lands,
-                // so `s = s + 1` leaves `s` live going backwards.
-                for (sym_id, _) in self.writes_of_stmt(stmt) {
-                    fact.remove(sym_id);
-                }
-                let mut reads = FxHashSet::default();
-                self.reads_of_stmt(stmt, &mut reads);
-                for sym_id in reads {
-                    fact.insert(sym_id);
-                }
-            }
-            Action::Evaluate(expr_id) => {
-                let mut reads = FxHashSet::default();
-                self.reads_of_expr(*expr_id, &mut reads);
-                for sym_id in reads {
-                    fact.insert(sym_id);
-                }
-            }
-            // A loop variable is written afresh each iteration, so anything live before the binding
-            // is not this binding's value.
-            Action::Bind(sym_id) => {
-                fact.remove(*sym_id);
-            }
+    fn transfer_statement(&self, statement: NodeId, fact: &mut VariableSet) {
+        if let Some(variable) = self.written(statement) {
+            fact.remove(variable);
         }
+        self.reads_in(statement, fact);
     }
 
-    fn transfer_terminator(&self, terminator: &Terminator, fact: &mut SymbolSetFact) {
-        let mut reads = FxHashSet::default();
-        self.reads_of_terminator(terminator, &mut reads);
-        for sym_id in reads {
-            fact.insert(sym_id);
+    fn transfer_terminator(&self, terminator: &Terminator, fact: &mut VariableSet) {
+        if let Some(operand) = terminator.operand() {
+            self.reads_in(operand, fact);
         }
     }
 }
 
-impl Liveness<'_, '_> {
-    fn name(&self, sym_id: SymId) -> &str {
-        self.ast.names[sym_id.value()]
+impl Liveness<'_> {
+    /// Locals are numbered first, owned globals after them.
+    fn local(&self, local_id: LocalId) -> usize {
+        local_id.index() as usize
     }
 
-    /// Whether a symbol is deliberately not reported about.
-    fn is_exempt(&self, sym_id: SymId) -> bool {
-        // `_` exists to say "I am not using this".
-        self.name(sym_id) == "_"
-            // A global may be read from a function this graph knows nothing about.
-            || self.escaping.contains(&sym_id)
+    fn global(&self, global_id: GlobalId) -> Option<usize> {
+        self.owned_globals
+            .contains(&global_id)
+            .then(|| self.function.arena.locals.len() + global_id.index() as usize)
     }
 
-    fn reads_of_action(&self, action: &Action<'_>, out: &mut FxHashSet<SymId>) {
-        match action {
-            Action::Statement(stmt) => self.reads_of_stmt(stmt, out),
-            Action::Evaluate(expr_id) => self.reads_of_expr(*expr_id, out),
-            Action::Bind(_) => {}
+    /// The variable a statement stores into as a whole, if any.
+    fn written(&self, statement: NodeId) -> Option<usize> {
+        match self.function.arena.operations[statement] {
+            Operation::WriteLocal { local_id, .. } => Some(self.local(local_id)),
+            Operation::WriteGlobal { global_id, .. } => self.global(global_id),
+            _ => None,
         }
     }
 
-    fn reads_of_terminator(&self, terminator: &Terminator, out: &mut FxHashSet<SymId>) {
-        match terminator {
-            Terminator::Branch { cond, .. } => self.reads_of_expr(*cond, out),
-            Terminator::Return(Some(result)) => self.reads_of_expr(*result, out),
-            Terminator::Goto(_) | Terminator::Return(None) | Terminator::Exit => {}
-        }
-    }
-
-    /// The bindings a statement writes, with where each was written.
-    fn writes_of_stmt(&self, stmt: &Stmt) -> Vec<(SymId, Span)> {
-        match stmt {
-            Stmt::Assign {
-                target_lists,
-                target_spans,
-                ..
-            } => target_lists
-                .iter()
-                .zip(target_spans)
-                .flat_map(|(places, spans)| places.iter().zip(spans))
-                .map(|(place, span)| (place_sym(*place), *span))
-                .collect(),
-            // An indexed assignment updates one element of an existing array; the binding itself is
-            // read, not replaced, so it is not a write for liveness purposes.
-            _ => Vec::new(),
-        }
-    }
-
-    /// Every binding a statement reads, including inside nested blocks.
-    fn reads_of_stmt(&self, stmt: &Stmt, out: &mut FxHashSet<SymId>) {
-        match stmt {
-            Stmt::Assign { values, .. } => {
-                for value in values {
-                    self.reads_of_expr(*value, out);
+    /// Adds every variable read in the tree under `root`. Freeing a string is not reading it: the
+    /// frees ownership places before every string store and at the end would otherwise make every
+    /// string look used.
+    fn reads_in(&self, root: NodeId, fact: &mut VariableSet) {
+        let arena = &self.function.arena;
+        let mut pending = vec![root];
+        while let Some(node_id) = pending.pop() {
+            match arena.operations[node_id] {
+                Operation::RuntimeCall {
+                    function: RuntimeFunction::StrFree,
+                    ..
+                } => continue,
+                Operation::ReadLocal(local_id) => {
+                    fact.insert(self.local(local_id));
                 }
-            }
-            Stmt::Expr(expr_id) => self.reads_of_expr(*expr_id, out),
-            Stmt::While { cond, body } => {
-                self.reads_of_expr(*cond, out);
-                self.reads_of_block(body, out);
-            }
-            Stmt::Loop { body, cond, .. } => {
-                self.reads_of_block(body, out);
-                self.reads_of_expr(*cond, out);
-            }
-            Stmt::For { source, body, .. } | Stmt::ForArray { source, body, .. } => {
-                self.reads_of_expr(*source, out);
-                self.reads_of_block(body, out);
-            }
-            Stmt::IndexedAssign {
-                target,
-                index,
-                value,
-                ..
-            } => {
-                out.insert(place_sym(*target));
-                self.reads_of_expr(*index, out);
-                self.reads_of_expr(*value, out);
-            }
-            Stmt::IndexedAssign2D {
-                target,
-                row,
-                col,
-                value,
-                ..
-            } => {
-                out.insert(place_sym(*target));
-                self.reads_of_expr(*row, out);
-                self.reads_of_expr(*col, out);
-                self.reads_of_expr(*value, out);
-            }
-        }
-    }
-
-    fn reads_of_block(&self, block: &Block, out: &mut FxHashSet<SymId>) {
-        for stmt in &block.stmts {
-            self.reads_of_stmt(stmt, out);
-        }
-        if let Some(result) = block.result {
-            self.reads_of_expr(result, out);
-        }
-    }
-
-    /// Every binding an expression reads.
-    ///
-    /// Nested blocks — an `if`-expression's arms, which the CFG treats as part of one atomic
-    /// statement — are walked for their reads. Writes inside them are *not* collected, which loses
-    /// a finding rather than inventing one.
-    fn reads_of_expr(&self, expr_id: ExprId, out: &mut FxHashSet<SymId>) {
-        match self.ast.node(expr_id) {
-            Node::Var(sym_id) | Node::Global(sym_id) => {
-                out.insert(*sym_id);
-            }
-            Node::FStr { segments } => {
-                for segment in segments {
-                    if let FStrSegment::Interp(place) = segment {
-                        out.insert(place_sym(*place));
+                Operation::ReadGlobal(global_id) => {
+                    if let Some(variable) = self.global(global_id) {
+                        fact.insert(variable);
                     }
                 }
+                _ => {}
             }
-            Node::Unary { operand, .. } => self.reads_of_expr(*operand, out),
-            Node::Bin { lhs, rhs, .. } => {
-                self.reads_of_expr(*lhs, out);
-                self.reads_of_expr(*rhs, out);
-            }
-            Node::Call { args, .. } => {
-                for arg in args {
-                    self.reads_of_expr(*arg, out);
-                }
-            }
-            Node::If { arms, else_block } => {
-                for arm in arms {
-                    self.reads_of_expr(arm.cond, out);
-                    self.reads_of_block(&arm.body, out);
-                }
-                if let Some(else_body) = else_block {
-                    self.reads_of_block(else_body, out);
-                }
-            }
-            Node::Range {
-                start, stop, step, ..
-            } => {
-                self.reads_of_expr(*start, out);
-                self.reads_of_expr(*stop, out);
-                if let Some(step) = step {
-                    self.reads_of_expr(*step, out);
-                }
-            }
-            Node::Membership { value, range } => {
-                self.reads_of_expr(*value, out);
-                self.reads_of_expr(*range, out);
-            }
-            Node::ArrayLiteral { elements } => {
-                for element in elements {
-                    self.reads_of_expr(*element, out);
-                }
-            }
-            Node::MatrixLiteral { rows } => {
-                for row in rows {
-                    for element in row {
-                        self.reads_of_expr(*element, out);
-                    }
-                }
-            }
-            Node::Index { array, index } => {
-                self.reads_of_expr(*array, out);
-                self.reads_of_expr(*index, out);
-            }
-            Node::Index2D { matrix, row, col } => {
-                self.reads_of_expr(*matrix, out);
-                self.reads_of_expr(*row, out);
-                self.reads_of_expr(*col, out);
-            }
-            Node::Member { object, .. } => self.reads_of_expr(*object, out),
-            Node::Comprehension {
-                element, source, ..
-            } => {
-                self.reads_of_expr(*element, out);
-                self.reads_of_expr(*source, out);
-            }
-            Node::Int(_) | Node::Float(_) | Node::Bool(_) | Node::Str(_) | Node::FullExtent => {}
+            arena.for_each_child(node_id, |child| pending.push(child));
         }
     }
-}
 
-fn place_sym(place: Place) -> SymId {
-    match place {
-        Place::Local(sym_id) | Place::Global(sym_id) => sym_id,
+    /// The source name of a variable; `None` for a compiler temporary.
+    fn name<'names>(
+        &self,
+        variable: usize,
+        tables: &ProgramTables,
+        names: &[&'names str],
+    ) -> Option<&'names str> {
+        let locals = &self.function.arena.locals;
+        let sym_id: SymId = match variable.checked_sub(locals.len()) {
+            None => locals[LocalId::from_index(variable as u32)].name?,
+            Some(global) => tables.globals[GlobalId::from_index(global as u32)].name,
+        };
+        Some(names[sym_id.value()])
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::diagnostic::DiagnosticCode;
-    use crate::parser::{TopLevel, parse};
+    use crate::desugar::desugar;
+    use crate::flatten::flatten_program;
+    use crate::parser::parse;
+    use crate::sema::analyze;
     use indoc::indoc;
 
-    /// Findings for the top-level program, as `(code, source text)` pairs in source order.
-    fn findings(src: &str) -> Vec<(&'static str, String)> {
-        let ast = parse(src).unwrap();
-        let cfg = Cfg::build_entry(&ast);
-        let escaping = escaping_symbols(&ast);
-        let mut found: Vec<(&'static str, String)> = check(&ast, &cfg, &escaping)
-            .into_iter()
-            .map(|diagnostic| {
-                (
-                    diagnostic
-                        .code
-                        .expect("a checker finding always carries a code")
-                        .name(),
-                    diagnostic.span.text(src).to_string(),
-                )
-            })
-            .collect();
+    /// Findings for the function at `index` of `src` (the entry is the last), as `(code, text)`
+    /// pairs sorted — with the globals analysed the way `analysis::check` analyses them.
+    fn findings_in(src: &str, index: usize) -> Vec<(&'static str, String)> {
+        let mut ast = parse(src).unwrap();
+        analyze(&mut ast).unwrap();
+        let program = flatten_program(desugar(&ast));
+        let owned = owned_globals(&program);
+        let function = program.functions.iter().nth(index).unwrap().1;
+        let owned = match function.id == program.entry {
+            true => owned,
+            false => FxHashSet::default(),
+        };
+        let mut found: Vec<(&'static str, String)> =
+            check(function, &program.tables, &ast.names, &owned)
+                .into_iter()
+                .map(|diagnostic| {
+                    let code = diagnostic.code.expect("a checker finding carries a code");
+                    (code.name(), diagnostic.span.text(src).to_string())
+                })
+                .collect();
         found.sort();
         found
     }
 
-    /// Findings for the first function defined in `src`.
-    fn function_findings(src: &str) -> Vec<(&'static str, String)> {
-        let ast = parse(src).unwrap();
-        let TopLevel::Func(func) = &ast.top_level[0] else {
-            panic!("Expected a function first.");
-        };
-        let cfg = Cfg::build_function(&ast, func);
-        let escaping = escaping_symbols(&ast);
-        check(&ast, &cfg, &escaping)
-            .into_iter()
-            .map(|diagnostic| {
-                (
-                    diagnostic
-                        .code
-                        .expect("a checker finding always carries a code")
-                        .name(),
-                    diagnostic.span.text(src).to_string(),
-                )
-            })
+    /// Findings for the top-level program.
+    fn findings(src: &str) -> Vec<(&'static str, String)> {
+        let mut ast = parse(src).unwrap();
+        analyze(&mut ast).unwrap();
+        let entry = flatten_program(desugar(&ast)).entry;
+        findings_in(src, entry.index() as usize)
+    }
+
+    fn found(pairs: &[(&'static str, &str)]) -> Vec<(&'static str, String)> {
+        pairs
+            .iter()
+            .map(|&(code, text)| (code, text.to_string()))
             .collect()
     }
 
@@ -464,46 +283,34 @@ mod tests {
 
     #[test]
     fn an_overwritten_value_is_a_dead_store() {
-        assert_eq!(
-            findings("a = 1\na = 2\na"),
-            vec![("dead-store", "a".to_string())],
-            "only the first assignment"
-        );
+        assert_eq!(findings("a = 1\na = 2\na"), found(&[("dead-store", "a")]));
     }
 
     #[test]
-    fn a_symbol_nothing_reads_is_an_unused_variable() {
-        assert_eq!(
-            findings("a = 1\n0"),
-            vec![("unused-variable", "a".to_string())]
-        );
+    fn a_variable_nothing_reads_is_an_unused_variable() {
+        assert_eq!(findings("a = 1\n0"), found(&[("unused-variable", "a")]));
     }
 
     #[test]
-    fn a_never_read_symbol_reports_its_introduction_then_dead_stores() {
-        // One unused-variable where the symbol is introduced, one dead store per later write —
-        // the later writes are dead whether or not anything ever reads the symbol.
-        let mut found = findings("a = 1\na = 2\na = 3\n0");
-        found.sort();
+    fn a_never_read_variable_reports_its_introduction_then_dead_stores() {
         assert_eq!(
-            found,
-            vec![
-                ("dead-store", "a".to_string()),
-                ("dead-store", "a".to_string()),
-                ("unused-variable", "a".to_string()),
-            ]
+            findings("a = 1\na = 2\na = 3\n0"),
+            found(&[
+                ("dead-store", "a"),
+                ("dead-store", "a"),
+                ("unused-variable", "a")
+            ])
         );
     }
 
     #[test]
     fn an_unused_variable_is_reported_at_its_introduction() {
-        // Not at the last write: the backward walk reaches that one first, but the reader deletes
-        // the binding from where it starts.
         let src = "alpha = 1\nalpha = 2\nalpha = 3\n0";
-        let ast = parse(src).unwrap();
-        let cfg = Cfg::build_entry(&ast);
-        let escaping = escaping_symbols(&ast);
-        let unused: Vec<u32> = check(&ast, &cfg, &escaping)
+        let mut ast = parse(src).unwrap();
+        analyze(&mut ast).unwrap();
+        let program = flatten_program(desugar(&ast));
+        let entry = &program.functions[program.entry];
+        let unused: Vec<u32> = check(entry, &program.tables, &ast.names, &owned_globals(&program))
             .into_iter()
             .filter(|diagnostic| diagnostic.code == Some(DiagnosticCode::UnusedVariable))
             .map(|diagnostic| diagnostic.span.start)
@@ -513,56 +320,26 @@ mod tests {
 
     #[test]
     fn a_self_referring_update_keeps_the_binding_live() {
-        // `a = a + 1` reads before it writes, so the earlier store is not dead.
         assert!(findings("a = 1\na = a + 1\na").is_empty());
     }
 
     #[test]
     fn a_value_read_only_inside_a_loop_is_live() {
-        // The read is reached through the back edge, which a single pass would miss.
-        assert!(
-            findings(indoc! {"
-                a = 1
-                n = 0
-                while n < 3
-                    n += a
-                n
-            "})
-            .is_empty()
-        );
+        assert!(findings("a = 1\nn = 0\nwhile n < 3\n    n += a\nn").is_empty());
     }
 
     #[test]
     fn a_store_in_a_loop_read_next_iteration_is_live() {
-        assert!(
-            findings(indoc! {"
-                total = 0
-                for idx in 1..3
-                    total += idx
-                total
-            "})
-            .is_empty()
-        );
+        assert!(findings("total = 0\nfor idx in 1..3\n    total += idx\ntotal").is_empty());
     }
 
     #[test]
     fn a_value_read_on_only_one_branch_is_live() {
-        // Liveness unions at a merge: a read on any onward path keeps the value needed.
-        assert!(
-            findings(indoc! {"
-                a = 1
-                b = 0
-                if b > 0
-                    b = a
-                b
-            "})
-            .is_empty()
-        );
+        assert!(findings("a = 1\nb = 0\nif b > 0\n    b = a\nb").is_empty());
     }
 
     #[test]
     fn the_dont_care_binder_is_never_reported() {
-        // `_` exists to say the value is unwanted.
         assert!(
             findings(indoc! {"
                 m = [1, 2; 3, 4]
@@ -576,77 +353,87 @@ mod tests {
     }
 
     #[test]
-    fn an_unread_loop_variable_is_not_reported() {
-        // Idiomatic "repeat n times"; firing here would make the checker unusable.
+    fn an_unread_range_loop_index_is_not_reported() {
+        // Idiomatic "repeat n times"; the loop's own test and step read the index.
+        assert!(findings("total = 0\nfor idx in 1..3\n    total += 1\ntotal").is_empty());
+    }
+
+    #[test]
+    fn an_unread_array_loop_value_is_an_unused_variable() {
+        // Newly reported, as `rustc` does; `_` silences it.
+        assert_eq!(
+            findings("a = [1, 2]\nt = 0\nfor v in a\n    t += 1\nt"),
+            found(&[("unused-variable", "v")])
+        );
+        assert!(findings("a = [1, 2]\nt = 0\nfor _ in a\n    t += 1\nt").is_empty());
+    }
+
+    #[test]
+    fn an_unread_index_binder_is_the_loop_index_and_not_reported() {
+        assert!(findings("a = [1, 2]\nt = 0\nfor i, v in a\n    t += v\nt").is_empty());
+    }
+
+    #[test]
+    fn an_unread_float_comprehension_variable_is_an_unused_variable() {
+        assert_eq!(
+            findings("[1.0 for x: float in 0..3]"),
+            found(&[("unused-variable", "x")])
+        );
         assert!(
-            findings(indoc! {"
-                total = 0
-                for idx in 1..3
-                    total += 1
-                total
-            "})
-            .is_empty()
+            findings("[1 for x in 0..3]").is_empty(),
+            "an int one is the loop index"
         );
     }
 
     #[test]
     fn a_global_read_from_a_function_is_not_reported() {
-        // The entry cannot see the read, so globals are live wherever a graph ends.
-        assert!(
-            findings(indoc! {"
-                g = 1
-                read(): int is ::g
-                read()
-            "})
-            .is_empty()
-        );
+        assert!(findings("g = 1\nread(): int is ::g\nread()").is_empty());
     }
 
     #[test]
     fn a_global_written_in_a_function_is_not_a_dead_store() {
-        assert!(
-            function_findings(indoc! {"
-                bump(): int is
-                    ::g = ::g + 1
-                    0
-                g = 1
-                bump()
-            "})
-            .is_empty()
-        );
+        let src = indoc! {"
+            g = 1
+            bump(): int is
+                ::g = ::g + 1
+                0
+            bump()
+        "};
+        assert!(findings_in(src, 0).is_empty(), "in the function");
+        assert!(findings(src).is_empty(), "at the top level");
+    }
+
+    #[test]
+    fn a_global_no_function_touches_is_analysed_like_a_local() {
+        let src = indoc! {"
+            g = 1
+            other = 1
+            f(): int is ::g
+            other = 2
+            f() + other
+        "};
+        assert_eq!(findings(src), found(&[("dead-store", "other")]));
     }
 
     #[test]
     fn a_function_local_nothing_reads_is_reported() {
-        assert_eq!(
-            function_findings(indoc! {"
-                f(n: int): int is
-                    unused = n * 2
-                    n
-                f(1)
-            "}),
-            vec![("unused-variable", "unused".to_string())]
-        );
+        let src = "f(n: int): int is\n    unused = n * 2\n    n\nf(1)";
+        assert_eq!(findings_in(src, 0), found(&[("unused-variable", "unused")]));
+    }
+
+    #[test]
+    fn an_unread_parameter_is_not_reported() {
+        assert!(findings_in("f(n: int): int is 5\nf(1)", 0).is_empty());
     }
 
     #[test]
     fn a_function_result_counts_as_a_read() {
-        // The body's trailing expression is what the function returns — the read that matters most.
-        assert!(
-            function_findings(indoc! {"
-                f(n: int): int is
-                    doubled = n * 2
-                    doubled
-                f(1)
-            "})
-            .is_empty()
-        );
+        let src = "f(n: int): int is\n    doubled = n * 2\n    doubled\nf(1)";
+        assert!(findings_in(src, 0).is_empty());
     }
 
     #[test]
     fn a_read_inside_an_if_expression_counts() {
-        // The CFG treats a nested if-expression as atomic, so its reads must still be collected —
-        // otherwise `a` would look dead.
         assert!(findings("a = 1\nb = a if a > 0 else 0\nb").is_empty());
     }
 
@@ -657,42 +444,81 @@ mod tests {
 
     #[test]
     fn a_read_through_indexing_counts() {
-        assert!(
-            findings(indoc! {"
-                idx = 1
-                arr = [1, 2, 3]
-                arr[idx]
-            "})
-            .is_empty()
-        );
+        assert!(findings("idx = 1\narr = [1, 2, 3]\narr[idx]").is_empty());
     }
 
     #[test]
     fn writing_one_element_is_not_a_whole_new_value() {
-        // `arr[0] = 9` updates the array in place: it reads `arr` rather than replacing it, so the
-        // original binding is not a dead store.
+        assert!(findings("arr = [1, 2, 3]\narr[0] = 9\narr[0]").is_empty());
+    }
+
+    #[test]
+    fn same_named_bindings_in_separate_bodies_are_separate_variables() {
+        // Newly precise: by name, the `else` arm's `x` was a dead store of the one variable `x`;
+        // as a binding of its own, nothing ever reads it.
+        let src = indoc! {"
+            c = true
+            if c
+                x = 1
+                x
+            else
+                x = 2
+            0
+        "};
+        assert_eq!(findings(src), found(&[("unused-variable", "x")]));
+    }
+
+    #[test]
+    fn swapping_through_a_multiple_assignment_reports_nothing() {
+        assert!(findings("a, b = 1, 2\na, b = b, a\na + b").is_empty());
+    }
+
+    #[test]
+    fn a_chained_assignment_reports_the_unread_target() {
+        assert_eq!(findings("a = b = 1\na"), found(&[("unused-variable", "b")]));
+    }
+
+    #[test]
+    fn compiler_temporaries_are_never_reported() {
+        // `and`, `or`, and if-expressions all write temporaries; none has a name to report.
         assert!(
-            findings(indoc! {"
-                arr = [1, 2, 3]
-                arr[0] = 9
-                arr[0]
-            "})
-            .is_empty()
+            findings("a = 1\nb = (a > 0 and a < 5) or a == 9\nc = 1 if b else 2\nc").is_empty()
         );
     }
 
     #[test]
+    fn more_variables_than_one_word_of_bits_are_tracked() {
+        let mut src = String::from("f(): int is\n");
+        for index in 0..70 {
+            src += &format!("    v{index} = {index}\n");
+        }
+        src += "    s = 0\n";
+        for index in 0..69 {
+            src += &format!("    s += v{index}\n");
+        }
+        src += "    s\nf()";
+        assert_eq!(findings_in(&src, 0), found(&[("unused-variable", "v69")]));
+    }
+
+    #[test]
     fn both_findings_can_appear_in_one_run() {
-        // The batch-reporting property: fail-fast sema could never show this.
-        let found = findings(indoc! {"
-            dead = 1
-            dead = 2
-            unread = 3
-            dead
-        "});
-        let codes: Vec<&str> = found.iter().map(|(code, _)| *code).collect();
-        assert!(codes.contains(&DiagnosticCode::DeadStore.name()));
-        assert!(codes.contains(&DiagnosticCode::UnusedVariable.name()));
-        assert_eq!(found.len(), 2);
+        let src = "dead = 1\ndead = 2\nunread = 3\ndead";
+        assert_eq!(
+            findings(src),
+            found(&[("dead-store", "dead"), ("unused-variable", "unread")])
+        );
+    }
+
+    #[test]
+    fn freeing_a_string_is_not_reading_it() {
+        // Every string store frees the old value first, and the end of the program frees them all;
+        // neither is a use of the value.
+        assert_eq!(
+            findings("s = 'a'\ns = 'b'\ns"),
+            found(&[("dead-store", "s")])
+        );
+        assert_eq!(findings("s = 'a'\n0"), found(&[("unused-variable", "s")]));
+        let src = "f(): int is\n    t = 'x'\n    0\nf()";
+        assert_eq!(findings_in(src, 0), found(&[("unused-variable", "t")]));
     }
 }

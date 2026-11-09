@@ -69,16 +69,16 @@ prerequisite).
 `rerun-if-changed` covers `static.c`, the shim, the header, and `build.rs`, so an untouched tree
 never re-runs the script.
 
-## Runtime shim ([runtime/](../runtime))
+## Runtime shim ([runtime/](../src/runtime/))
 
-- [pinp_runtime.h](../runtime/pinp_runtime.h) — the exported ABI: the three functions and a
+- [pinp_runtime.h](../src/runtime/pinp_runtime.h) — the exported ABI: the three functions and a
   `pinp_mem_info { outstanding_bytes, allocation_count, free_count }` struct.
-- [shim.c](../runtime/shim.c) — wraps `mi_malloc`/`mi_free` and keeps byte-exact bookkeeping. It
+- [shim.c](../src/runtime/shim.c) — wraps `mi_malloc`/`mi_free` and keeps byte-exact bookkeeping. It
   charges/credits `mi_usable_size(ptr)` (so `pinp_free` needs no size argument), and the counts feed
   leak detection and the planned memory-summary built-in. Plain counters, no atomics: pinp's JIT runs
   single-threaded.
 
-## JIT ([src/codegen/jit.rs](../src/codegen/jit.rs))
+## JIT ([src/codegen/jit.rs](../src/codegen/llvm/jit.rs))
 
 `Jit::new` attaches a dynamic-library search generator
 (`LLVMOrcCreateDynamicLibrarySearchGeneratorForProcess`) to the main dylib, so symbols pinp code
@@ -87,7 +87,7 @@ the path JIT-compiled allocation calls will take.
 
 ## Test plan (TDD: red → green → refactor)
 
-- `runtime_allocator_is_reachable_from_the_jit` ([src/codegen/tests.rs](../src/codegen/tests.rs)):
+- `runtime_allocator_is_reachable_from_the_jit` ([src/codegen/tests.rs](../src/codegen/llvm/tests.rs)):
   look the three symbols up through the JIT (exercising the search generator), allocate, assert the
   bookkeeping (`allocation_count == 1`, `outstanding_bytes >= request`), free, assert it returns to
   zero with `free_count == 1`. This is what proved the native cut works after the bitcode cut

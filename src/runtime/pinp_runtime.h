@@ -1,9 +1,9 @@
 // SPDX-License-Identifier: MIT
 //
-// The pinp runtime ABI: the stable surface that JIT-compiled pinp code links
-// against. Everything here is compiled (together with mimalloc) into a single
-// self-contained bitcode module; only these three symbols stay externally
-// visible, so codegen targets `pinp_*` names and never mimalloc's directly.
+// The pinp runtime ABI: the C half of the surface that JIT-compiled pinp code
+// calls (the `pinp_str_*` half is Rust, src/runtime/string.rs). It is linked
+// into the pinp binary together with mimalloc; only the `pinp_*` names are
+// exported (build.rs), so compiled code never calls mimalloc directly.
 
 #ifndef PINP_RUNTIME_H
 #define PINP_RUNTIME_H
@@ -26,7 +26,7 @@ void *pinp_alloc(size_t size);
 // Frees a block previously returned by pinp_alloc. A null pointer is ignored.
 void pinp_free(void *ptr);
 
-// Writes the current allocation bookkeeping into `out`.
+// Writes the calling thread's allocation bookkeeping into `out`.
 void pinp_memory_info(pinp_mem_info *out);
 
 // Reports a runtime error and unwinds the JIT call stack via longjmp. Never returns.

@@ -4,8 +4,7 @@
 //!
 //! A forward analysis over the simplest fact there is — reached, or not. Every block starts knowing
 //! nothing (`false`), the entry is seeded as reached, and anything still `false` at fixpoint has no
-//! path leading to it. Terms shared across this layer are defined in [`crate::analysis`]; the graph
-//! terms in [`crate::cfg`].
+//! path leading to it. Terms shared across this layer are defined in [`crate::analysis`].
 //!
 //! Vocabulary particular to reachability:
 //!
@@ -14,81 +13,64 @@
 //! * Unreachable: the finding — a statement no execution can arrive at.
 //!
 //! What makes anything unreachable in a language with no `return` or `break` is a condition that
-//! cannot vary. Only a **literal** `true`/`false` counts here, and an empty literal range: `while
-//! 1 > 2` is not folded, because doing constant arithmetic by hand would duplicate what constant
-//! propagation will do properly later. That is a deliberate first-iteration limit, not an oversight.
+//! cannot vary. Only a **constant** `true`/`false` counts here, and a counted loop over a range of
+//! two integer constants that is provably empty: `while 1 > 2` is not folded, because doing
+//! constant arithmetic by hand would duplicate what constant propagation will do properly later.
 
 use crate::analysis::dataflow::{Analysis, Direction, ReachabilityFact, solve};
-use crate::cfg::{Action, BlockId, Cfg, Terminator};
 use crate::diagnostic::{Diagnostic, DiagnosticCode};
+use crate::ir::{BlockId, Constant, Flat, Function, NodeId, Operation, ProgramTables, Terminator};
 use crate::lexer::Span;
-use crate::parser::{ExprId, Node, ProgramAst, RangeKind, Stmt};
+use crate::parser::{RangeKind, UnOp};
 
-/// Reports every statement that cannot run.
-pub fn check(ast: &ProgramAst, cfg: &Cfg) -> Vec<Diagnostic> {
-    let analysis = Reachability { ast };
-    let solution = solve(cfg, &analysis);
-
-    let mut diagnostics = Vec::new();
-    for block_id in cfg.block_ids() {
-        if solution.before(block_id).is_reached() {
-            continue;
-        }
-        // One finding per unreachable block, at its first action: reporting every statement in a
-        // skipped body would bury the one fact the reader needs.
-        if let Some(span) = first_span(ast, cfg, block_id) {
-            diagnostics.push(Diagnostic::new(
+/// Reports the first statement of every block no execution can reach.
+pub fn check(function: &Function<Flat>, tables: &ProgramTables) -> Vec<Diagnostic> {
+    let analysis = Reachability { function, tables };
+    let solution = solve(function, &analysis);
+    function
+        .shape
+        .blocks
+        .iter()
+        .filter(|&(block_id, _)| !solution.before(block_id).is_reached())
+        .filter_map(|(block_id, _)| first_span(function, block_id))
+        .map(|span| {
+            Diagnostic::new(
                 DiagnosticCode::UnreachableCode,
                 span,
                 "This code can never run.",
-            ));
-        }
-    }
-    diagnostics
+            )
+        })
+        .collect()
 }
 
-/// Where to point a finding about `block_id` — the span of its first action that has one.
-fn first_span(ast: &ProgramAst, cfg: &Cfg, block_id: BlockId) -> Option<Span> {
-    cfg.block(block_id).actions.iter().find_map(|action| {
-        let span = match action {
-            Action::Statement(stmt) => stmt_span(ast, stmt),
-            Action::Evaluate(expr_id) => ast.span_of(*expr_id),
-            Action::Bind(_) => Span::UNKNOWN,
-        };
-        (!span.is_unknown()).then_some(span)
-    })
+/// Where a block's code begins in the source: its first statement, or what its terminator reads.
+fn first_span(function: &Function<Flat>, block_id: BlockId) -> Option<Span> {
+    let block = &function.shape.blocks[block_id];
+    let arena = &function.arena;
+    let statements = arena.items(block.statements).iter();
+    statements
+        .map(|&statement| match arena.operations[statement] {
+            // A compiler temporary has no source text of its own; its value does.
+            Operation::WriteLocal { local_id, value } if arena.locals[local_id].name.is_none() => {
+                arena.spans[value]
+            }
+            _ => arena.spans[statement],
+        })
+        .chain(
+            block
+                .terminator
+                .operand()
+                .map(|operand| arena.spans[operand]),
+        )
+        .find(|span| !span.is_unknown())
 }
 
-/// A statement's position, taken from a representative expression. Statements are not arena
-/// entries, so they have no span of their own; this is the compromise recorded in the spec.
-fn stmt_span(ast: &ProgramAst, stmt: &Stmt) -> Span {
-    match stmt {
-        Stmt::Assign {
-            target_spans,
-            values,
-            ..
-        } => target_spans
-            .first()
-            .and_then(|group| group.first().copied())
-            .filter(|span| !span.is_unknown())
-            .or_else(|| values.first().map(|value| ast.span_of(*value)))
-            .unwrap_or(Span::UNKNOWN),
-        Stmt::Expr(expr_id) => ast.span_of(*expr_id),
-        Stmt::While { cond, .. } => ast.span_of(*cond),
-        Stmt::Loop { cond, .. } => ast.span_of(*cond),
-        Stmt::For { source, .. } | Stmt::ForArray { source, .. } => ast.span_of(*source),
-        // An indexed target is a `Place`, which carries no span; the index expression is the
-        // nearest thing with a position.
-        Stmt::IndexedAssign { index, .. } => ast.span_of(*index),
-        Stmt::IndexedAssign2D { row, .. } => ast.span_of(*row),
-    }
+struct Reachability<'function> {
+    function: &'function Function<Flat>,
+    tables: &'function ProgramTables,
 }
 
-struct Reachability<'a, 'ast> {
-    ast: &'a ProgramAst<'ast>,
-}
-
-impl<'ast> Analysis<'ast> for Reachability<'_, 'ast> {
+impl Analysis for Reachability<'_> {
     type Fact = ReachabilityFact;
     const DIRECTION: Direction = Direction::Forward;
 
@@ -96,90 +78,133 @@ impl<'ast> Analysis<'ast> for Reachability<'_, 'ast> {
         ReachabilityFact::reached()
     }
 
-    fn transfer_action(&self, _action: &Action<'ast>, _fact: &mut ReachabilityFact) {
-        // Nothing a block does can make the rest of it unreachable — pinp has no diverging
-        // statement. Only a terminator decides where control goes next.
-    }
+    // Reaching a statement says nothing about the next one: a block runs whole once entered.
+    fn transfer_statement(&self, _statement: NodeId, _fact: &mut ReachabilityFact) {}
 
     fn transfer_terminator(&self, _terminator: &Terminator, _fact: &mut ReachabilityFact) {}
 
-    /// The whole checker, in one override: an edge out of a decided condition is never taken, so
-    /// nothing beyond it is reached.
-    fn live_successors(&self, cfg: &Cfg<'ast>, block_id: BlockId) -> Vec<BlockId> {
-        match cfg.block(block_id).terminator {
-            Terminator::Branch {
-                cond,
-                then_block,
-                else_block,
-            } => match self.constant_condition(cond) {
-                Some(true) => vec![then_block],
-                Some(false) => vec![else_block],
-                None => vec![then_block, else_block],
-            },
-            _ => cfg.successors(block_id),
+    fn live_successors(&self, function: &Function<Flat>, block_id: BlockId) -> Vec<BlockId> {
+        let Terminator::Branch {
+            cond,
+            then_block,
+            else_block,
+        } = function.shape.blocks[block_id].terminator
+        else {
+            return function.successors(block_id);
+        };
+        let empty_loop = function.shape.counted_loop_ranges[block_id]
+            .is_some_and(|range| self.is_empty_range(range));
+        match self.constant_bool(cond) {
+            Some(true) => vec![then_block],
+            Some(false) => vec![else_block],
+            None if empty_loop => vec![else_block],
+            None => vec![then_block, else_block],
         }
     }
 }
 
-impl<'ast> Reachability<'_, 'ast> {
-    /// Whether `cond` is decided before the program runs: `Some(true)` when only the then-edge is
-    /// ever taken, `Some(false)` when only the else-edge is, `None` when both remain possible.
-    ///
-    /// A literal `true`/`false` decides both ways. A `for` header is different: its "condition" is
-    /// the range, and an empty one decides *against* the body — but a non-empty range decides
-    /// nothing, because a loop that runs still finishes and leaves by the exit edge. Claiming
-    /// otherwise marks everything after any literal `for` loop unreachable.
-    fn constant_condition(&self, cond: ExprId) -> Option<bool> {
-        match self.ast.node(cond) {
-            Node::Bool(value) => Some(*value),
-            Node::Range { .. } => match literal_range_is_empty(self.ast, cond) {
-                Some(true) => Some(false),
-                Some(false) | None => None,
-            },
+impl Reachability<'_> {
+    fn constant_bool(&self, node_id: NodeId) -> Option<bool> {
+        match self.constant(node_id)? {
+            Constant::Bool(value) => Some(value),
             _ => None,
         }
     }
-}
 
-/// Whether a range with literal bounds is empty — `1..<1` and `5..1` are, `1..3` is not. `None`
-/// when a bound is not a literal, so nothing is assumed.
-fn literal_range_is_empty(ast: &ProgramAst, range_id: ExprId) -> Option<bool> {
-    let Node::Range {
-        start, stop, kind, ..
-    } = ast.node(range_id)
-    else {
-        return None;
-    };
-    let start = literal_int(ast, *start)?;
-    let stop = literal_int(ast, *stop)?;
-    Some(match kind {
-        RangeKind::Inclusive => start > stop,
-        RangeKind::UpExclusive => start >= stop,
-        RangeKind::DownExclusive => start <= stop,
-    })
-}
+    fn constant(&self, node_id: NodeId) -> Option<Constant> {
+        match self.function.arena.operations[node_id] {
+            Operation::Constant(constant_id) => Some(self.tables.constants.get(constant_id)),
+            _ => None,
+        }
+    }
 
-fn literal_int(ast: &ProgramAst, expr_id: ExprId) -> Option<i64> {
-    match ast.node(expr_id) {
-        Node::Int(value) => Some(*value),
-        _ => None,
+    fn constant_int(&self, node_id: NodeId) -> Option<i64> {
+        match self.constant(node_id)? {
+            Constant::Int(value) => Some(value),
+            _ => None,
+        }
+    }
+
+    /// The sign of a step written as an integer constant, negated or not; `None` when not written
+    /// so, or zero (which is a runtime error, not an empty range).
+    fn step_sign(&self, step: NodeId) -> Option<i64> {
+        let (operand, negated) = match self.function.arena.operations[step] {
+            Operation::Unary {
+                op: UnOp::Neg,
+                operand,
+            } => (operand, true),
+            _ => (step, false),
+        };
+        let sign = self.constant_int(operand)?.signum();
+        match (sign, negated) {
+            (0, _) => None,
+            (sign, false) => Some(sign),
+            (sign, true) => Some(-sign),
+        }
+    }
+
+    /// Whether `range` is two integer constants that give no value at all. A written step decides
+    /// the direction, as when the loop runs; without one an exclusive range runs its spelled way,
+    /// and an inclusive range counts toward its stop, so it always holds at least its start.
+    fn is_empty_range(&self, range: NodeId) -> bool {
+        let Operation::Range {
+            kind,
+            start,
+            stop,
+            step,
+        } = self.function.arena.operations[range]
+        else {
+            return false;
+        };
+        let (Some(start), Some(stop)) = (self.constant_int(start), self.constant_int(stop)) else {
+            return false;
+        };
+        let upward = match (kind, step) {
+            (_, Some(step)) => match self.step_sign(step) {
+                Some(sign) => sign > 0,
+                None => return false,
+            },
+            (RangeKind::UpExclusive, None) => true,
+            (RangeKind::DownExclusive, None) => false,
+            (RangeKind::Inclusive, None) => return false,
+        };
+        match (upward, kind == RangeKind::Inclusive) {
+            (true, true) => start > stop,
+            (true, false) => start >= stop,
+            (false, true) => start < stop,
+            (false, false) => start <= stop,
+        }
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::desugar::desugar;
+    use crate::flatten::flatten_program;
     use crate::parser::parse;
+    use crate::sema::analyze;
     use indoc::indoc;
 
-    /// Every unreachable-code finding in `src`, as the source text it points at.
+    /// The text of each finding in every function of `src`, in source order.
     fn findings(src: &str) -> Vec<String> {
-        let ast = parse(src).unwrap();
-        let cfg = Cfg::build_entry(&ast);
-        check(&ast, &cfg)
+        let mut ast = parse(src).unwrap();
+        analyze(&mut ast).unwrap();
+        let program = flatten_program(desugar(&ast));
+        let mut found: Vec<Diagnostic> = program
+            .functions
+            .iter()
+            .flat_map(|(_, function)| check(function, &program.tables))
+            .collect();
+        found.sort_by_key(|diagnostic| diagnostic.span.start);
+        found
             .into_iter()
             .map(|diagnostic| diagnostic.span.text(src).to_string())
             .collect()
+    }
+
+    fn loop_over(range: &str) -> String {
+        format!("total = 0\nfor idx in {range}\n    total += idx\ntotal\n")
     }
 
     #[test]
@@ -195,7 +220,6 @@ mod tests {
 
     #[test]
     fn a_variable_condition_is_never_assumed() {
-        // The whole point of the literal-only limit: nothing is folded, so nothing is claimed.
         let src = indoc! {"
             c = false
             n = 1
@@ -208,7 +232,6 @@ mod tests {
 
     #[test]
     fn an_arithmetic_condition_is_not_folded() {
-        // `1 > 2` is constantly false, but recognising that is constant propagation's job.
         let src = indoc! {"
             n = 1
             while 1 > 2
@@ -243,23 +266,57 @@ mod tests {
     }
 
     #[test]
+    fn a_false_elif_arm_never_runs() {
+        let src = indoc! {"
+            n = 1
+            if n > 0
+                n = 2
+            elif false
+                n = 3
+            n
+        "};
+        assert_eq!(findings(src), vec!["n"]);
+    }
+
+    #[test]
+    fn an_if_expression_with_a_constant_condition_has_a_dead_arm() {
+        // Newly reported: the AST-borrowing graph treated an if-expression as atomic.
+        let src = "n = 1\nx = 10 if false else 20\nn + x";
+        assert_eq!(findings(src), vec!["10"]);
+    }
+
+    #[test]
+    fn a_constant_false_left_operand_is_not_followed_through_and() {
+        // `and` becomes a branch on a temporary holding the left operand; reachability folds
+        // constant conditions only, not values carried through variables.
+        assert!(findings("n = 1\nb = false and n > 0\nb").is_empty());
+    }
+
+    #[test]
     fn an_empty_literal_range_never_enters_its_body() {
-        for source in ["1..<1", "5..1", "1..>5"] {
-            let src = format!("total = 0\nfor idx in {source}\n    total += idx\ntotal\n");
-            assert_eq!(
-                findings(&src).len(),
-                1,
-                "`{source}` is empty, so the body is dead"
-            );
+        // Sema rejects a literal range whose spelling contradicts its bounds (`1..>5`), so the
+        // empty ones are equal bounds with an exclusive stop — or a written step leading away.
+        for range in ["1..<1", "3..>3", "5..>1:2", "1..<5:-2"] {
+            assert_eq!(findings(&loop_over(range)).len(), 1, "`{range}` is empty");
         }
     }
 
     #[test]
     fn a_non_empty_literal_range_is_fine() {
-        for source in ["1..3", "1..<2", "5..>1", "1..1"] {
-            let src = format!("total = 0\nfor idx in {source}\n    total += idx\ntotal\n");
-            assert!(findings(&src).is_empty(), "`{source}` runs at least once");
+        for range in [
+            "1..3", "1..<2", "5..>1", "1..1", "1..5:2", "1..1:7", "5..1:-2",
+        ] {
+            assert!(
+                findings(&loop_over(range)).is_empty(),
+                "`{range}` runs at least once"
+            );
         }
+    }
+
+    #[test]
+    fn an_inclusive_range_without_a_step_counts_toward_its_stop() {
+        // `5..1` runs 5, 4, 3, 2, 1 — today's checker took it for empty.
+        assert!(findings(&loop_over("5..1")).is_empty());
     }
 
     #[test]
@@ -272,12 +329,17 @@ mod tests {
             total
         "};
         assert!(findings(src).is_empty());
+        assert!(findings("r = 1..<1\nt = 0\nfor i in r\n    t += i\nt").is_empty());
+    }
+
+    #[test]
+    fn a_loop_over_an_array_always_enters_its_body() {
+        assert!(findings("a = [1, 2]\nt = 0\nfor v in a\n    t += v\nt").is_empty());
     }
 
     #[test]
     fn code_after_an_infinite_loop_is_unreachable() {
-        // `while true` has no exit — pinp has no `break` — so whatever follows it genuinely cannot
-        // run. Looping for ever is the author's business; the dead tail is worth saying.
+        // `while true` has no exit — pinp has no `break` — so whatever follows it cannot run.
         let src = indoc! {"
             n = 1
             while true
@@ -285,6 +347,21 @@ mod tests {
             n
         "};
         assert_eq!(findings(src), vec!["n"], "the trailing `n`");
+    }
+
+    #[test]
+    fn each_dead_block_of_nested_code_is_reported() {
+        // The body, the `if` arm inside it, and the code after that `if`: three blocks, as before.
+        let src = indoc! {"
+            n = 1
+            while false
+                n = 2
+                if n > 1
+                    n = 3
+                n = 4
+            n
+        "};
+        assert_eq!(findings(src), vec!["n", "n", "n"]);
     }
 
     #[test]
@@ -303,19 +380,20 @@ mod tests {
 
     #[test]
     fn a_function_body_is_checked_too() {
-        let ast = parse(indoc! {"
+        let src = indoc! {"
             f(n: int): int is
                 m = n
                 if false
                     m = 0
                 m
             f(1)
-        "})
-        .unwrap();
-        let crate::parser::TopLevel::Func(func) = &ast.top_level[0] else {
-            panic!("Expected a function.");
-        };
-        let cfg = Cfg::build_function(&ast, func);
-        assert_eq!(check(&ast, &cfg).len(), 1);
+        "};
+        assert_eq!(findings(src), vec!["m"]);
+    }
+
+    #[test]
+    fn a_dead_string_assignment_is_reported_at_its_target() {
+        // The free of the old value comes first in the block, and carries the target's position.
+        assert_eq!(findings("s = 'a'\nif false\n    s = 'b'\ns"), vec!["s"]);
     }
 }

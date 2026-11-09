@@ -1,89 +1,15 @@
 // SPDX-License-Identifier: MIT
 
-//! LLVM ORCv2 JIT backend (gated behind the `llvm` feature).
+//! The backend: a type-checked program compiled to machine code by Cranelift and run.
 //!
-//! [`Jit`] is a thin safe wrapper over the ORCv2 LLJIT C API (reached through
-//! `inkwell::llvm_sys`, no extra dependency); inkwell 0.9 ships no ORC bindings.
-//! `CodeGen` lowers a parsed [`ProgramAst`] into an LLVM module, and [`PinpJit`] ties
-//! the two together: source string in, executed, [`PinpValue`] out. This is the
-//! harness pinp's runtime tests are written against.
+//! [`PinpJit`] is the harness pinp's runtime tests are written against: source string in,
+//! executed, [`PinpValue`] out.
 
-use inkwell::AddressSpace;
-use inkwell::builder::Builder;
-use inkwell::context::Context;
-use inkwell::module::Module;
-use inkwell::values::{BasicValueEnum, FunctionValue, PointerValue, ValueKind};
-use rustc_hash::FxHashMap;
-
-use crate::parser::{ArrayElementType, PinpType, Place, ProgramAst, SymId, parse};
+use crate::parser::{ArrayElementType, PinpType, parse};
 use crate::runtime::string::{PinpStr, pinp_str_free};
 use crate::sema::analyze;
 
-mod expr;
-mod jit;
-mod lower;
-mod stmt;
-mod string;
-
-#[cfg(test)]
-mod tests;
-
-pub use jit::Jit;
-
-// ---------------------------------------------------------------------------
-// Module constants and runtime errors
-// ---------------------------------------------------------------------------
-
-/// Name of the synthetic entry function `CodeGen` emits for the top-level program.
-const ENTRY: &str = "__pinp_main";
-
-// ---------------------------------------------------------------------------
-// Code generator
-// ---------------------------------------------------------------------------
-
-/// Lowers a parsed [`ProgramAst`] into an LLVM module. Every pinp function becomes an
-/// LLVM function, top-level globals become module globals, and the top-level
-/// statements are emitted into an `ENTRY` function whose return value is the
-/// program's final expression.
-struct CodeGen<'ctx, 'ast> {
-    context: &'ctx Context,
-    module: Module<'ctx>,
-    builder: Builder<'ctx>,
-    ast: &'ast ProgramAst<'ast>,
-    functions: FxHashMap<SymId, (FunctionValue<'ctx>, Vec<PinpType>, PinpType)>,
-    globals: FxHashMap<SymId, (PointerValue<'ctx>, PinpType)>,
-    // A stack of local scope frames mirroring sema: a function (or the entry) pushes a base frame,
-    // and every control-flow body pushes another. Bare-name resolution searches `locals[fn_base..]`
-    // outward, so an assignment mutates the nearest enclosing local while a name new to all frames
-    // becomes a non-escaping body-local (its slot is still alloca'd in the entry block).
-    locals: Vec<FxHashMap<SymId, (PointerValue<'ctx>, PinpType)>>,
-    fn_base: usize,
-    in_function: bool,
-}
-
-/// The symbol behind a place, whether it is a local or a global.
-fn place_sym(place: Place) -> SymId {
-    match place {
-        Place::Local(sym_id) | Place::Global(sym_id) => sym_id,
-    }
-}
-
-/// Extracts the value of a value-returning call (already filtered against void).
-fn basic_value(kind: ValueKind) -> BasicValueEnum {
-    match kind {
-        ValueKind::Basic(value) => value,
-        ValueKind::Instruction(_) => unreachable!("A value-returning call yields a basic value."),
-    }
-}
-
-/// Wraps an inkwell IR-builder error as a message string.
-fn err(e: inkwell::builder::BuilderError) -> String {
-    format!("IR builder error: {e}.")
-}
-
-// ---------------------------------------------------------------------------
-// PinpJit: source string -> value
-// ---------------------------------------------------------------------------
+mod cranelift;
 
 /// The value a pinp program evaluates to.
 #[derive(Debug, Clone, PartialEq)]
@@ -105,12 +31,10 @@ pub enum PinpValue {
     },
 }
 
-/// Compiles a pinp source string and JIT-executes it, the test harness for the
-/// runtime. Holds the JIT and the context it borrows (context dropped last).
+/// Compiles a pinp source string and JIT-executes it, the test harness for the runtime.
 pub struct PinpJit {
-    jit: Jit,
+    compiled: cranelift::Compiled,
     result_type: PinpType,
-    _context: Context,
 }
 
 impl PinpJit {
@@ -118,18 +42,10 @@ impl PinpJit {
     pub fn new(src: &str) -> Result<Self, String> {
         let mut ast = parse(src).map_err(|error| format!("{error:?}"))?;
         analyze(&mut ast).map_err(|error| format!("{error:?}"))?;
-        let context = Context::create();
-
-        let mut codegen = CodeGen::new(&context, &ast);
-        let result_type = codegen.generate()?;
-        let module = codegen.into_module();
-
-        let jit = Jit::new()?;
-        jit.add_module(module)?;
+        let (compiled, result_type) = cranelift::compile(&ast)?;
         Ok(PinpJit {
-            jit,
+            compiled,
             result_type,
-            _context: context,
         })
     }
 
@@ -146,11 +62,10 @@ impl PinpJit {
             );
         }
 
-        // SAFETY: the entry is always `void (*)(void*)` now — the uniform out-pointer ABI.
-        let entry: unsafe extern "C" fn(*mut u8) = unsafe { self.jit.lookup(ENTRY)? };
-        // Use `u64`s (not bytes) so the buffer has 8-byte alignment. LLVM emits `align 8` stores
-        // for i64/f64 and pointer-sized values; a misaligned target is UB in LLVM's model. Two of
-        // them, because the widest result is the 16-byte `PinpStr`; a scalar uses the first only.
+        let entry = self.compiled.entry();
+        // `u64`s (not bytes), so the buffer is 8-byte aligned: the entry writes each result word
+        // with an aligned store. Two of them, because the widest result is the 16-byte `PinpStr`;
+        // a scalar uses the first only.
         let mut result_buf: [u64; 2] = [0; 2];
         let result_ptr = result_buf.as_mut_ptr().cast::<u8>();
         let mut error: *const std::ffi::c_char = std::ptr::null();

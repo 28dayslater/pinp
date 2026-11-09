@@ -3,7 +3,8 @@
 use indoc::indoc;
 
 use super::*;
-use crate::parser::ArrayElementType;
+use crate::lexer::Span;
+use crate::parser::{ArrayElementType, BinOp, RangeKind, UnOp};
 
 const FLOATS: PinpType = PinpType::Array(ArrayElementType::Float, 4);
 const DANGLING: NodeId = NodeId::from_index(999);
@@ -79,18 +80,35 @@ impl Builder {
     }
 
     fn structured(self, body: &[NodeId], result: Option<NodeId>) -> Function<Structured> {
+        self.structured_with_tables(body, result).1
+    }
+
+    /// The function, and the tables its types and constants were interned in.
+    fn structured_with_tables(
+        self,
+        body: &[NodeId],
+        result: Option<NodeId>,
+    ) -> (ProgramTables, Function<Structured>) {
         let mut arena = self.arena;
         let body = arena.list(body);
-        Function {
+        let function = Function {
             id: FunctionId::from_index(0),
             parameter_count: 0,
             arena,
             shape: Structured { body, result },
-        }
+        };
+        (self.tables, function)
     }
 
     /// A flat function whose entry is the first block.
     fn flat(self, blocks: Vec<(Vec<NodeId>, Terminator)>) -> Function<Flat> {
+        self.flat_with_tables(blocks).1
+    }
+
+    fn flat_with_tables(
+        self,
+        blocks: Vec<(Vec<NodeId>, Terminator)>,
+    ) -> (ProgramTables, Function<Flat>) {
         let mut arena = self.arena;
         let mut flat_blocks = IdVec::default();
         for (statements, terminator) in blocks {
@@ -99,15 +117,17 @@ impl Builder {
                 terminator,
             });
         }
-        Function {
+        let function = Function {
             id: FunctionId::from_index(0),
             parameter_count: 0,
             arena,
             shape: Flat {
                 blocks: flat_blocks,
                 entry: block(0),
+                counted_loop_ranges: SideTable::default(),
             },
-        }
+        };
+        (self.tables, function)
     }
 }
 
@@ -137,6 +157,10 @@ fn reads(arena: &Arena, root: NodeId) -> Vec<LocalId> {
 ///     total
 /// ```
 fn loop_example() -> Function<Structured> {
+    loop_example_with_tables().1
+}
+
+fn loop_example_with_tables() -> (ProgramTables, Function<Structured>) {
     let mut builder = Builder::new();
     let n = builder.local(PinpType::Int);
     let total = builder.local(PinpType::Float);
@@ -205,9 +229,10 @@ fn loop_example() -> Function<Structured> {
     });
 
     let result = builder.read(total);
-    let mut function = builder.structured(&[total_init, xs_init, for_loop], Some(result));
+    let (tables, mut function) =
+        builder.structured_with_tables(&[total_init, xs_init, for_loop], Some(result));
     function.parameter_count = 1;
-    function
+    (tables, function)
 }
 
 /// ```text
@@ -217,6 +242,10 @@ fn loop_example() -> Function<Structured> {
 ///   block3: return x
 /// ```
 fn diamond_example() -> Function<Flat> {
+    diamond_example_with_tables().1
+}
+
+fn diamond_example_with_tables() -> (ProgramTables, Function<Flat>) {
     let mut builder = Builder::new();
     let x = builder.local(PinpType::Int);
     let one = builder.int(1);
@@ -225,7 +254,7 @@ fn diamond_example() -> Function<Flat> {
     let two = builder.int(2);
     let second_write = builder.write(x, two);
     let result = builder.read(x);
-    builder.flat(vec![
+    builder.flat_with_tables(vec![
         (
             vec![first_write],
             Terminator::Branch {
@@ -420,7 +449,7 @@ fn a_list_reads_back_in_order() {
 #[test]
 fn an_empty_list_reads_back_empty() {
     let mut arena = Arena::default();
-    let list = arena.list(&[]);
+    let list = arena.list::<NodeId>(&[]);
     assert!(arena.items(list).is_empty());
     assert!(arena.items(List::<NodeId>::EMPTY).is_empty());
 }
@@ -818,7 +847,7 @@ fn every_operation(builder: &mut Builder) -> Vec<(Operation, bool, bool, bool)> 
     let local_id = builder.local(PinpType::Int);
     let [value, other] = builder.leaves();
     let list = builder.list(&[value]);
-    let constant_id = builder.tables.constants.intern(Constant::Int(0));
+    let constant_id = builder.tables.constants.intern(super::Constant::Int(0));
     use Operation::*;
     vec![
         (Constant(constant_id), true, true, false),
@@ -883,7 +912,7 @@ fn every_operation(builder: &mut Builder) -> Vec<(Operation, bool, bool, bool)> 
                 step: None,
             },
             true,
-            false,
+            true,
             false,
         ),
         (
@@ -892,11 +921,11 @@ fn every_operation(builder: &mut Builder) -> Vec<(Operation, bool, bool, bool)> 
                 range: other,
             },
             true,
-            false,
+            true,
             false,
         ),
-        (ArrayNew { elements: list }, true, false, false),
-        (ArrayAllocate { zeroed: false }, true, false, false),
+        (ArrayNew { elements: list }, true, true, false),
+        (ArrayAllocate { zeroed: false }, true, true, false),
         (
             ElementGet {
                 array: value,
@@ -904,7 +933,7 @@ fn every_operation(builder: &mut Builder) -> Vec<(Operation, bool, bool, bool)> 
                 checked: true,
             },
             true,
-            false,
+            true,
             false,
         ),
         (
@@ -915,7 +944,7 @@ fn every_operation(builder: &mut Builder) -> Vec<(Operation, bool, bool, bool)> 
                 checked: true,
             },
             true,
-            false,
+            true,
             true,
         ),
         (
@@ -924,7 +953,7 @@ fn every_operation(builder: &mut Builder) -> Vec<(Operation, bool, bool, bool)> 
                 selectors: list,
             },
             true,
-            false,
+            true,
             false,
         ),
         (
@@ -966,6 +995,25 @@ fn every_operation(builder: &mut Builder) -> Vec<(Operation, bool, bool, bool)> 
             true,
             false,
             true,
+        ),
+        (
+            RangeField {
+                range: value,
+                field: RangeFieldKind::Stop,
+            },
+            true,
+            true,
+            false,
+        ),
+        (
+            Select {
+                cond: value,
+                if_true: other,
+                if_false: value,
+            },
+            true,
+            true,
+            false,
         ),
         (
             RuntimeCall {
@@ -1145,6 +1193,11 @@ fn pure_operations_never_trap() {
             value: lhs,
             range: rhs,
         },
+        Operation::Select {
+            cond: lhs,
+            if_true: rhs,
+            if_false: lhs,
+        },
         Operation::ElementAddress {
             array: lhs,
             index: rhs,
@@ -1316,7 +1369,7 @@ fn nested_bodies_of_every_loop_kind_verify() {
     let mut builder = Builder::new();
     let local_id = builder.local(PinpType::Int);
     let index = builder.local(PinpType::Int);
-    let mut write_one = |builder: &mut Builder| {
+    let write_one = |builder: &mut Builder| {
         let one = builder.int(1);
         builder.write(local_id, one)
     };
@@ -1688,57 +1741,6 @@ fn a_structured_statement_in_a_flat_block_is_rejected() {
     );
 }
 
-#[test]
-fn a_structured_value_deep_in_a_flat_tree_is_rejected() {
-    let mut builder = Builder::new();
-    let local_id = builder.local(PinpType::Float);
-    let array = builder.local(FLOATS);
-    let array_read = builder.read(array);
-    let [index] = builder.leaves();
-    let indices = builder.list(&[index]);
-    let element = builder.node(
-        Operation::ElementGet {
-            array: array_read,
-            indices,
-            checked: false,
-        },
-        PinpType::Float,
-    );
-    let negated = builder.node(
-        Operation::Unary {
-            op: UnOp::Neg,
-            operand: element,
-        },
-        PinpType::Float,
-    );
-    let write = builder.write(local_id, negated);
-    let function = builder.flat(vec![(vec![write], Terminator::Return(None))]);
-    assert_eq!(
-        verify(&function),
-        Err(VerifyError::WrongLevel(element, Level::Flat))
-    );
-}
-
-#[test]
-fn a_structured_value_as_a_terminator_operand_is_rejected() {
-    let mut builder = Builder::new();
-    let [value] = builder.leaves();
-    let range = builder.node(
-        Operation::Range {
-            kind: RangeKind::Inclusive,
-            start: value,
-            stop: value,
-            step: None,
-        },
-        PinpType::Range,
-    );
-    let function = builder.flat(vec![(vec![], Terminator::Return(Some(range)))]);
-    assert_eq!(
-        verify(&function),
-        Err(VerifyError::WrongLevel(range, Level::Flat))
-    );
-}
-
 /// Partial lowering: array access and string operations may already be lowered while the control
 /// flow is still structured.
 ///
@@ -1753,7 +1755,7 @@ fn lowered_operations_inside_structured_control_flow_verify() {
     let xs = builder.local(FLOATS);
     let i = builder.local(PinpType::Int);
     let text = builder.local(PinpType::Str);
-    let mut address_of_element = |builder: &mut Builder| {
+    let address_of_element = |builder: &mut Builder| {
         let array = builder.read(xs);
         let index = builder.read(i);
         builder.node(Operation::ElementAddress { array, index }, PinpType::Int)
@@ -2058,12 +2060,11 @@ fn an_unspanned_result_or_terminator_operand_is_rejected() {
 #[test]
 fn the_diamond_has_the_expected_edges() {
     let function = diamond_example();
-    let flat = &function.shape;
-    assert_eq!(flat.successors(block(0)), vec![block(1), block(2)]);
-    assert_eq!(flat.successors(block(1)), vec![block(3)]);
-    assert_eq!(flat.successors(block(2)), vec![block(3)]);
-    assert!(flat.successors(block(3)).is_empty());
-    let predecessors = flat.predecessors();
+    assert_eq!(function.successors(block(0)), vec![block(1), block(2)]);
+    assert_eq!(function.successors(block(1)), vec![block(3)]);
+    assert_eq!(function.successors(block(2)), vec![block(3)]);
+    assert!(function.successors(block(3)).is_empty());
+    let predecessors = function.predecessors();
     assert!(predecessors[block(0)].is_empty());
     assert_eq!(predecessors[block(1)], vec![block(0)]);
     assert_eq!(predecessors[block(2)], vec![block(0)]);
@@ -2088,7 +2089,7 @@ fn a_back_edge_makes_the_loop_header_its_own_predecessor() {
         (vec![], Terminator::Return(None)),
     ]);
     assert_eq!(verify(&function), Ok(()));
-    let predecessors = function.shape.predecessors();
+    let predecessors = function.predecessors();
     assert_eq!(predecessors[block(1)], vec![block(0), block(1)]);
     assert_eq!(predecessors[block(2)], vec![block(1)]);
 }
@@ -2111,8 +2112,8 @@ fn an_error_exit_has_no_successors() {
         (vec![], Terminator::RuntimeError(message)),
     ]);
     assert_eq!(verify(&function), Ok(()));
-    assert!(function.shape.successors(block(2)).is_empty());
-    assert_eq!(function.shape.predecessors()[block(2)], vec![block(0)]);
+    assert!(function.successors(block(2)).is_empty());
+    assert_eq!(function.predecessors()[block(2)], vec![block(0)]);
 }
 
 #[test]
@@ -2125,7 +2126,7 @@ fn an_unreachable_block_still_counts_as_a_predecessor() {
         (vec![], Terminator::Return(None)),
     ]);
     assert_eq!(verify(&function), Ok(()));
-    let predecessors = function.shape.predecessors();
+    let predecessors = function.predecessors();
     assert!(predecessors[block(1)].is_empty());
     assert_eq!(predecessors[block(2)], vec![block(0), block(1)]);
 }
@@ -2145,14 +2146,8 @@ fn a_branch_with_identical_targets_counts_both_edges() {
         ),
         (vec![], Terminator::Return(None)),
     ]);
-    assert_eq!(
-        function.shape.successors(block(0)),
-        vec![block(1), block(1)]
-    );
-    assert_eq!(
-        function.shape.predecessors()[block(1)],
-        vec![block(0), block(0)]
-    );
+    assert_eq!(function.successors(block(0)), vec![block(1), block(1)]);
+    assert_eq!(function.predecessors()[block(1)], vec![block(0), block(0)]);
 }
 
 // ---------------------------------------------------------------------------
@@ -2172,10 +2167,17 @@ impl Builder {
 
 /// block0 switches on a tag into block2, block1, or (by default) block3; each returns.
 fn switch_example(targets: &[BlockId], default: BlockId) -> Function<Flat> {
+    switch_example_with_tables(targets, default).1
+}
+
+fn switch_example_with_tables(
+    targets: &[BlockId],
+    default: BlockId,
+) -> (ProgramTables, Function<Flat>) {
     let mut builder = Builder::new();
     let tag = builder.int(0);
     let switch = builder.switch(tag, targets, default);
-    builder.flat(vec![
+    builder.flat_with_tables(vec![
         (vec![], switch),
         (vec![], Terminator::Return(None)),
         (vec![], Terminator::Return(None)),
@@ -2194,12 +2196,11 @@ fn a_valid_switch_verifies() {
 #[test]
 fn a_switch_leads_to_its_targets_in_order_then_its_default() {
     let function = switch_example(&[block(2), block(1)], block(3));
-    let flat = &function.shape;
     assert_eq!(
-        flat.successors(block(0)),
+        function.successors(block(0)),
         vec![block(2), block(1), block(3)]
     );
-    let predecessors = flat.predecessors();
+    let predecessors = function.predecessors();
     for target in [block(1), block(2), block(3)] {
         assert_eq!(predecessors[target], vec![block(0)]);
     }
@@ -2209,7 +2210,7 @@ fn a_switch_leads_to_its_targets_in_order_then_its_default() {
 fn a_switch_without_targets_leads_only_to_its_default() {
     let function = switch_example(&[], block(3));
     assert_eq!(verify(&function), Ok(()));
-    assert_eq!(function.shape.successors(block(0)), vec![block(3)]);
+    assert_eq!(function.successors(block(0)), vec![block(3)]);
 }
 
 #[test]
@@ -2217,11 +2218,11 @@ fn a_switch_repeating_a_block_counts_every_edge() {
     let function = switch_example(&[block(1), block(1)], block(1));
     assert_eq!(verify(&function), Ok(()));
     assert_eq!(
-        function.shape.successors(block(0)),
+        function.successors(block(0)),
         vec![block(1), block(1), block(1)]
     );
     assert_eq!(
-        function.shape.predecessors()[block(1)],
+        function.predecessors()[block(1)],
         vec![block(0), block(0), block(0)]
     );
 }
@@ -2272,27 +2273,6 @@ fn a_switch_tag_shared_with_a_statement_is_rejected() {
     assert_eq!(verify(&function), Err(VerifyError::SharedNode(shared)));
 }
 
-#[test]
-fn a_structured_value_as_a_switch_tag_is_rejected() {
-    let mut builder = Builder::new();
-    let [start, stop] = builder.leaves();
-    let range = builder.node(
-        Operation::Range {
-            kind: RangeKind::Inclusive,
-            start,
-            stop,
-            step: None,
-        },
-        PinpType::Range,
-    );
-    let switch = builder.switch(range, &[], block(1));
-    let function = builder.flat(vec![(vec![], switch), (vec![], Terminator::Return(None))]);
-    assert_eq!(
-        verify(&function),
-        Err(VerifyError::WrongLevel(range, Level::Flat))
-    );
-}
-
 // ---------------------------------------------------------------------------
 // The loop example, end to end
 // ---------------------------------------------------------------------------
@@ -2315,5 +2295,798 @@ fn the_loop_example_reads_what_the_source_reads() {
         indoc! {"
         n is read by the range, total by the update and the result, xs and i by the access.
     "}
+    );
+}
+
+// ---------------------------------------------------------------------------
+// Printer
+// ---------------------------------------------------------------------------
+
+/// The tree under `root`, printed with the builder's tables.
+fn print_tree(builder: &Builder, names: &[&str], root: NodeId) -> String {
+    Printer::new(&builder.tables, names, &[]).tree(&builder.arena, root)
+}
+
+fn first_line(printed: &str) -> &str {
+    printed.lines().next().unwrap_or_default()
+}
+
+#[test]
+fn the_loop_example_prints_one_line_per_node() {
+    let (tables, function) = loop_example_with_tables();
+    let printer = Printer::new(&tables, &["n", "total", "xs", "i"], &[]);
+    assert_eq!(
+        printer.function(&function),
+        indoc! {"
+            function f0 (1 parameter), structured
+            locals
+              l0 n: int
+              l1 total: float
+              l2 xs: float[4]
+              l3 i: int
+            body
+              write_local l1 total
+                constant 0.0: float
+              write_local l2 xs
+                array_new: float[4]
+                  constant 1.5: float
+                  constant 2.5: float
+                  constant 3.5: float
+                  constant 4.5: float
+              counted_loop l3 i
+                range inclusive: range
+                  constant 0: int
+                  read_local l0 n: int
+                body
+                  write_local l1 total
+                    add: float
+                      read_local l1 total: float
+                      element_get checked: float
+                        read_local l2 xs: float[4]
+                        mod: int
+                          read_local l3 i: int
+                          constant 4: int
+            result
+              read_local l1 total: float
+        "}
+    );
+}
+
+#[test]
+fn an_empty_structured_function_prints_only_its_header_and_body_label() {
+    let (tables, function) = Builder::new().structured_with_tables(&[], None);
+    assert_eq!(
+        Printer::new(&tables, &[], &[]).function(&function),
+        indoc! {"
+            function f0 (0 parameters), structured
+            body
+        "}
+    );
+}
+
+#[test]
+fn the_diamond_prints_each_block_with_its_terminator() {
+    let (tables, function) = diamond_example_with_tables();
+    assert_eq!(
+        Printer::new(&tables, &["x"], &[]).function(&function),
+        indoc! {"
+            function f0 (0 parameters), flat
+            locals
+              l0 x: int
+            block0 (entry)
+              write_local l0 x
+                constant 1: int
+              branch block1 block2
+                constant true: bool
+            block1
+              write_local l0 x
+                constant 2: int
+              goto block3
+            block2
+              goto block3
+            block3
+              return
+                read_local l0 x: int
+        "}
+    );
+}
+
+#[test]
+fn the_entry_is_marked_wherever_it_is() {
+    let (tables, mut function) = diamond_example_with_tables();
+    function.shape.entry = block(2);
+    let printed = Printer::new(&tables, &["x"], &[]).function(&function);
+    assert!(printed.contains("\nblock0\n"), "{printed}");
+    assert!(printed.contains("\nblock2 (entry)\n"), "{printed}");
+}
+
+#[test]
+fn a_switch_prints_its_targets_then_its_default() {
+    let (tables, function) = switch_example_with_tables(&[block(2), block(1)], block(3));
+    assert_eq!(
+        Printer::new(&tables, &[], &[]).function(&function),
+        indoc! {"
+            function f0 (0 parameters), flat
+            block0 (entry)
+              switch block2 block1 default block3
+                constant 0: int
+            block1
+              return
+            block2
+              return
+            block3
+              return
+        "}
+    );
+}
+
+#[test]
+fn an_error_exit_prints_its_message() {
+    let mut builder = Builder::new();
+    let message = builder.tables.constants.intern(Constant::Str(StrId(0)));
+    let (tables, function) =
+        builder.flat_with_tables(vec![(vec![], Terminator::RuntimeError(message))]);
+    let strings = ["Division by zero.".to_string()];
+    assert_eq!(
+        Printer::new(&tables, &[], &strings).function(&function),
+        indoc! {r#"
+            function f0 (0 parameters), flat
+            block0 (entry)
+              runtime_error "Division by zero."
+        "#}
+    );
+}
+
+#[test]
+fn nested_bodies_are_labelled_and_empty_optional_ones_omitted() {
+    let mut builder = Builder::new();
+    let flag = builder.local(PinpType::Bool);
+    let set = |builder: &mut Builder, value: bool| {
+        let constant = builder.boolean(value);
+        builder.write(flag, constant)
+    };
+    let then_write = set(&mut builder, true);
+    let else_write = set(&mut builder, false);
+    let cond = builder.read(flag);
+    let then_body = builder.list(&[then_write]);
+    let else_body = builder.list(&[else_write]);
+    let both = builder.statement(Operation::If {
+        cond,
+        then_body,
+        else_body,
+    });
+    let cond = builder.read(flag);
+    let neither = builder.statement(Operation::If {
+        cond,
+        then_body: List::EMPTY,
+        else_body: List::EMPTY,
+    });
+    let header_write = set(&mut builder, true);
+    let body_write = set(&mut builder, false);
+    let cond = builder.read(flag);
+    let header = builder.list(&[header_write]);
+    let body = builder.list(&[body_write]);
+    let with_header = builder.statement(Operation::While { header, cond, body });
+    let cond = builder.read(flag);
+    let without_header = builder.statement(Operation::While {
+        header: List::EMPTY,
+        cond,
+        body: List::EMPTY,
+    });
+    let body_write = set(&mut builder, true);
+    let cond = builder.read(flag);
+    let body = builder.list(&[body_write]);
+    let do_until = builder.statement(Operation::DoWhile {
+        body,
+        cond,
+        until: true,
+    });
+    let cond = builder.read(flag);
+    let do_while = builder.statement(Operation::DoWhile {
+        body: List::EMPTY,
+        cond,
+        until: false,
+    });
+    let names = ["done"];
+    let printed: Vec<String> = [
+        both,
+        neither,
+        with_header,
+        without_header,
+        do_until,
+        do_while,
+    ]
+    .into_iter()
+    .map(|root| print_tree(&builder, &names, root))
+    .collect();
+    assert_eq!(
+        printed,
+        [
+            indoc! {"
+                if
+                  read_local l0 done: bool
+                  then
+                    write_local l0 done
+                      constant true: bool
+                  else
+                    write_local l0 done
+                      constant false: bool
+            "},
+            indoc! {"
+                if
+                  read_local l0 done: bool
+                  then
+            "},
+            indoc! {"
+                while
+                  header
+                    write_local l0 done
+                      constant true: bool
+                  read_local l0 done: bool
+                  body
+                    write_local l0 done
+                      constant false: bool
+            "},
+            indoc! {"
+                while
+                  read_local l0 done: bool
+                  body
+            "},
+            indoc! {"
+                do_until
+                  body
+                    write_local l0 done
+                      constant true: bool
+                  read_local l0 done: bool
+            "},
+            indoc! {"
+                do_while
+                  body
+                  read_local l0 done: bool
+            "},
+        ]
+    );
+}
+
+#[test]
+fn every_binary_operator_prints_as_a_word() {
+    let words = [
+        (BinOp::Add, "add"),
+        (BinOp::Sub, "subtract"),
+        (BinOp::Mul, "multiply"),
+        (BinOp::Div, "divide"),
+        (BinOp::Pow, "power"),
+        (BinOp::Eq, "equal"),
+        (BinOp::Ne, "not_equal"),
+        (BinOp::Lt, "less"),
+        (BinOp::Gt, "greater"),
+        (BinOp::Le, "less_equal"),
+        (BinOp::Ge, "greater_equal"),
+        (BinOp::Xor, "xor"),
+    ];
+    for (op, word) in words {
+        let mut builder = Builder::new();
+        let [lhs, rhs] = builder.leaves();
+        let binary = builder.node(Operation::Binary { op, lhs, rhs }, PinpType::Int);
+        assert_eq!(
+            print_tree(&builder, &[], binary),
+            format!("{word}: int\n  constant 0: int\n  constant 1: int\n")
+        );
+    }
+}
+
+#[test]
+fn flags_kinds_and_targets_print_after_the_operation_name() {
+    let cases: [fn(&mut Builder) -> NodeId; 20] = [
+        |builder| {
+            let [operand] = builder.leaves();
+            let operation = Operation::Unary {
+                op: UnOp::Neg,
+                operand,
+            };
+            builder.node(operation, PinpType::Int)
+        },
+        |builder| {
+            let operand = builder.boolean(true);
+            let operation = Operation::Unary {
+                op: UnOp::Not,
+                operand,
+            };
+            builder.node(operation, PinpType::Bool)
+        },
+        |builder| {
+            let [lhs, rhs] = builder.leaves();
+            let operation = Operation::IntegerDivide {
+                remainder: false,
+                checked: true,
+                lhs,
+                rhs,
+            };
+            builder.node(operation, PinpType::Int)
+        },
+        |builder| {
+            let [lhs, rhs] = builder.leaves();
+            let operation = Operation::IntegerDivide {
+                remainder: true,
+                checked: false,
+                lhs,
+                rhs,
+            };
+            builder.node(operation, PinpType::Int)
+        },
+        |builder| {
+            let [operand] = builder.leaves();
+            builder.node(Operation::Convert { operand }, PinpType::Float)
+        },
+        |builder| {
+            let [first] = builder.leaves();
+            let args = builder.list(&[first]);
+            let callee = FunctionId::from_index(3);
+            builder.node(Operation::Call { callee, args }, PinpType::Int)
+        },
+        |builder| {
+            let [first, second] = builder.leaves();
+            let args = builder.list(&[first, second]);
+            let function = RuntimeFunction::StrConcat;
+            builder.node(Operation::RuntimeCall { function, args }, PinpType::Str)
+        },
+        |builder| {
+            let [address] = builder.leaves();
+            let operation = Operation::Load {
+                address,
+                offset: 8,
+                stored: ScalarKind::Word,
+            };
+            builder.node(operation, PinpType::Float)
+        },
+        |builder| {
+            let [address, value] = builder.leaves();
+            builder.statement(Operation::Store {
+                address,
+                value,
+                offset: 16,
+                stored: ScalarKind::Byte,
+            })
+        },
+        |builder| {
+            let [array, index] = builder.leaves();
+            let operation = Operation::ElementAddress { array, index };
+            builder.node(operation, PinpType::Int)
+        },
+        |builder| {
+            let [start, stop, step] = builder.leaves();
+            let operation = Operation::Range {
+                kind: RangeKind::DownExclusive,
+                start,
+                stop,
+                step: Some(step),
+            };
+            builder.node(operation, PinpType::Range)
+        },
+        |builder| {
+            let [start, stop] = builder.leaves();
+            let operation = Operation::Range {
+                kind: RangeKind::UpExclusive,
+                start,
+                stop,
+                step: None,
+            };
+            builder.node(operation, PinpType::Range)
+        },
+        |builder| {
+            let [value, range] = builder.leaves();
+            builder.node(Operation::Membership { value, range }, PinpType::Bool)
+        },
+        |builder| {
+            let operation = Operation::ArrayAllocate { zeroed: true };
+            builder.node(operation, PinpType::Matrix(ArrayElementType::Float, 2, 3))
+        },
+        |builder| {
+            let operation = Operation::ArrayAllocate { zeroed: false };
+            builder.node(operation, PinpType::Array(ArrayElementType::Bool, 5))
+        },
+        |builder| {
+            let [array, index] = builder.leaves();
+            let indices = builder.list(&[index]);
+            let operation = Operation::ElementGet {
+                array,
+                indices,
+                checked: false,
+            };
+            builder.node(operation, PinpType::Int)
+        },
+        |builder| {
+            let [array, row, column, value] = builder.leaves();
+            let indices = builder.list(&[row, column]);
+            builder.statement(Operation::ElementSet {
+                array,
+                indices,
+                value,
+                checked: true,
+            })
+        },
+        |builder| {
+            let [source, selector] = builder.leaves();
+            let selectors = builder.list(&[selector]);
+            builder.node(Operation::Slice { source, selectors }, FLOATS)
+        },
+        |builder| {
+            let global_id = GlobalId::from_index(2);
+            builder.node(Operation::ReadGlobal(global_id), PinpType::Int)
+        },
+        |builder| {
+            let [value] = builder.leaves();
+            let global_id = GlobalId::from_index(2);
+            builder.statement(Operation::WriteGlobal { global_id, value })
+        },
+    ];
+    let expected = [
+        "negate: int",
+        "not: bool",
+        "div checked: int",
+        "mod: int",
+        "convert: float",
+        "call f3: int",
+        "runtime_call str_concat: str",
+        "load word +8: float",
+        "store byte +16",
+        "element_address: int",
+        "range down_exclusive: range",
+        "range up_exclusive: range",
+        "in: bool",
+        "array_allocate zeroed: float[2x3]",
+        "array_allocate: bool[5]",
+        "element_get: int",
+        "element_set checked",
+        "slice: float[4]",
+        "read_global g2: int",
+        "write_global g2",
+    ];
+    for ((build, line), expected_children) in cases
+        .into_iter()
+        .zip(expected)
+        .zip([1, 1, 2, 2, 1, 1, 2, 1, 2, 2, 3, 2, 2, 0, 0, 2, 4, 2, 0, 1])
+    {
+        let mut builder = Builder::new();
+        let root = build(&mut builder);
+        let printed = print_tree(&builder, &[], root);
+        assert_eq!(first_line(&printed), line);
+        assert_eq!(printed.lines().count(), 1 + expected_children, "{printed}");
+    }
+}
+
+#[test]
+fn constants_print_as_pinp_would_write_them() {
+    let strings = ["say \"hi\"\n".to_string()];
+    let cases = [
+        (
+            Constant::Int(i64::MIN),
+            PinpType::Int,
+            "-9223372036854775808",
+        ),
+        (Constant::Bool(false), PinpType::Bool, "false"),
+        (Constant::Float(0.0f64.to_bits()), PinpType::Float, "0.0"),
+        (
+            Constant::Float((-0.0f64).to_bits()),
+            PinpType::Float,
+            "-0.0",
+        ),
+        (Constant::Float(0.1f64.to_bits()), PinpType::Float, "0.1"),
+        (
+            Constant::Float(1e100f64.to_bits()),
+            PinpType::Float,
+            "1e100",
+        ),
+        (Constant::Float(f64::NAN.to_bits()), PinpType::Float, "nan"),
+        (
+            Constant::Float(f64::INFINITY.to_bits()),
+            PinpType::Float,
+            "inf",
+        ),
+        (
+            Constant::Float(f64::NEG_INFINITY.to_bits()),
+            PinpType::Float,
+            "-inf",
+        ),
+        (Constant::Str(StrId(0)), PinpType::Str, r#""say \"hi\"\n""#),
+        (Constant::Str(StrId(7)), PinpType::Str, "str#7"),
+    ];
+    for (constant, pinp_type, text) in cases {
+        let mut builder = Builder::new();
+        let node_id = builder.constant(constant, pinp_type);
+        let printed = Printer::new(&builder.tables, &[], &strings).tree(&builder.arena, node_id);
+        assert_eq!(
+            printed,
+            format!("constant {text}: {}\n", type_name(pinp_type))
+        );
+    }
+}
+
+fn type_name(pinp_type: PinpType) -> &'static str {
+    match pinp_type {
+        PinpType::Int => "int",
+        PinpType::Bool => "bool",
+        PinpType::Float => "float",
+        PinpType::Str => "str",
+        _ => unreachable!(),
+    }
+}
+
+#[test]
+fn temporaries_print_without_a_name() {
+    let mut builder = Builder::new();
+    let int_id = builder.tables.types.intern(PinpType::Int);
+    let temporary = builder.arena.locals.push(Local {
+        name: None,
+        type_id: int_id,
+    });
+    let read = builder.read(temporary);
+    let evaluate = builder.evaluate(read);
+    let (tables, function) = builder.structured_with_tables(&[evaluate], None);
+    assert_eq!(
+        Printer::new(&tables, &[], &[]).function(&function),
+        indoc! {"
+            function f0 (0 parameters), structured
+            locals
+              l0: int
+            body
+              evaluate
+                read_local l0: int
+        "}
+    );
+}
+
+#[test]
+fn a_void_type_is_not_printed() {
+    let mut builder = Builder::new();
+    let callee = FunctionId::from_index(1);
+    let call = builder.node(
+        Operation::Call {
+            callee,
+            args: List::EMPTY,
+        },
+        PinpType::Void,
+    );
+    let evaluate = builder.evaluate(call);
+    assert_eq!(print_tree(&builder, &[], evaluate), "evaluate\n  call f1\n");
+}
+
+// Broken IR still prints — the printer is how a verifier failure gets investigated.
+
+#[test]
+fn a_dangling_node_prints_as_dangling() {
+    let (tables, function) = Builder::new().structured_with_tables(&[DANGLING], None);
+    assert_eq!(
+        Printer::new(&tables, &[], &[]).function(&function),
+        indoc! {"
+            function f0 (0 parameters), structured
+            body
+              <dangling n999>
+        "}
+    );
+}
+
+#[test]
+fn a_shared_node_prints_in_full_once_then_as_shared() {
+    let mut builder = Builder::new();
+    let [shared] = builder.leaves();
+    let doubled = builder.node(
+        Operation::Binary {
+            op: BinOp::Add,
+            lhs: shared,
+            rhs: shared,
+        },
+        PinpType::Int,
+    );
+    assert_eq!(
+        print_tree(&builder, &[], doubled),
+        "add: int\n  constant 0: int\n  <shared n0>\n"
+    );
+}
+
+#[test]
+fn a_cycle_prints_without_looping_forever() {
+    let mut builder = Builder::new();
+    let itself = builder.arena.operations.next_id();
+    let evaluate = builder.evaluate(itself);
+    assert_eq!(
+        print_tree(&builder, &[], evaluate),
+        "evaluate\n  <shared n0>\n"
+    );
+}
+
+#[test]
+fn missing_names_types_and_locals_print_as_question_marks() {
+    let mut builder = Builder::new();
+    let named = builder.local(PinpType::Int);
+    let named_read = builder.read(named);
+    let missing = builder
+        .arena
+        .operations
+        .push(Operation::ReadLocal(LocalId::from_index(42)));
+    builder.arena.spans[missing] = SPAN;
+    let untyped = builder
+        .arena
+        .operations
+        .push(Operation::ReadGlobal(GlobalId::from_index(0)));
+    // No names at all: local 0's name is out of range.
+    assert_eq!(
+        print_tree(&builder, &[], named_read),
+        "read_local l0 ?: int\n"
+    );
+    assert_eq!(print_tree(&builder, &[], missing), "read_local l42 ?: ?\n");
+    assert_eq!(print_tree(&builder, &[], untyped), "read_global g0: ?\n");
+}
+
+#[test]
+fn a_dangling_block_prints_by_number() {
+    let (tables, function) =
+        Builder::new().flat_with_tables(vec![(vec![], Terminator::Goto(block(7)))]);
+    assert_eq!(
+        Printer::new(&tables, &[], &[]).function(&function),
+        indoc! {"
+            function f0 (0 parameters), flat
+            block0 (entry)
+              goto block7
+        "}
+    );
+}
+
+#[test]
+fn a_global_with_an_entry_in_the_tables_prints_its_name() {
+    let mut builder = Builder::new();
+    let int_id = builder.tables.types.intern(PinpType::Int);
+    let global_id = builder.tables.globals.push(Global {
+        name: SymId(0),
+        type_id: int_id,
+    });
+    let read = builder.node(Operation::ReadGlobal(global_id), PinpType::Int);
+    let write = builder.statement(Operation::WriteGlobal {
+        global_id,
+        value: read,
+    });
+    assert_eq!(
+        print_tree(&builder, &["total"], write),
+        "write_global g0 total\n  read_global g0 total: int\n"
+    );
+}
+
+#[test]
+fn a_function_with_a_signature_prints_its_name_in_its_header_and_calls() {
+    let mut builder = Builder::new();
+    let int_id = builder.tables.types.intern(PinpType::Int);
+    let callee = builder.tables.signatures.push(Signature {
+        name: Some(SymId(0)),
+        parameters: vec![int_id],
+        result: int_id,
+    });
+    let [argument] = builder.leaves();
+    let args = builder.list(&[argument]);
+    let call = builder.node(Operation::Call { callee, args }, PinpType::Int);
+    let (tables, function) = builder.structured_with_tables(&[], Some(call));
+    assert_eq!(
+        Printer::new(&tables, &["double"], &[]).function(&function),
+        indoc! {"
+            function f0 double (0 parameters), structured
+            body
+            result
+              call f0 double: int
+                constant 0: int
+        "}
+    );
+}
+
+#[test]
+fn a_select_visits_its_condition_then_both_values_and_prints_as_select() {
+    let mut builder = Builder::new();
+    let cond = builder.boolean(true);
+    let [if_true, if_false] = builder.leaves();
+    let select = builder.node(
+        Operation::Select {
+            cond,
+            if_true,
+            if_false,
+        },
+        PinpType::Int,
+    );
+    assert_eq!(
+        children(&builder.arena, select),
+        vec![cond, if_true, if_false]
+    );
+    assert!(builder.arena.is_removable(select));
+    assert_eq!(
+        print_tree(&builder, &[], select),
+        "select: int\n  constant true: bool\n  constant 0: int\n  constant 1: int\n"
+    );
+}
+
+#[test]
+fn every_value_operation_is_legal_in_a_flat_function() {
+    // Arrays, slices and ranges reach the backend as they are; only control flow is flattened.
+    let mut builder = Builder::new();
+    let local_id = builder.local(PinpType::Int);
+    let array = builder.local(FLOATS);
+    let array_read = builder.read(array);
+    let [index, start, stop] = builder.leaves();
+    let indices = builder.list(&[index]);
+    let element = builder.node(
+        Operation::ElementGet {
+            array: array_read,
+            indices,
+            checked: true,
+        },
+        PinpType::Float,
+    );
+    let range = builder.node(
+        Operation::Range {
+            kind: RangeKind::Inclusive,
+            start,
+            stop,
+            step: None,
+        },
+        PinpType::Range,
+    );
+    let first = builder.node(
+        Operation::RangeField {
+            range,
+            field: RangeFieldKind::Start,
+        },
+        PinpType::Int,
+    );
+    let converted = builder.node(Operation::Convert { operand: first }, PinpType::Float);
+    let sum = builder.node(
+        Operation::Binary {
+            op: BinOp::Add,
+            lhs: element,
+            rhs: converted,
+        },
+        PinpType::Float,
+    );
+    let write = builder.write(local_id, sum);
+    let function = builder.flat(vec![(vec![write], Terminator::Return(None))]);
+    assert_eq!(verify(&function), Ok(()));
+}
+
+#[test]
+fn a_range_field_reads_its_range_and_prints_its_field() {
+    let fields = [
+        (
+            RangeFieldKind::Start,
+            PinpType::Int,
+            "range_field start: int",
+        ),
+        (RangeFieldKind::Stop, PinpType::Int, "range_field stop: int"),
+        (RangeFieldKind::Step, PinpType::Int, "range_field step: int"),
+        (
+            RangeFieldKind::Inclusive,
+            PinpType::Bool,
+            "range_field inclusive: bool",
+        ),
+    ];
+    for (field, pinp_type, line) in fields {
+        let mut builder = Builder::new();
+        let range_local = builder.local(PinpType::Range);
+        let range = builder.read(range_local);
+        let node = builder.node(Operation::RangeField { range, field }, pinp_type);
+        assert_eq!(children(&builder.arena, node), vec![range]);
+        assert!(!Operation::RangeField { range, field }.may_trap());
+        assert!(builder.arena.is_removable(node));
+        assert_eq!(first_line(&print_tree(&builder, &["r"], node)), line);
+    }
+}
+
+#[test]
+fn every_runtime_function_has_a_printed_name() {
+    use RuntimeFunction::*;
+    let names = [StrConcat, StrCopy, StrFree, StrLength, MemInfo].map(RuntimeFunction::name);
+    assert_eq!(
+        names,
+        [
+            "str_concat",
+            "str_copy",
+            "str_free",
+            "str_length",
+            "meminfo"
+        ]
     );
 }

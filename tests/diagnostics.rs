@@ -9,8 +9,6 @@
 //! Each case asserts `(line, column, the-text-the-span-covers)`. Naming the covered text rather
 //! than a byte offset is what makes a wrong span visible — an off-by-one that still lands on the
 //! right line shows up as the wrong character.
-//!
-//! No `llvm` feature: reporting an error never reaches the backend.
 
 use indoc::indoc;
 use pinp::diagnostic::{Diagnose, Severity};

@@ -19,7 +19,7 @@ pub enum SemaError { UnknownSymbol(String), Type(String) }
 ```
 
 Every `ParseError` and `SemaError` variant is a bare `String`. No span, no line, no column, and no
-`Display` impl anywhere in `src/` — nothing renders either type. [parser/mod.rs:59](src/parser/mod.rs#L59)
+`Display` impl anywhere in `src/` — nothing renders either type. [parser/mod.rs:59](../src/parser/mod.rs#L59)
 compounds it by discarding position the lexer already computed:
 
 ```rust
@@ -52,9 +52,9 @@ Out of scope:
 
 `LexError` swaps to `Span`; `Token` does not, and the distinction is not an inconsistency to tidy up
 later. pinp's layout rules *compare columns as a language semantic* — hung-parameter alignment
-([item.rs:161-175](src/parser/item.rs#L161-L175)), wrapped-conditional alignment
-([expr.rs:259-262](src/parser/expr.rs#L259-L262)), list-element alignment
-([item.rs:596-599](src/parser/item.rs#L596-L599)). Those sites need a resolved column *during
+([item.rs:161-175](../src/parser/item.rs#L161-L175)), wrapped-conditional alignment
+([expr.rs:259-262](../src/parser/expr.rs#L259-L262)), list-element alignment
+([item.rs:596-599](../src/parser/item.rs#L596-L599)). Those sites need a resolved column *during
 parsing*, at points with no `LineIndex` in scope, and they are doing arithmetic rather than
 reporting a position. Converting them to `Span` would mean resolving offsets back to columns on a
 hot path to answer a question the token already answers.
@@ -67,12 +67,12 @@ Diagnostics resolve late; the layout engine resolves eagerly. Both are correct f
   span and their rendering becomes uniform. The existing suite must stay green.
 - **One deliberate API break**, and only one: `LexError`'s `line`/`col` become `span`. It has 9
   reference sites across `src/` and `tests/`, two of which are assertions
-  ([lexer.rs:879](src/lexer.rs#L879), [lexer.rs:931](src/lexer.rs#L931)) that get rewritten to
+  ([lexer.rs:879](../src/lexer.rs#L879), [lexer.rs:931](../src/lexer.rs#L931)) that get rewritten to
   compare a `Span` or to resolve it through `LineIndex`.
 - **Errors stay fail-fast.** The [fail-fast rule](0004-initial-sema.md) is unchanged: the first
   error still stops the pass. This iteration adds *positions*, not batching.
 - **Message text is unchanged.** Messages stay capitalised and end with a period per
-  [CLAUDE.md](CLAUDE.md); no message is reworded, so no test asserting on text needs touching.
+  [CLAUDE.md](../CLAUDE.md); no message is reworded, so no test asserting on text needs touching.
 
 ## Key decision: unify the rendering, not the error types
 
@@ -87,7 +87,7 @@ reasons, recorded here because the choice should be deliberate:
    *which kind* of failure occurred without matching message strings. Flattening pushes ~344
    reference sites across `src/` and `tests/` onto string matching — strictly worse.
 3. **The type advertises the policy.** A distinct fail-fast error type next to a batched
-   `Vec<Diagnostic>` is the distinction [analysis/mod.rs](src/analysis/mod.rs#L15-L16) exists to make.
+   `Vec<Diagnostic>` is the distinction [analysis/mod.rs](../src/analysis/mod.rs#L15-L16) exists to make.
 
 So `Diagnostic` becomes the **presentation** type, which is what the C++ `TextDiagConsumer` actually
 is — a formatter, while `DiagnosticsEngine::error()` still throws a plain `runtime_error`. Error
@@ -125,7 +125,7 @@ source in hand, so none of them are inconvenienced by needing a `LineIndex`.
 
 [0015](0015-static-analyses-start.md) added the `spans` arena but filled it only for `Node::Var` and
 `Node::Global` — the two kinds its checkers report on. Everything else holds `Span::UNKNOWN`, and
-`ProgramAst::push` still defaults to it ([ast.rs:415](src/parser/ast.rs#L415)).
+`ProgramAst::push` still defaults to it ([ast.rs:415](../src/parser/ast.rs#L415)).
 
 That compromise is load-bearing against this iteration. `SemaError::Type` is the overwhelmingly
 common sema error — 127 of the 165 wildcard test patterns — and it fires on binary operators, calls,
@@ -194,7 +194,7 @@ Steps 3 and 4 are the bulk; they are mechanical but wide.
 
 ## Tests
 
-Per [CLAUDE.md](CLAUDE.md), tests come first and adversarially. The contract worth attacking:
+Per [CLAUDE.md](../CLAUDE.md), tests come first and adversarially. The contract worth attacking:
 
 - **Position accuracy** — the span points at the offending token, not the statement start, not the
   line start. One case per `ParseError` and `SemaError` variant, on multi-line input with leading
@@ -207,7 +207,7 @@ Per [CLAUDE.md](CLAUDE.md), tests come first and adversarially. The contract wor
 - **Layout errors still point at the column the rule is about.** The alignment rules compare
   `Token::col`; the diagnostic must report *that* column, not the statement start — the one place
   where the eager and lazy position paths have to agree.
-- **Unknown spans** still render without a position, as [diagnostic.rs](src/diagnostic.rs)
+- **Unknown spans** still render without a position, as [diagnostic.rs](../src/diagnostic.rs)
   already guarantees for warnings.
 - **Tab and multi-byte input** — columns are counted consistently with what `LineIndex` already does
   for the analysis layer; a diagnostic on a line containing non-ASCII must agree with it.
@@ -222,7 +222,7 @@ Eight things settled differently from the plan above, each because the code said
    the unspanned variant was dead and the `_spanned` qualifier distinguished nothing.
 
 2. **Parser spans are attached centrally, not per site.** The 42 construction sites return a
-   `ParseErrorKind`; [`parse`](src/parser/mod.rs) wraps it with the span. The parser unwinds the
+   `ParseErrorKind`; [`parse`](../src/parser/mod.rs) wraps it with the span. The parser unwinds the
    moment a rule fails and never advances afterwards, so the token it stopped on *is* the offending
    one — which makes 42 hand-threaded spans unnecessary and, being hand-threaded, less uniform.
 

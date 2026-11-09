@@ -1,5 +1,4 @@
 // SPDX-License-Identifier: MIT
-#![cfg(feature = "llvm")]
 // Each integration-test binary compiles this module separately and uses only the helpers it
 // needs, so an unused helper here is expected rather than dead code.
 #![allow(dead_code)]
@@ -11,7 +10,42 @@ use pinp::codegen::{PinpJit, PinpValue};
 
 /// Compiles and runs `src`, returning its value; panics on any compile/run error.
 pub fn eval(src: &str) -> PinpValue {
-    PinpJit::eval(src).expect("Program failed to compile or run.")
+    eval_result(src).expect("Program failed to compile or run.")
+}
+
+/// Compiles and runs `src`, returning its value or its error.
+///
+/// Every program is also desugared to the IR and verified first, so the whole end-to-end corpus
+/// doubles as a test of the IR.
+pub fn eval_result(src: &str) -> Result<PinpValue, String> {
+    check_ir(src);
+    PinpJit::eval(src)
+}
+
+/// Desugars `src`, then flattens it, verifying every function at both levels and printing the one
+/// that fails. A program that does not compile has no IR to check.
+fn check_ir(src: &str) {
+    let Ok(mut ast) = pinp::parser::parse(src) else {
+        return;
+    };
+    if pinp::sema::analyze(&mut ast).is_err() {
+        return;
+    }
+    let mut program = pinp::desugar::desugar(&ast);
+    for (_, function) in program.functions.iter() {
+        if let Err(error) = pinp::ir::verify(function) {
+            let printer = pinp::ir::Printer::new(&program.tables, &ast.names, &ast.string_literals);
+            panic!("{error:?} in\n{}", printer.function(function));
+        }
+    }
+    let functions: Vec<_> = program.functions.iter().map(|(_, f)| f.clone()).collect();
+    for function in functions {
+        let flat = pinp::flatten::flatten(function, &mut program.tables);
+        if let Err(error) = pinp::ir::verify(&flat) {
+            let printer = pinp::ir::Printer::new(&program.tables, &ast.names, &ast.string_literals);
+            panic!("{error:?} in\n{}", printer.function(&flat));
+        }
+    }
 }
 
 /// Defines a typed `eval_*` helper that runs `src` and unwraps the expected [`PinpValue`] variant,
@@ -44,8 +78,8 @@ pub struct MemoryCounts {
     pub free_count: i64,
 }
 
-/// Reads the runtime's current allocation bookkeeping. The counters are process-global, so a test
-/// comparing two readings must keep other allocating tests out in between.
+/// Reads the runtime's current allocation bookkeeping for the calling thread — the thread a test
+/// runs its programs on.
 pub fn memory_counts() -> MemoryCounts {
     unsafe extern "C" {
         fn pinp_memory_info(info: *mut MemoryCounts);

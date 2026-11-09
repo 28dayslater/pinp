@@ -103,7 +103,7 @@ branches and a mandatory `else`.
   then-value, `e2` the else-value. It is the loosest operator — binding power **10**, below `or`
   (20) — so `a or b if c else d` is `(a or b) if c else d`. The else-tail is right-associative:
   `a if p else b if q else c` is `a if p else (b if q else c)`. Like the comparison chain (0005),
-  it is handled apart from the [`infix`](src/parser.rs#L220) table, in the `parse_expr` loop.
+  it is handled apart from the [`infix`](../src/parser/) table, in the `parse_expr` loop.
 - **Block.**
   ```
   if cond1
@@ -152,7 +152,7 @@ dropped.
   ternary parser skips any `Newline`/`Indent`/`Dedent` and, if a newline was crossed, requires the
   `else` token's column to equal that start column (a `ParseError::Layout` otherwise). This reuses
   the column-tracking already in place for parameter alignment
-  ([parser.rs:473](src/parser.rs#L473)). Because `e1` always begins to the right of the enclosing
+  ([parser.rs:473](../src/parser/)). Because `e1` always begins to the right of the enclosing
   block's indent, the stray `Indent`/`Dedent` bracketing the `else` line never dedents the outer
   block.
 - **Block bodies.** Indentation is the lexer's existing job; the parser only checks that `elif`/
@@ -166,18 +166,18 @@ dropped.
 - `Node` gains `If { arms: Vec<IfArm>, els: Option<Block> }`, where
   `IfArm { cond: ExprId, body: Block }`. The leading `if` and each `elif` are uniform `IfArm`s; the
   inline ternary is one arm plus `els: Some(..)`.
-- `Block.result` becomes `Option<ExprId>` ([parser.rs:118](src/parser.rs#L118)). A control-flow body
+- `Block.result` becomes `Option<ExprId>` ([parser.rs:118](../src/parser/)). A control-flow body
   may end in a statement (`None`); a function body still requires the trailing expression — the
   parser enforces `Some` there, keeping the existing "Function body must end with an expression."
-  error ([parser.rs:537](src/parser.rs#L537)).
+  error ([parser.rs:537](../src/parser/)).
 - `Stmt` gains `While { cond: ExprId, body: Block }` and
-  `Loop { body: Block, cond: ExprId, until: bool }` ([parser.rs:104](src/parser.rs#L104)).
+  `Loop { body: Block, cond: ExprId, until: bool }` ([parser.rs:104](../src/parser/)).
 - No new `BinOp`/`UnOp`: `until` lowers to a negated branch in codegen, not a `not` node.
 
 ## Lexer
 
 `if elif else while until loop` join the keyword classifier
-([lexer.rs:206](src/lexer.rs#L206)) as `KwIf KwElif KwElse KwWhile KwUntil KwLoop`, becoming
+([lexer.rs:206](../src/lexer.rs#L206)) as `KwIf KwElif KwElse KwWhile KwUntil KwLoop`, becoming
 reserved words (like `and`/`or`). No new operator lexemes.
 
 ## Parser
@@ -202,7 +202,7 @@ reserved words (like `and`/`or`). No new operator lexemes.
   to `Void`. A `Void`-typed `if` used where a value is required then trips the existing void checks
   (`Cannot assign a void value.`, the function-return mismatch, etc.).
 - **Scoping (lexical, mutate-outer; no shadowing in 0006).** Each `if`-branch and loop body pushes a
-  scope frame onto the existing stack ([sema.rs:83](src/sema.rs#L83)). A bare-name **read** resolves
+  scope frame onto the existing stack ([sema.rs:83](../src/sema/)). A bare-name **read** resolves
   *outward* through the enclosing frames to the current function's base frame (globals only via `::`;
   a top-level body, having no function frame, sees the top-level globals). A bare-name **assignment**
   *also* searches outward: if the name is already bound in any enclosing frame it **mutates that
@@ -220,14 +220,14 @@ reserved words (like `and`/`or`). No new operator lexemes.
 - **`if`** lowers to a chain of diamonds — `arms[0]` branches into its body or into the lowering of
   `arms[1..]` + `els`, recursively. When the node's type is non-`Void`, each diamond contributes to a
   `phi` in the merge block (incoming from each branch's *end* block, tracked like
-  [gen_short_circuit](src/codegen.rs#L586)); when `Void`, no `phi` — branches run for effect and
+  [gen_short_circuit](../src/codegen/llvm/)); when `Void`, no `phi` — branches run for effect and
   merge. Branch values promote to the node's join type before the `phi`.
 - **`while`**: a header block (evaluate `cond`, `condbr` to body or exit), a body block branching
   back to the header. **`loop … while/until`**: body first, then evaluate `cond` and `condbr` back to
   the body (for `until`, swap the branch targets) or to exit. First loops/back-edges in the codebase.
 - **Locals move to entry-block allocas.** A pre-pass over each function body allocates one slot per
   local `SymId` up front, replacing the lazy first-assignment alloca in
-  [resolve_place](src/codegen.rs#L325). This keeps every load dominated by its slot and stops an
+  [resolve_place](../src/codegen/llvm/). This keeps every load dominated by its slot and stops an
   alloca from re-executing (and growing the stack) each loop iteration. One slot per `SymId` is
   enough: sema's mutate-outer means a name maps to a single binding, and sema rejects any read of a
   body-local after its scope, so codegen never loads an out-of-scope name. Assignment then just

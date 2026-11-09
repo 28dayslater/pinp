@@ -575,8 +575,9 @@ impl<'src> Parser<'src> {
         // Comprehension: `[element for var[:type] in source]`.
         if self.peek().kind == TokenKind::KwFor {
             self.advance(); // 'for'
-            let var_name = self.expect(TokenKind::Identifier)?.text;
-            let var = self.ast.intern(var_name);
+            let var_token = self.expect(TokenKind::Identifier)?;
+            let var = self.ast.intern(var_token.text);
+            let var_span = var_token.span();
             let var_type = if self.peek().kind == TokenKind::Colon {
                 self.advance(); // ':'
                 self.parse_type()?
@@ -591,6 +592,7 @@ impl<'src> Parser<'src> {
                 Node::Comprehension {
                     element: first,
                     var,
+                    var_span,
                     var_type,
                     source,
                 },

@@ -1,8 +1,7 @@
 // SPDX-License-Identifier: MIT
-#![cfg(feature = "llvm")]
 
 //! End-to-end matrix tests: literal init, element read/write, slicing, built-in members,
-//! iteration, identity, and PinpValue::Matrix round-trips. Requires the `llvm` feature.
+//! iteration, identity, and PinpValue::Matrix round-trips.
 //!
 //! Tests are ordered by the codegen step that makes them pass. Steps 13–19 light them up
 //! progressively; until then they fail on a `todo!()` in the still-unimplemented path.
@@ -10,7 +9,7 @@
 mod common;
 use common::{eval_array, eval_float, eval_int, eval_matrix};
 use indoc::indoc;
-use pinp::codegen::{PinpJit, PinpValue};
+use pinp::codegen::PinpValue;
 
 // -----------------------------------------------------------------------------------------
 // Step 13 — matrix literal allocation and element stores
@@ -205,7 +204,7 @@ fn index2d_scalar_read_float() {
 
 #[test]
 fn index2d_row_oob_is_runtime_error() {
-    let error = PinpJit::eval(indoc! {"
+    let error = common::eval_result(indoc! {"
         mat = [1, 2; 3, 4]
         mat[5, 0]
     "})
@@ -215,7 +214,7 @@ fn index2d_row_oob_is_runtime_error() {
 
 #[test]
 fn index2d_col_oob_is_runtime_error() {
-    let error = PinpJit::eval(indoc! {"
+    let error = common::eval_result(indoc! {"
         mat = [1, 2; 3, 4]
         mat[0, 5]
     "})
@@ -226,7 +225,7 @@ fn index2d_col_oob_is_runtime_error() {
 #[test]
 fn index2d_negative_row_oob_is_runtime_error() {
     // -3 on a 2-row matrix: effective = -3 + 2 = -1 — still OOB.
-    let error = PinpJit::eval(indoc! {"
+    let error = common::eval_result(indoc! {"
         mat = [1, 2; 3, 4]
         i = 0 - 3
         mat[i, 0]
@@ -522,7 +521,7 @@ fn indexed_assign2d_multiple_writes_last_wins() {
 
 #[test]
 fn indexed_assign2d_row_oob_is_runtime_error() {
-    let error = PinpJit::eval(indoc! {"
+    let error = common::eval_result(indoc! {"
         mat = [1, 2; 3, 4]
         mat[5, 0] = 99
     "})
@@ -532,7 +531,7 @@ fn indexed_assign2d_row_oob_is_runtime_error() {
 
 #[test]
 fn indexed_assign2d_col_oob_is_runtime_error() {
-    let error = PinpJit::eval(indoc! {"
+    let error = common::eval_result(indoc! {"
         mat = [1, 2; 3, 4]
         mat[0, 5] = 99
     "})
@@ -543,7 +542,7 @@ fn indexed_assign2d_col_oob_is_runtime_error() {
 #[test]
 fn indexed_assign2d_negative_row_is_runtime_error() {
     // -3 on a 2-row matrix: effective = -3 + 2 = -1 — still OOB.
-    let error = PinpJit::eval(indoc! {"
+    let error = common::eval_result(indoc! {"
         mat = [1, 2; 3, 4]
         i = 0 - 3
         mat[i, 0] = 99
@@ -609,7 +608,7 @@ fn negative_index_2d_variable_reads_element() {
 
 #[test]
 fn negative_index_2d_variable_row_oob_is_runtime_error() {
-    let error = PinpJit::eval(indoc! {"
+    let error = common::eval_result(indoc! {"
         mat = [1, 2; 3, 4; 5, 6; 7, 8]
         r = 0 - 5
         mat[r, 0]
@@ -670,4 +669,12 @@ fn indexed_compound_assign_2d_doubles_element() {
     assert_eq!(elements[1], PinpValue::Int(20)); // was 2, now 2 * 10
     assert_eq!(elements[2], PinpValue::Int(3));
     assert_eq!(elements[3], PinpValue::Int(4));
+}
+
+#[test]
+fn an_underscore_value_binder_visits_every_cell() {
+    assert_eq!(
+        eval_int("m = [1, 2; 3, 4]\nn = 0\nfor r, c, _ in m\n    n += r * 2 + c\nn"),
+        6
+    );
 }

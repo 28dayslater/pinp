@@ -160,16 +160,14 @@ impl Analyzer<'_, '_> {
                 self.check_condition(*cond)?;
                 Ok(())
             }
-            Stmt::For { var, source, body } => {
+            Stmt::For {
+                var, source, body, ..
+            } => {
                 let source_type = self.analyze_expr(*source)?;
                 // Range → Int counter; Array/Matrix → element type; anything else → error.
                 let var_type = match source_type {
                     PinpType::Range => PinpType::Int,
                     PinpType::Array(elem_type, _) | PinpType::Matrix(elem_type, _, _) => {
-                        if self.name(*var) == "_" {
-                            let kind = SemaErrorKind::Type("Value binder must not be `_`.".into());
-                            return Err(self.error_at_expr(*source, kind));
-                        }
                         PinpType::from(elem_type)
                     }
                     other => {
@@ -191,6 +189,7 @@ impl Analyzer<'_, '_> {
                 binders,
                 source,
                 body,
+                ..
             } => {
                 let source_type = self.analyze_expr(*source)?;
                 let mut frame = FxHashMap::default();
@@ -209,10 +208,6 @@ impl Analyzer<'_, '_> {
                             SemaErrorKind::Type("Binder count does not match array rank.".into());
                         return Err(self.error_at_expr(*source, kind));
                     }
-                }
-                if self.name(*binders.last().unwrap()) == "_" {
-                    let kind = SemaErrorKind::Type("Value binder must not be `_`.".into());
-                    return Err(self.error_at_expr(*source, kind));
                 }
                 // Binders share one scope frame, so a repeated name would silently keep only the
                 // last position's value. `_` is the discard binder and may repeat freely.
@@ -452,6 +447,7 @@ impl Analyzer<'_, '_> {
                 var,
                 var_type,
                 source,
+                ..
             } => self.comprehension_type(element, var, var_type, source)?,
             Node::MatrixLiteral { rows } => self.matrix_literal_type(&rows)?,
             Node::Index2D { matrix, row, col } => self.matrix_index2d_type(matrix, row, col)?,

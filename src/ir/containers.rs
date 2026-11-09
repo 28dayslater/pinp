@@ -2,6 +2,392 @@
 
 //! Typed ids and the containers the IR is built from: `IdVec` (owns items and creates their ids),
 //! `SideTable` (per-id data with a default), and `List` handles into a shared `ListPool`.
+//!
+//! An id is a `u32` index wrapped in its own type, so a `LocalId` cannot be used where a `NodeId`
+//! is expected. It is stored as `index + 1` in a `NonZeroU32`, which lets `Option<Id>` use the
+//! forbidden zero for `None` and stay 4 bytes.
+
+use std::fmt::Debug;
+use std::hash::Hash;
+use std::marker::PhantomData;
+use std::ops::{Index, IndexMut};
+
+/// A `u32` index with a type of its own. Implemented by [`typed_id!`].
+///
+/// # Safety
+///
+/// The implementing type must be `#[repr(transparent)]` over a `NonZeroU32` holding `index + 1`:
+/// [`ListPool`] stores ids as that raw `u32` and hands them back as a slice of the id type.
+pub unsafe trait TypedId: Copy + Eq + Ord + Hash + Debug {
+    /// The id with this index; panics on `u32::MAX`.
+    fn from_index(index: u32) -> Self;
+    /// This id's index, counting from 0.
+    fn index(self) -> u32;
+}
+
+/// Declares a typed id: `typed_id!(NodeId);`.
+macro_rules! typed_id {
+    ($(#[$attribute:meta])* $name:ident) => {
+        $(#[$attribute])*
+        #[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+        #[repr(transparent)]
+        pub struct $name(std::num::NonZeroU32);
+
+        impl $name {
+            /// The id with this index. `u32::MAX` is given up so that `Option` fits in 4 bytes.
+            pub const fn from_index(index: u32) -> $name {
+                match std::num::NonZeroU32::new(index.wrapping_add(1)) {
+                    Some(stored) => $name(stored),
+                    None => panic!("Id index out of range."),
+                }
+            }
+
+            pub const fn index(self) -> u32 {
+                self.0.get() - 1
+            }
+        }
+
+        // SAFETY: `repr(transparent)` over a `NonZeroU32` holding `index + 1`.
+        unsafe impl $crate::ir::TypedId for $name {
+            fn from_index(index: u32) -> $name {
+                $name::from_index(index)
+            }
+
+            fn index(self) -> u32 {
+                $name::index(self)
+            }
+        }
+
+        impl std::fmt::Debug for $name {
+            fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+                write!(formatter, "{}({})", stringify!($name), self.index())
+            }
+        }
+    };
+}
+pub(crate) use typed_id;
+
+fn position<Id: TypedId>(id: Id) -> usize {
+    id.index() as usize
+}
+
+fn id_at<Id: TypedId>(position: usize) -> Id {
+    Id::from_index(u32::try_from(position).expect("Too many ids."))
+}
+
+/// Owns its items and creates their ids: `push` returns the next id, and only that id type
+/// indexes the vector.
+#[derive(Debug, Clone)]
+pub struct IdVec<Id, T> {
+    items: Vec<T>,
+    id: PhantomData<Id>,
+}
+
+impl<Id, T> Default for IdVec<Id, T> {
+    fn default() -> Self {
+        IdVec {
+            items: Vec::new(),
+            id: PhantomData,
+        }
+    }
+}
+
+impl<Id: TypedId, T> IdVec<Id, T> {
+    pub fn with_capacity(capacity: usize) -> Self {
+        IdVec {
+            items: Vec::with_capacity(capacity),
+            id: PhantomData,
+        }
+    }
+
+    /// Stores `item` and returns its new id.
+    pub fn push(&mut self, item: T) -> Id {
+        let id = self.next_id();
+        self.items.push(item);
+        id
+    }
+
+    /// The id the next `push` will return.
+    pub fn next_id(&self) -> Id {
+        id_at(self.items.len())
+    }
+
+    pub fn get(&self, id: Id) -> Option<&T> {
+        self.items.get(position(id))
+    }
+
+    pub fn len(&self) -> usize {
+        self.items.len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.items.is_empty()
+    }
+
+    pub fn capacity(&self) -> usize {
+        self.items.capacity()
+    }
+
+    /// Forgets every item; ids start again from zero.
+    pub fn clear(&mut self) {
+        self.items.clear();
+    }
+
+    pub fn iter(&self) -> impl Iterator<Item = (Id, &T)> {
+        self.items
+            .iter()
+            .enumerate()
+            .map(|(index, item)| (id_at(index), item))
+    }
+
+    /// The items in id order, consuming the vector.
+    pub fn into_items(self) -> impl Iterator<Item = T> {
+        self.items.into_iter()
+    }
+}
+
+impl<Id: TypedId, T> Index<Id> for IdVec<Id, T> {
+    type Output = T;
+
+    fn index(&self, id: Id) -> &T {
+        &self.items[position(id)]
+    }
+}
+
+impl<Id: TypedId, T> IndexMut<Id> for IdVec<Id, T> {
+    fn index_mut(&mut self, id: Id) -> &mut T {
+        &mut self.items[position(id)]
+    }
+}
+
+/// Extra data about items another container owns, indexed by their ids. An entry never written
+/// reads as the default, so the table grows only as far as the highest id actually written.
+#[derive(Debug, Clone)]
+pub struct SideTable<Id, T> {
+    items: Vec<T>,
+    default: T,
+    id: PhantomData<Id>,
+}
+
+impl<Id, T: Default> Default for SideTable<Id, T> {
+    fn default() -> Self {
+        SideTable::new(T::default())
+    }
+}
+
+impl<Id, T> SideTable<Id, T> {
+    pub fn new(default: T) -> Self {
+        SideTable {
+            items: Vec::new(),
+            default,
+            id: PhantomData,
+        }
+    }
+
+    /// Resets every entry to the default.
+    pub fn clear(&mut self) {
+        self.items.clear();
+    }
+}
+
+impl<Id: TypedId, T> Index<Id> for SideTable<Id, T> {
+    type Output = T;
+
+    fn index(&self, id: Id) -> &T {
+        self.items.get(position(id)).unwrap_or(&self.default)
+    }
+}
+
+impl<Id: TypedId, T: Clone> IndexMut<Id> for SideTable<Id, T> {
+    fn index_mut(&mut self, id: Id) -> &mut T {
+        let position = position(id);
+        if position >= self.items.len() {
+            self.items.resize(position + 1, self.default.clone());
+        }
+        &mut self.items[position]
+    }
+}
+
+/// A list of ids stored in a [`ListPool`]: 4 bytes, where a `Vec` would take 24. It is only an
+/// index, so it means nothing without the pool it came from.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct List<T> {
+    /// Where the first item sits in the pool; 0 is the empty list, which takes no space.
+    start: u32,
+    item: PhantomData<T>,
+}
+
+impl<T> List<T> {
+    pub const EMPTY: List<T> = List {
+        start: 0,
+        item: PhantomData,
+    };
+
+    pub fn is_empty(self) -> bool {
+        self.start == 0
+    }
+}
+
+impl<T> Default for List<T> {
+    fn default() -> Self {
+        List::EMPTY
+    }
+}
+
+/// Storage for every [`List`] of one function, whatever their id type.
+///
+/// Each list lives in a block of 4, 8, 16, … slots: its length, then its items, then spare room,
+/// so most insertions need no move. A list that outgrows its block moves to a block twice the
+/// size, and the old block joins a free list for its size — linked through the free blocks
+/// themselves — for the next list of that size to reuse. The design follows Cranelift's
+/// `ListPool`.
+#[derive(Debug, Clone, Default)]
+pub struct ListPool {
+    slots: Vec<u32>,
+    /// Per size class, the most recently freed block plus one; 0 when none is free.
+    free: Vec<u32>,
+}
+
+/// Size class `class` has blocks of `4 << class` slots.
+fn block_size(class: usize) -> usize {
+    4 << class
+}
+
+/// The smallest size class whose blocks hold `length` items and the length itself.
+fn size_class(length: usize) -> usize {
+    (length + 1).next_power_of_two().max(4).trailing_zeros() as usize - 2
+}
+
+impl ListPool {
+    pub fn with_capacity(slots: usize) -> Self {
+        ListPool {
+            slots: Vec::with_capacity(slots),
+            free: Vec::new(),
+        }
+    }
+
+    /// Slots in use or on a free list; free blocks are never returned.
+    pub fn slot_count(&self) -> usize {
+        self.slots.len()
+    }
+
+    /// Forgets every list; handles into the pool become meaningless.
+    pub fn clear(&mut self) {
+        self.slots.clear();
+        self.free.clear();
+    }
+
+    /// A new list holding `items`.
+    pub fn list<T: TypedId>(&mut self, items: &[T]) -> List<T> {
+        if items.is_empty() {
+            return List::EMPTY;
+        }
+        let block = self.allocate(size_class(items.len()));
+        self.slots[block] = items.len() as u32;
+        for (slot, item) in self.slots[block + 1..].iter_mut().zip(items) {
+            *slot = item.index() + 1;
+        }
+        List {
+            start: (block + 1) as u32,
+            item: PhantomData,
+        }
+    }
+
+    pub fn items<T: TypedId>(&self, list: List<T>) -> &[T] {
+        let start = list.start as usize;
+        let items = &self.slots[start..start + self.length(list)];
+        // SAFETY: `T` is `repr(transparent)` over a `NonZeroU32` (the `TypedId` contract), and
+        // item slots only ever hold `index + 1` of a `T`, which is never zero.
+        unsafe { std::slice::from_raw_parts(items.as_ptr().cast::<T>(), items.len()) }
+    }
+
+    pub fn push<T: TypedId>(&mut self, list: &mut List<T>, item: T) {
+        self.insert(list, self.length(*list), item);
+    }
+
+    /// Inserts `item` before position `at`; panics past the end, like `Vec::insert`.
+    pub fn insert<T: TypedId>(&mut self, list: &mut List<T>, at: usize, item: T) {
+        let length = self.length(*list);
+        assert!(at <= length, "Insertion past the end of a list.");
+        if list.is_empty() {
+            *list = self.list(&[item]);
+            return;
+        }
+        let (class, new_class) = (size_class(length), size_class(length + 1));
+        if new_class != class {
+            self.relocate(list, length, class, new_class);
+        }
+        let block = list.start as usize - 1;
+        let items = block + 1;
+        self.slots
+            .copy_within(items + at..items + length, items + at + 1);
+        self.slots[items + at] = item.index() + 1;
+        self.slots[block] = (length + 1) as u32;
+    }
+
+    /// Removes and returns the item at position `at`; panics past the end, like `Vec::remove`.
+    pub fn remove<T: TypedId>(&mut self, list: &mut List<T>, at: usize) -> T {
+        let length = self.length(*list);
+        assert!(at < length, "Removal past the end of a list.");
+        let block = list.start as usize - 1;
+        let items = block + 1;
+        let removed = T::from_index(self.slots[items + at] - 1);
+        self.slots
+            .copy_within(items + at + 1..items + length, items + at);
+        self.slots[block] = (length - 1) as u32;
+        let (class, new_class) = (size_class(length), size_class(length - 1));
+        if length == 1 {
+            self.release(block, class);
+            *list = List::EMPTY;
+        } else if new_class != class {
+            self.relocate(list, length - 1, class, new_class);
+        }
+        removed
+    }
+
+    /// Moves a list of `length` items from its block of size class `class` to a new block of
+    /// `new_class`, so that a block's class always matches the length of the list in it.
+    fn relocate<T>(&mut self, list: &mut List<T>, length: usize, class: usize, new_class: usize) {
+        let block = list.start as usize - 1;
+        let new_block = self.allocate(new_class);
+        self.slots.copy_within(block..=block + length, new_block);
+        self.release(block, class);
+        list.start = (new_block + 1) as u32;
+    }
+
+    fn length<T>(&self, list: List<T>) -> usize {
+        match list.start {
+            0 => 0,
+            start => self.slots[start as usize - 1] as usize,
+        }
+    }
+
+    /// A free block of size class `class`: a reused one if any, otherwise new slots at the end.
+    fn allocate(&mut self, class: usize) -> usize {
+        match self.free.get(class) {
+            Some(&head) if head != 0 => {
+                let block = head as usize - 1;
+                self.free[class] = self.slots[block + 1];
+                block
+            }
+            _ => {
+                let block = self.slots.len();
+                self.slots.resize(block + block_size(class), 0);
+                block
+            }
+        }
+    }
+
+    /// Puts a block on its size class's free list; its second slot links to the previous head.
+    fn release(&mut self, block: usize, class: usize) {
+        if self.free.len() <= class {
+            self.free.resize(class + 1, 0);
+        }
+        self.slots[block] = 0;
+        self.slots[block + 1] = self.free[class];
+        self.free[class] = (block + 1) as u32;
+    }
+}
 
 #[cfg(test)]
 mod tests {
@@ -99,6 +485,14 @@ mod tests {
         let green = colours.push("green");
         let pairs: Vec<(AppleId, &&str)> = colours.iter().collect();
         assert_eq!(pairs, vec![(red, &"red"), (green, &"green")]);
+    }
+
+    #[test]
+    fn consuming_yields_the_items_in_id_order() {
+        let mut colours = IdVec::<AppleId, &str>::default();
+        colours.push("red");
+        colours.push("green");
+        assert_eq!(colours.into_items().collect::<Vec<_>>(), ["red", "green"]);
     }
 
     #[test]
@@ -354,7 +748,7 @@ mod tests {
             (seed >> 33) as usize % bound
         };
         let mut pool = ListPool::default();
-        let mut lists = vec![List::<AppleId>::EMPTY; 5];
+        let mut lists = [List::<AppleId>::EMPTY; 5];
         let mut models: Vec<Vec<AppleId>> = vec![Vec::new(); 5];
         for step in 0..2000u32 {
             let which = next(lists.len());

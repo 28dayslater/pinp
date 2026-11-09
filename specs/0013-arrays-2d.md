@@ -184,7 +184,7 @@ section.
 
 ---
 
-## Step 1 — Data model ([parser/ast.rs](src/parser/ast.rs))
+## Step 1 — Data model ([parser/ast.rs](../src/parser/ast.rs))
 
 ### `PinpType::Matrix`
 
@@ -245,7 +245,7 @@ Elements are in row-major order. `PinpValue` already gave up `Copy` in 0012; add
 
 ---
 
-## Step 2 — Lexer ([src/lexer.rs](src/lexer.rs))
+## Step 2 — Lexer ([src/lexer.rs](../src/lexer.rs))
 
 Add `Semicolon` to both `Lexeme` and `TokenKind`; map `;` → `Lexeme::Semicolon` in the
 character dispatcher before the number/identifier/symbol matchers. The `;` character is
@@ -253,7 +253,7 @@ currently unrecognised; it appears in no existing test source, so no existing te
 
 ---
 
-## Step 3 — Parser: matrix literal ([src/parser/expr.rs](src/parser/expr.rs))
+## Step 3 — Parser: matrix literal ([src/parser/expr.rs](../src/parser/expr.rs))
 
 Extend the `LBracket` null denotation (which already handles `ArrayLiteral` and
 `Comprehension`). After parsing the first row's element list:
@@ -271,7 +271,7 @@ that starts on a new line must align its first element to that column.
 
 ---
 
-## Step 4 — Parser: 2D indexing and slicing ([src/parser/expr.rs](src/parser/expr.rs))
+## Step 4 — Parser: 2D indexing and slicing ([src/parser/expr.rs](../src/parser/expr.rs))
 
 Extend the `LBracket` left denotation (which already handles 1D `Node::Index`). After parsing
 the first dimension selector:
@@ -287,7 +287,7 @@ Parsing a dimension selector (used for both dimensions):
 
 ---
 
-## Step 5 — Parser: ForArray and IndexedAssign2D ([src/parser/stmt.rs](src/parser/stmt.rs))
+## Step 5 — Parser: ForArray and IndexedAssign2D ([src/parser/stmt.rs](../src/parser/))
 
 ### `Stmt::ForArray`
 
@@ -305,7 +305,7 @@ be `Var`/`Global`, else `ParseError`), parse the RHS, and build `Stmt::IndexedAs
 
 ---
 
-## Step 6 — Sema: Matrix type integration ([src/sema/](src/sema/))
+## Step 6 — Sema: Matrix type integration ([src/sema/](../src/sema/))
 
 Extend `join` and `assignable`:
 
@@ -318,7 +318,7 @@ Extend `gen_entry` to permit `PinpType::Matrix` as a valid return type (alongsid
 
 ---
 
-## Step 7 — Sema: matrix literal ([src/sema/expr.rs](src/sema/expr.rs))
+## Step 7 — Sema: matrix literal ([src/sema/expr.rs](../src/sema/))
 
 `Node::MatrixLiteral { rows }`:
 
@@ -331,7 +331,7 @@ Extend `gen_entry` to permit `PinpType::Matrix` as a valid return type (alongsid
 
 ---
 
-## Step 8 — Sema: 2D indexing and slicing ([src/sema/expr.rs](src/sema/expr.rs))
+## Step 8 — Sema: 2D indexing and slicing ([src/sema/expr.rs](../src/sema/))
 
 `Node::Index2D { matrix, row, col }`:
 
@@ -356,7 +356,7 @@ Extend `gen_entry` to permit `PinpType::Matrix` as a valid return type (alongsid
 
 ---
 
-## Step 9 — Sema: built-in members ([src/sema/expr.rs](src/sema/expr.rs))
+## Step 9 — Sema: built-in members ([src/sema/expr.rs](../src/sema/))
 
 Extend `Node::Member` handling:
 
@@ -370,7 +370,7 @@ Extend `Node::Member` handling:
 
 ---
 
-## Step 10 — Sema: `identity` built-in ([src/sema/expr.rs](src/sema/expr.rs))
+## Step 10 — Sema: `identity` built-in ([src/sema/expr.rs](../src/sema/))
 
 `Node::Call` with `callee == "identity"` is intercepted before the normal function-call path:
 
@@ -388,7 +388,7 @@ The check is in `analyze_func`, before the body is typed.
 
 ---
 
-## Step 11 — Sema: `ForArray` and extended `For` ([src/sema/analyzer.rs](src/sema/analyzer.rs))
+## Step 11 — Sema: `ForArray` and extended `For` ([src/sema/analyzer.rs](../src/sema/analyzer.rs))
 
 ### Extended `Stmt::For` (1-binder, array/matrix source)
 
@@ -424,7 +424,7 @@ All binders are pushed to `loop_vars` for the read-only guard.
 
 ---
 
-## Step 12 — Codegen: Matrix type ([src/codegen/mod.rs](src/codegen/mod.rs))
+## Step 12 — Codegen: Matrix type ([src/codegen/mod.rs](../src/codegen/mod.rs))
 
 - `basic_type(PinpType::Matrix(_, _, _))` → opaque pointer (same as `Array`; a matrix is a
   heap pointer to a contiguous row-major block).
@@ -434,7 +434,7 @@ All binders are pushed to `loop_vars` for the read-only guard.
 
 ---
 
-## Step 13 — Codegen: matrix literal + host readback ([src/codegen/expr.rs](src/codegen/expr.rs), [src/codegen/mod.rs](src/codegen/mod.rs))
+## Step 13 — Codegen: matrix literal + host readback ([src/codegen/expr.rs](../src/codegen/llvm/expr.rs), [src/codegen/mod.rs](../src/codegen/mod.rs))
 
 ### `gen_matrix_literal`
 
@@ -468,7 +468,7 @@ PinpType::Matrix(elem_type, rows, cols) => {
 
 ---
 
-## Step 14 — Codegen: `identity` ([src/codegen/expr.rs](src/codegen/expr.rs))
+## Step 14 — Codegen: `identity` ([src/codegen/expr.rs](../src/codegen/llvm/expr.rs))
 
 `Node::Call` intercepted for `identity`:
 
@@ -479,7 +479,7 @@ PinpType::Matrix(elem_type, rows, cols) => {
 
 ---
 
-## Step 15 — Codegen: 2D indexing and slicing ([src/codegen/expr.rs](src/codegen/expr.rs))
+## Step 15 — Codegen: 2D indexing and slicing ([src/codegen/expr.rs](../src/codegen/llvm/expr.rs))
 
 `Node::Index2D` — dispatch on sema-determined result type:
 
@@ -508,7 +508,7 @@ The copy loops for slices follow the same counted-loop shape as `Comprehension`.
 
 ---
 
-## Step 16 — Codegen: built-in members ([src/codegen/expr.rs](src/codegen/expr.rs))
+## Step 16 — Codegen: built-in members ([src/codegen/expr.rs](../src/codegen/llvm/expr.rs))
 
 `Node::Member` extended:
 
@@ -522,7 +522,7 @@ All are compile-time constants; no pointer load needed.
 
 ---
 
-## Step 17 — Codegen: `for`-array iteration ([src/codegen/stmt.rs](src/codegen/stmt.rs))
+## Step 17 — Codegen: `for`-array iteration ([src/codegen/stmt.rs](../src/codegen/llvm/stmt.rs))
 
 ### Extended `Stmt::For` (1-binder, Array/Matrix source)
 
@@ -554,7 +554,7 @@ All binders are pushed into the loop scope read-only (via `loop_vars`).
 
 ---
 
-## Step 18 — Codegen: `IndexedAssign2D` ([src/codegen/stmt.rs](src/codegen/stmt.rs))
+## Step 18 — Codegen: `IndexedAssign2D` ([src/codegen/stmt.rs](../src/codegen/llvm/stmt.rs))
 
 Same structure as `IndexedAssign` for 1D:
 
@@ -564,7 +564,7 @@ Same structure as `IndexedAssign` for 1D:
 
 ---
 
-## Step 19 — Negative indexing ([src/sema/](src/sema/), [src/codegen/expr.rs](src/codegen/expr.rs))
+## Step 19 — Negative indexing ([src/sema/](../src/sema/), [src/codegen/expr.rs](../src/codegen/llvm/expr.rs))
 
 Python-style negative indices: `i < 0` addresses element `len + i` from the start, so `-1` is
 the last element and `-len` is the first. No parser change is required — a negative index already
