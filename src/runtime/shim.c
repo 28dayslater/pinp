@@ -9,10 +9,11 @@
 #include <mimalloc.h>
 #include <setjmp.h>
 
-// pinp's JIT executes single-threaded, so plain counters are enough — no atomics.
-static int64_t outstanding_bytes = 0;
-static int64_t allocation_count = 0;
-static int64_t free_count = 0;
+// A program runs on one thread, but several threads may each run their own (the test
+// harness does), so the counters are per thread — no atomics, and no thread sees another's.
+static _Thread_local int64_t outstanding_bytes = 0;
+static _Thread_local int64_t allocation_count = 0;
+static _Thread_local int64_t free_count = 0;
 
 void *pinp_alloc(size_t size) {
     void *ptr = mi_malloc(size);
@@ -43,8 +44,9 @@ void pinp_memory_info(pinp_mem_info *out) {
 // Runtime error recovery
 // ---------------------------------------------------------------------------
 
-static jmp_buf  pinp_jmpbuf;
-static const char *pinp_pending_error = NULL;
+// Per thread too: an error must land in the `pinp_run` frame of the thread that raised it.
+static _Thread_local jmp_buf pinp_jmpbuf;
+static _Thread_local const char *pinp_pending_error = NULL;
 
 void pinp_runtime_error(const char *message) {
     pinp_pending_error = message;

@@ -5,8 +5,6 @@
 //! These go through the public [`pinp::analysis::check`] rather than a single checker, so they
 //! cover what a user of the layer actually sees — every checker over every function, findings in
 //! source order, each resolved to a line and column.
-//!
-//! No `llvm` feature: the analysis layer reads a typed AST and knows nothing about the backend.
 
 use pinp::analysis::{Diagnostic, check};
 use pinp::lexer::LineIndex;
@@ -23,7 +21,10 @@ fn findings(src: &str) -> Vec<(&'static str, u32, u32, String)> {
         .map(|diagnostic: Diagnostic| {
             let (line, column) = line_index.locate(diagnostic.span.start);
             (
-                diagnostic.code.code(),
+                diagnostic
+                    .code
+                    .expect("a checker finding always carries a code")
+                    .code(),
                 line,
                 column,
                 diagnostic.span.text(src).to_string(),
@@ -44,7 +45,7 @@ total
 }
 
 #[test]
-fn an_unused_binding_is_located() {
+fn an_unused_variable_is_located() {
     let src = "\
 kept = 1
 spare = 2
@@ -52,7 +53,7 @@ kept
 ";
     assert_eq!(
         findings(src),
-        vec![("PINP0103", 2, 1, "spare".to_string())],
+        vec![("PINP1003", 2, 1, "spare".to_string())],
         "line 2, column 1 — where `spare` is written"
     );
 }
@@ -64,7 +65,7 @@ a = 1
 a = 2
 a
 ";
-    assert_eq!(findings(src), vec![("PINP0102", 1, 1, "a".to_string())]);
+    assert_eq!(findings(src), vec![("PINP1002", 1, 1, "a".to_string())]);
 }
 
 #[test]
@@ -75,7 +76,7 @@ while false
     n = 2
 n
 ";
-    assert_eq!(findings(src), vec![("PINP0101", 3, 5, "n".to_string())]);
+    assert_eq!(findings(src), vec![("PINP1001", 3, 5, "n".to_string())]);
 }
 
 #[test]
@@ -97,9 +98,9 @@ first
         "findings must be ordered by position, got {found:?}"
     );
     let codes: Vec<&str> = found.iter().map(|(code, _, _, _)| *code).collect();
-    assert!(codes.contains(&"PINP0102"), "the overwritten `first`");
-    assert!(codes.contains(&"PINP0103"), "`never_read`");
-    assert!(codes.contains(&"PINP0101"), "the dead `if` arm");
+    assert!(codes.contains(&"PINP1002"), "the overwritten `first`");
+    assert!(codes.contains(&"PINP1003"), "`never_read`");
+    assert!(codes.contains(&"PINP1001"), "the dead `if` arm");
 }
 
 #[test]
@@ -112,7 +113,7 @@ compute(3)
 ";
     assert_eq!(
         findings(src),
-        vec![("PINP0103", 2, 5, "spare".to_string())],
+        vec![("PINP1003", 2, 5, "spare".to_string())],
         "the function's own graph is checked"
     );
 }
@@ -150,7 +151,7 @@ fn a_rendered_finding_reads_as_a_diagnostic() {
         .collect();
     assert_eq!(
         rendered,
-        vec!["1:1: warning[PINP0103]: Binding `spare` is never read.".to_string()]
+        vec!["1:1: warning[PINP1003]: Variable `spare` is never used.".to_string()]
     );
 }
 
@@ -170,4 +171,37 @@ fn analysis_never_reports_on_the_language_test_programs() {
     ] {
         assert_eq!(findings(src), Vec::new(), "false positive on:\n{src}");
     }
+}
+
+#[test]
+fn a_loop_counting_down_is_not_dead() {
+    // An inclusive range without a step counts toward its stop: `5..1` runs five times.
+    let src = "\
+total = 0
+for idx in 5..1
+    total += idx
+total
+";
+    assert_eq!(findings(src), Vec::new());
+}
+
+#[test]
+fn an_unread_loop_value_is_located() {
+    let src = "\
+a = [1, 2]
+count = 0
+for value in a
+    count += 1
+count
+";
+    assert_eq!(findings(src), vec![("PINP1003", 3, 5, "value".to_string())]);
+}
+
+#[test]
+fn a_dead_if_expression_arm_is_located() {
+    let src = "\
+x = 10 if false else 20
+x
+";
+    assert_eq!(findings(src), vec![("PINP1001", 1, 5, "10".to_string())]);
 }

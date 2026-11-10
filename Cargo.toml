@@ -4,17 +4,13 @@ version = "0.1.0"
 edition = "2024"
 license = "MIT"
 
-[features]
-# The LLVM backend is on by default — it is core to pinp (the whole point is compiling
-# to LLVM), so a plain `cargo build`/`cargo test` exercises the full pipeline (needs LLVM 22
-# installed). Build the front-end (lexer/parser/sema) alone — no system LLVM required — with
-# `cargo build --no-default-features`.
-default = ["llvm"]
-llvm = ["dep:inkwell"]
-
 [dependencies]
 indoc = "2.0.7"
 logos = "0.16.1"
 rustc-hash = "2.1.2"
-inkwell = { version = "0.9", features = ["llvm22-1"], optional = true }
 ryu = "1.0.23"
+cranelift-codegen = "0.137"
+cranelift-frontend = "0.137"
+cranelift-jit = "0.137"
+cranelift-module = "0.137"
+cranelift-native = "0.137"

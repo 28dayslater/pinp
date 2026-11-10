@@ -24,9 +24,10 @@ The code is a teaching showcase — favor clear, explicit names over terse ones.
 
   | pass | verb | prefix |
   |---|---|---|
-  | AST → LLVM IR | *generate* / "lower **to LLVM IR**" | `gen_*` (`src/codegen/`) |
-  | AST → control-flow graph | *build* / "CFG **construction**" | `build_*` (`src/analysis/cfg.rs`) |
-  | CFG × analysis → facts | *solve* | `solve` (`src/analysis/dataflow.rs`) |
+  | AST → structured IR | *desugar* | — (`src/desugar/`) |
+  | structured IR → flat IR | *flatten* | — (`src/flatten/`) |
+  | flat IR → Cranelift IR | *emit* | `emit_*` (`src/codegen/cranelift/`) |
+  | flat IR × analysis → facts | *solve* | `solve` (`src/analysis/dataflow.rs`) |
   | facts → diagnostics | *check* | `check_*` (`src/analysis/checks/`) |
 
   In prose, "lowering" without a named target is a review comment.

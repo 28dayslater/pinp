@@ -10,7 +10,7 @@ use crate::lexer::Span;
 
 /// The scalar element types that an array may hold. A strict subset of [`PinpType`] so that
 /// `PinpType::Array` stays `Copy` (it stores an `ArrayElementType`, not a boxed `PinpType`).
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum ArrayElementType {
     Bool,
     Int,
@@ -29,7 +29,7 @@ impl From<ArrayElementType> for PinpType {
 
 /// The type of every expression and binding. `Void` is the type of a function with no declared
 /// return type (and of a call to one); a value-typed expression is never `Void`.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum PinpType {
     Bool,
     Int,
@@ -59,7 +59,7 @@ impl SymId {
 /// An index into [`ProgramAst::string_literals`]: the owned content of a [`Node::Str`] or of one
 /// literal run of a [`Node::FStr`]. Content is owned rather than a source slice because auto-dedent
 /// (and, later, escape processing) rewrite the bytes, so it cannot borrow the source.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct StrId(pub u32);
 
 impl StrId {
@@ -215,6 +215,8 @@ pub enum Node {
     Comprehension {
         element: ExprId,
         var: SymId,
+        /// Where the variable was written, without its type annotation.
+        var_span: Span,
         var_type: PinpType,
         source: ExprId,
     },
@@ -307,6 +309,8 @@ pub enum Stmt {
     /// loop variable), a 1D array (value only), or a 2D matrix (value only, row-major).
     For {
         var: SymId,
+        /// Where the binder was written; like a `Place`, a `SymId` has nowhere to hang a position.
+        var_span: Span,
         source: ExprId,
         body: Block,
     },
@@ -314,6 +318,8 @@ pub enum Stmt {
     /// 2 binders + 1D array → (index, value); 3 binders + 2D matrix → (row, col, value).
     ForArray {
         binders: Vec<SymId>,
+        /// Where each binder was written, in order.
+        binder_spans: Vec<Span>,
         source: ExprId,
         body: Block,
     },
@@ -322,6 +328,10 @@ pub enum Stmt {
     /// codegen loads the current element, applies `op`, and stores the result.
     IndexedAssign {
         target: Place,
+        /// Where the target name was written. Like `Assign::target_spans`, a `Place` has nowhere
+        /// to hang a position, and a rule that blames the target — not an array, not bound — has
+        /// to point at it.
+        target_span: Span,
         index: ExprId,
         value: ExprId,
         compound_op: Option<BinOp>,
@@ -329,6 +339,8 @@ pub enum Stmt {
     /// `mat[row, col] = value` or `mat[row, col] <op>= rhs` — write one element of a 2D matrix.
     IndexedAssign2D {
         target: Place,
+        /// Where the target name was written; see [`Stmt::IndexedAssign::target_span`].
+        target_span: Span,
         row: ExprId,
         col: ExprId,
         value: ExprId,
@@ -356,6 +368,9 @@ pub struct Block {
 #[derive(Debug, Clone, PartialEq)]
 pub struct FuncDef {
     pub name: SymId,
+    /// Where the name was written. Header rules (a built-in name, a `void` parameter) run before
+    /// any expression has been typed, so the declaration itself is the only thing to point at.
+    pub name_span: Span,
     pub params: Vec<Param>,
     pub return_type: PinpType,
     pub body: Block,
@@ -388,9 +403,9 @@ pub struct ProgramAst<'src> {
     pub builtin_members: Vec<Option<BuiltinMember>>,
     /// Parallel to `nodes`: where each node came from in the source.
     ///
-    /// Only the kinds a diagnostic currently points at are recorded — `Node::Var` and
-    /// `Node::Global`, the two a finding names — and every other node holds [`Span::UNKNOWN`].
-    /// Filling the rest is mechanical and needs no redesign; see KI in dev-docs.
+    /// Every expression node is recorded. A composite node — a binary operator, an index, a call —
+    /// covers its whole extent rather than just its operator or bracket, so a diagnostic about it
+    /// shows the reader everything that took part.
     pub spans: Vec<Span>,
     pub top_level: Vec<TopLevel>,
     pub names: Vec<&'src str>,
@@ -410,14 +425,9 @@ impl<'src> ProgramAst<'src> {
         self.types[expr_id.value()]
     }
 
-    /// Pushes a node, returning its id. Type and built-in member are left as placeholders for
-    /// sema to fill.
-    pub(super) fn push(&mut self, node: Node) -> ExprId {
-        self.push_spanned(node, Span::UNKNOWN)
-    }
-
-    /// [`push`](Self::push) for a node whose source position is known.
-    pub(super) fn push_spanned(&mut self, node: Node, span: Span) -> ExprId {
+    /// Pushes a node with the source position it came from, returning its id. Type and built-in
+    /// member are left as placeholders for sema to fill.
+    pub(super) fn push(&mut self, node: Node, span: Span) -> ExprId {
         let expr_id = ExprId(self.nodes.len() as u32);
         self.nodes.push(node);
         self.types.push(PinpType::Void);

@@ -1,8 +1,7 @@
 // SPDX-License-Identifier: MIT
-#![cfg(feature = "llvm")]
 
 //! End-to-end arrays: literal init, range-init comprehension, index read/write, `.len`,
-//! mutation, and bounds-check runtime errors. Requires the `llvm` feature.
+//! mutation, and bounds-check runtime errors.
 
 mod common;
 use common::{eval, eval_array, eval_bool, eval_int};
@@ -333,7 +332,7 @@ fn range_init_len_is_correct() {
 
 #[test]
 fn empty_array_literal_is_parse_error() {
-    let result = pinp::codegen::PinpJit::eval("[]");
+    let result = common::eval_result("[]");
     assert!(
         result.unwrap_err().contains("empty"),
         "expected empty-literal parse error"
@@ -342,7 +341,7 @@ fn empty_array_literal_is_parse_error() {
 
 #[test]
 fn bool_var_type_in_comprehension_is_sema_error() {
-    let result = pinp::codegen::PinpJit::eval("[x for x:bool in 0..3]");
+    let result = common::eval_result("[x for x:bool in 0..3]");
     assert!(
         result.unwrap_err().contains("bool"),
         "expected bool-annotation sema error"
@@ -351,7 +350,7 @@ fn bool_var_type_in_comprehension_is_sema_error() {
 
 #[test]
 fn empty_comprehension_range_is_sema_error() {
-    let result = pinp::codegen::PinpJit::eval("[x for x in 1..<1]");
+    let result = common::eval_result("[x for x in 1..<1]");
     assert!(
         result.unwrap_err().contains("empty"),
         "expected empty-range sema error"
@@ -362,7 +361,7 @@ fn empty_comprehension_range_is_sema_error() {
 
 #[test]
 fn index_too_high_is_runtime_error() {
-    let result = pinp::codegen::PinpJit::eval(indoc! {"
+    let result = common::eval_result(indoc! {"
         a = [1, 2, 3]
         a[3]
     "});
@@ -375,7 +374,7 @@ fn index_too_high_is_runtime_error() {
 #[test]
 fn negative_index_oob_is_error() {
     // -4 on a 3-element array: effective = -4 + 3 = -1 — still negative, still out of bounds.
-    let result = pinp::codegen::PinpJit::eval(indoc! {"
+    let result = common::eval_result(indoc! {"
         a = [1, 2, 3]
         a[-4]
     "});
@@ -387,7 +386,7 @@ fn negative_index_oob_is_error() {
 
 #[test]
 fn indexed_assign_out_of_bounds_is_runtime_error() {
-    let result = pinp::codegen::PinpJit::eval(indoc! {"
+    let result = common::eval_result(indoc! {"
         a = [1, 2, 3]
         a[5] = 99
         a[0]
@@ -451,7 +450,7 @@ fn indexed_assign_at_last_position_succeeds() {
 #[test]
 fn index_at_exactly_len_is_runtime_error() {
     // a[3] on a 3-element array: the index equals len, which is out of bounds.
-    let result = pinp::codegen::PinpJit::eval(indoc! {"
+    let result = common::eval_result(indoc! {"
         a = [1, 2, 3]
         a[3]
     "});
@@ -828,7 +827,7 @@ fn slice_assign_whole_array() {
 
 #[test]
 fn slice_variable_bounds_is_sema_error() {
-    let result = pinp::codegen::PinpJit::eval(indoc! {"
+    let result = common::eval_result(indoc! {"
         a = [1, 2, 3]
         n = 2
         a[0..n]
@@ -841,7 +840,7 @@ fn slice_variable_bounds_is_sema_error() {
 
 #[test]
 fn slice_with_step_is_sema_error() {
-    let result = pinp::codegen::PinpJit::eval(indoc! {"
+    let result = common::eval_result(indoc! {"
         a = [1, 2, 3, 4, 5]
         a[0..4:2]
     "});
@@ -850,7 +849,7 @@ fn slice_with_step_is_sema_error() {
 
 #[test]
 fn slice_oob_is_sema_error() {
-    let result = pinp::codegen::PinpJit::eval(indoc! {"
+    let result = common::eval_result(indoc! {"
         a = [1, 2, 3]
         a[0..3]
     "});
@@ -862,7 +861,7 @@ fn slice_oob_is_sema_error() {
 
 #[test]
 fn slice_descending_is_sema_error() {
-    let result = pinp::codegen::PinpJit::eval(indoc! {"
+    let result = common::eval_result(indoc! {"
         a = [1, 2, 3, 4, 5]
         a[4..>1]
     "});
@@ -873,7 +872,7 @@ fn slice_descending_is_sema_error() {
 
 #[test]
 fn range_init_empty_exclusive_is_sema_error() {
-    let result = pinp::codegen::PinpJit::eval("[1..<1]");
+    let result = common::eval_result("[1..<1]");
     assert!(
         result.unwrap_err().contains("empty"),
         "expected empty range-init sema error"
@@ -882,7 +881,7 @@ fn range_init_empty_exclusive_is_sema_error() {
 
 #[test]
 fn range_init_variable_bounds_is_sema_error() {
-    let result = pinp::codegen::PinpJit::eval(indoc! {"
+    let result = common::eval_result(indoc! {"
         n = 5
         [n..10]
     "});
@@ -920,7 +919,7 @@ fn negative_index_variable_reads_correct_element() {
 #[test]
 fn negative_index_variable_oob_is_runtime_error() {
     // -5 on a 4-element array: effective = -5 + 4 = -1 — still negative, still OOB.
-    let result = pinp::codegen::PinpJit::eval(indoc! {"
+    let result = common::eval_result(indoc! {"
         a = [1, 2, 3, 4]
         i = 0 - 5
         a[i]
@@ -953,7 +952,7 @@ fn negative_index_writes_first_middle_last() {
 
 #[test]
 fn negative_index_write_variable_oob_is_runtime_error() {
-    let result = pinp::codegen::PinpJit::eval(indoc! {"
+    let result = common::eval_result(indoc! {"
         a = [1, 2, 3, 4]
         i = 0 - 5
         a[i] = 99
@@ -1020,5 +1019,17 @@ fn indexed_compound_assign_index_evaluated_once() {
             arr
         "}),
         vec![PinpValue::Int(10), PinpValue::Int(25), PinpValue::Int(30)]
+    );
+}
+
+#[test]
+fn an_underscore_value_binder_runs_once_per_element() {
+    assert_eq!(
+        eval_int("a = [4, 5, 6]\nn = 0\nfor _ in a\n    n += 1\nn"),
+        3
+    );
+    assert_eq!(
+        eval_int("a = [4, 5, 6]\nn = 0\nfor i, _ in a\n    n += i\nn"),
+        3
     );
 }

@@ -1,8 +1,7 @@
 // SPDX-License-Identifier: MIT
-#![cfg(feature = "llvm")]
 
 //! End-to-end bool evaluation: literals, comparisons, logicals, chained comparisons, and bool
-//! flowing through function signatures and arithmetic. Requires the `llvm` feature.
+//! flowing through function signatures and arithmetic.
 
 mod common;
 use common::{eval_bool, eval_int};

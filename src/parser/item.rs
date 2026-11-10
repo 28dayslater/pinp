@@ -26,7 +26,7 @@ impl<'src> Parser<'src> {
     // -------------------------------------------------------------------------
 
     // Top level: a run of function definitions and statements, parsed until `Eof`.
-    pub(super) fn parse_program(&mut self) -> Result<(), ParseError> {
+    pub(super) fn parse_program(&mut self) -> Result<(), ParseErrorKind> {
         loop {
             self.pending_dedents = 0;
             self.depth = 0;
@@ -52,7 +52,7 @@ impl<'src> Parser<'src> {
                     TokenKind::Newline | TokenKind::Eof | TokenKind::Dedent => {}
                     _ if ended_at_layout => {}
                     other => {
-                        return Err(ParseError::Unexpected(format!(
+                        return Err(ParseErrorKind::Unexpected(format!(
                             "Unexpected token {other:?}."
                         )));
                     }
@@ -107,9 +107,10 @@ impl<'src> Parser<'src> {
     }
 
     // `<name>(<params>) [: <type>] is <body>` — a function definition.
-    fn parse_func_def(&mut self) -> Result<(), ParseError> {
+    fn parse_func_def(&mut self) -> Result<(), ParseErrorKind> {
         let name_token = self.advance(); // Identifier
         let name = self.ast.intern(name_token.text);
+        let name_span = name_token.span();
         self.expect(TokenKind::LParen)?;
         let params = self.parse_params(name_token.line, name_token.col)?; // line/col anchor the hung-param rule
         self.expect(TokenKind::RParen)?;
@@ -127,7 +128,7 @@ impl<'src> Parser<'src> {
         let mut seen = FxHashSet::default();
         for param in &params {
             if !seen.insert(param.name) {
-                return Err(ParseError::Unexpected(format!(
+                return Err(ParseErrorKind::Unexpected(format!(
                     "Duplicate parameter `{}`.",
                     self.ast.names[param.name.value()]
                 )));
@@ -137,6 +138,7 @@ impl<'src> Parser<'src> {
         let body = self.parse_func_body(has_return_type)?;
         self.ast.top_level.push(TopLevel::Func(FuncDef {
             name,
+            name_span,
             params,
             return_type,
             body,
@@ -149,7 +151,7 @@ impl<'src> Parser<'src> {
         &mut self,
         function_line: u32,
         function_col: u32,
-    ) -> Result<Vec<Param>, ParseError> {
+    ) -> Result<Vec<Param>, ParseErrorKind> {
         let mut params = Vec::new();
         if self.peek().kind == TokenKind::RParen {
             return Ok(params);
@@ -159,7 +161,7 @@ impl<'src> Parser<'src> {
         // A first parameter hung onto a later line — the opening line left bare — must be indented
         // past the function's own line, mirroring how a block body indents under its header.
         if first.line != function_line && first.col <= function_col {
-            return Err(ParseError::Layout(format!(
+            return Err(ParseErrorKind::Layout(format!(
                 "Parameter at line {} col {} must be indented past the function at column {function_col}.",
                 first.line, first.col
             )));
@@ -170,7 +172,7 @@ impl<'src> Parser<'src> {
                 (token.line, token.col)
             };
             if line != first.line && col != first.col {
-                return Err(ParseError::Layout(format!(
+                return Err(ParseErrorKind::Layout(format!(
                     "Parameter at line {line} col {col} must align to the first parameter's column {}.",
                     first.col
                 )));
@@ -193,7 +195,7 @@ impl<'src> Parser<'src> {
     // lexical; whether `str` is admissible in a given position (`str` *parameters* are out of scope
     // this iteration, their freeing model deferred) is a sema-layer decision made in a later step,
     // not here.
-    pub(super) fn parse_type(&mut self) -> Result<PinpType, ParseError> {
+    pub(super) fn parse_type(&mut self) -> Result<PinpType, ParseErrorKind> {
         let token = self.expect(TokenKind::Identifier)?;
         match token.text {
             "bool" => Ok(PinpType::Bool),
@@ -201,18 +203,20 @@ impl<'src> Parser<'src> {
             "float" => Ok(PinpType::Float),
             "str" => Ok(PinpType::Str),
             "void" => Ok(PinpType::Void),
-            other => Err(ParseError::Unexpected(format!("Unknown type `{other}`."))),
+            other => Err(ParseErrorKind::Unexpected(format!(
+                "Unknown type `{other}`."
+            ))),
         }
     }
 
     // A function body: an indented block, or the single-line form `is <expr>` (which must declare
     // a return type).
-    fn parse_func_body(&mut self, has_return_type: bool) -> Result<Block, ParseError> {
+    fn parse_func_body(&mut self, has_return_type: bool) -> Result<Block, ParseErrorKind> {
         if self.peek().kind == TokenKind::Newline {
             // Block form: a run of statements ending in a result expression.
             let block = self.parse_block()?;
             if block.result.is_none() {
-                return Err(ParseError::Unexpected(
+                return Err(ParseErrorKind::Unexpected(
                     "Function body must end with an expression.".into(),
                 ));
             }
@@ -220,7 +224,7 @@ impl<'src> Parser<'src> {
         } else {
             // Single-line form: `is` then an expression — which must declare a return type.
             if !has_return_type {
-                return Err(ParseError::Unexpected(
+                return Err(ParseErrorKind::Unexpected(
                     "Single-line function must declare a return type.".into(),
                 ));
             }
@@ -228,7 +232,7 @@ impl<'src> Parser<'src> {
             match self.peek().kind {
                 TokenKind::Newline | TokenKind::Eof => {}
                 other => {
-                    return Err(ParseError::Unexpected(format!(
+                    return Err(ParseErrorKind::Unexpected(format!(
                         "Unexpected token {other:?}."
                     )));
                 }
@@ -248,7 +252,7 @@ impl<'src> Parser<'src> {
     // every control-flow body (`if`/`while`/`loop`). A trailing expression statement becomes the
     // block's `result` (its value when the block is used as one); a block ending in any other
     // statement has `result: None`.
-    pub(super) fn parse_block(&mut self) -> Result<Block, ParseError> {
+    pub(super) fn parse_block(&mut self) -> Result<Block, ParseErrorKind> {
         // A wrapped one-line conditional inside the statement just parsed opened indents whose
         // closing dedents sit just past the statement's newline; swallow them so they are not taken
         // for this block's terminator.
@@ -268,7 +272,7 @@ impl<'src> Parser<'src> {
         // Consume the separator between two statements and report whether the block has ended. A
         // multiline construct (or a swallowed continuation) leaves us already on a layout token, so
         // the next statement may follow with no separator of its own.
-        fn reached_block_end(parser: &mut Parser<'_>) -> Result<bool, ParseError> {
+        fn reached_block_end(parser: &mut Parser<'_>) -> Result<bool, ParseErrorKind> {
             let ended_at_layout = matches!(
                 parser.tokens[parser.pos - 1].kind,
                 TokenKind::Newline | TokenKind::Dedent | TokenKind::Indent
@@ -282,7 +286,7 @@ impl<'src> Parser<'src> {
                 TokenKind::Eof => return Ok(true),
                 _ if ended_at_layout => {}
                 other => {
-                    return Err(ParseError::Unexpected(format!(
+                    return Err(ParseErrorKind::Unexpected(format!(
                         "Unexpected token {other:?}."
                     )));
                 }
@@ -323,7 +327,7 @@ impl<'src> Parser<'src> {
     }
 
     // `while <cond> <block>` — a pre-tested loop.
-    fn parse_while(&mut self) -> Result<Stmt, ParseError> {
+    fn parse_while(&mut self) -> Result<Stmt, ParseErrorKind> {
         self.advance(); // 'while'
         let cond = self.parse_expr(0)?;
         let body = self.parse_block()?;
@@ -331,14 +335,14 @@ impl<'src> Parser<'src> {
     }
 
     // `loop <block> (while | until) <cond>` — a post-tested loop (`until` flips the sense).
-    fn parse_loop(&mut self) -> Result<Stmt, ParseError> {
+    fn parse_loop(&mut self) -> Result<Stmt, ParseErrorKind> {
         self.advance(); // 'loop'
         let body = self.parse_block()?;
         let until = match self.peek().kind {
             TokenKind::KwWhile => false,
             TokenKind::KwUntil => true,
             other => {
-                return Err(ParseError::Unexpected(format!(
+                return Err(ParseErrorKind::Unexpected(format!(
                     "Expected `while` or `until` after a loop body, found {other:?}."
                 )));
             }
@@ -350,17 +354,20 @@ impl<'src> Parser<'src> {
 
     // `for <binder>[, <binder>…] in <source> <block>`.
     // 1 binder → `Stmt::For`; 2–3 binders → `Stmt::ForArray`; 4+ → `ParseError`.
-    fn parse_for(&mut self) -> Result<Stmt, ParseError> {
+    fn parse_for(&mut self) -> Result<Stmt, ParseErrorKind> {
         self.advance(); // 'for'
-        let first_sym = self.expect_binder()?;
+        let (first_sym, first_span) = self.expect_binder()?;
         if self.peek().kind == TokenKind::Comma {
             let mut binders = vec![first_sym];
+            let mut binder_spans = vec![first_span];
             while self.peek().kind == TokenKind::Comma {
                 self.advance(); // ','
-                binders.push(self.expect_binder()?);
+                let (binder, span) = self.expect_binder()?;
+                binders.push(binder);
+                binder_spans.push(span);
             }
             if binders.len() > 3 {
-                return Err(ParseError::Unexpected(
+                return Err(ParseErrorKind::Unexpected(
                     "Too many binders in for loop.".into(),
                 ));
             }
@@ -369,6 +376,7 @@ impl<'src> Parser<'src> {
             let body = self.parse_block()?;
             return Ok(Stmt::ForArray {
                 binders,
+                binder_spans,
                 source,
                 body,
             });
@@ -378,6 +386,7 @@ impl<'src> Parser<'src> {
         let body = self.parse_block()?;
         Ok(Stmt::For {
             var: first_sym,
+            var_span: first_span,
             source,
             body,
         })
@@ -386,17 +395,18 @@ impl<'src> Parser<'src> {
     // -------------------------------------------------------------------------
     // Statements and assignment
     // Consume the next token as a for-loop binder name: either a plain `Identifier` or the
-    // don't-care `_` (`Underscore`). Returns the interned `SymId`; errors on anything else.
-    fn expect_binder(&mut self) -> Result<SymId, ParseError> {
+    // don't-care `_` (`Underscore`). Returns the interned `SymId` and where it was written; errors
+    // on anything else.
+    fn expect_binder(&mut self) -> Result<(SymId, Span), ParseErrorKind> {
         let token = self.peek();
         match token.kind {
             TokenKind::Identifier | TokenKind::Underscore => {
-                let text = token.text;
+                let (text, span) = (token.text, token.span());
                 let sym = self.ast.intern(text);
                 self.advance();
-                Ok(sym)
+                Ok((sym, span))
             }
-            _ => Err(ParseError::Unexpected(format!(
+            _ => Err(ParseErrorKind::Unexpected(format!(
                 "Expected a binder name or `_`, found `{}`.",
                 token.text
             ))),
@@ -407,13 +417,13 @@ impl<'src> Parser<'src> {
 
     // One statement: a control-flow construct (`while`/`loop`/`for`), an expression statement, or a
     // (parallel/chained/compound) assignment.
-    fn parse_stmt(&mut self) -> Result<Stmt, ParseError> {
+    fn parse_stmt(&mut self) -> Result<Stmt, ParseErrorKind> {
         // Build `target_list = (target_list =)* value_list` from its `=`-separated groups: the last
         // group is the values; each earlier group is a target list checked for matching arity.
         fn finish_assignment(
             parser: &mut Parser<'_>,
             mut groups: Vec<Vec<ExprId>>,
-        ) -> Result<Stmt, ParseError> {
+        ) -> Result<Stmt, ParseErrorKind> {
             let values = groups.pop().expect("the first group is always present");
             let mut target_lists = Vec::with_capacity(groups.len());
             let mut target_spans = Vec::with_capacity(groups.len());
@@ -427,7 +437,7 @@ impl<'src> Parser<'src> {
                     targets.push(parser.expr_as_place(expr_id)?);
                 }
                 if targets.len() != values.len() {
-                    return Err(ParseError::Unexpected(format!(
+                    return Err(ParseErrorKind::Unexpected(format!(
                         "Assignment has {} target(s) but {} value(s).",
                         targets.len(),
                         values.len()
@@ -464,12 +474,18 @@ impl<'src> Parser<'src> {
                 let target = match self.ast.node(array) {
                     Node::Var(sym_id) => Place::Local(*sym_id),
                     Node::Global(sym_id) => Place::Global(*sym_id),
-                    _ => return Err(ParseError::Unexpected("Invalid assignment target.".into())),
+                    _ => {
+                        return Err(ParseErrorKind::Unexpected(
+                            "Invalid assignment target.".into(),
+                        ));
+                    }
                 };
+                let target_span = self.ast.span_of(array);
                 self.advance(); // the compound operator
                 let value = self.parse_expr(0)?;
                 return Ok(Stmt::IndexedAssign {
                     target,
+                    target_span,
                     index,
                     value,
                     compound_op: Some(op),
@@ -480,12 +496,18 @@ impl<'src> Parser<'src> {
                 let target = match self.ast.node(matrix) {
                     Node::Var(sym_id) => Place::Local(*sym_id),
                     Node::Global(sym_id) => Place::Global(*sym_id),
-                    _ => return Err(ParseError::Unexpected("Invalid assignment target.".into())),
+                    _ => {
+                        return Err(ParseErrorKind::Unexpected(
+                            "Invalid assignment target.".into(),
+                        ));
+                    }
                 };
+                let target_span = self.ast.span_of(matrix);
                 self.advance(); // the compound operator
                 let value = self.parse_expr(0)?;
                 return Ok(Stmt::IndexedAssign2D {
                     target,
+                    target_span,
                     row,
                     col,
                     value,
@@ -506,12 +528,18 @@ impl<'src> Parser<'src> {
                 let target = match self.ast.node(array) {
                     Node::Var(sym_id) => Place::Local(*sym_id),
                     Node::Global(sym_id) => Place::Global(*sym_id),
-                    _ => return Err(ParseError::Unexpected("Invalid assignment target.".into())),
+                    _ => {
+                        return Err(ParseErrorKind::Unexpected(
+                            "Invalid assignment target.".into(),
+                        ));
+                    }
                 };
+                let target_span = self.ast.span_of(array);
                 self.advance(); // '='
                 let value = self.parse_expr(0)?;
                 return Ok(Stmt::IndexedAssign {
                     target,
+                    target_span,
                     index,
                     value,
                     compound_op: None,
@@ -522,12 +550,18 @@ impl<'src> Parser<'src> {
                 let target = match self.ast.node(matrix) {
                     Node::Var(sym_id) => Place::Local(*sym_id),
                     Node::Global(sym_id) => Place::Global(*sym_id),
-                    _ => return Err(ParseError::Unexpected("Invalid assignment target.".into())),
+                    _ => {
+                        return Err(ParseErrorKind::Unexpected(
+                            "Invalid assignment target.".into(),
+                        ));
+                    }
                 };
+                let target_span = self.ast.span_of(matrix);
                 self.advance(); // '='
                 let value = self.parse_expr(0)?;
                 return Ok(Stmt::IndexedAssign2D {
                     target,
+                    target_span,
                     row,
                     col,
                     value,
@@ -544,11 +578,11 @@ impl<'src> Parser<'src> {
             // A comma-list with no `=`: if the next line starts with a comma, the user tried a
             // leading-comma continuation — the comma must instead trail the current line.
             if self.next_line_starts_with_comma() {
-                return Err(ParseError::Layout(
+                return Err(ParseErrorKind::Layout(
                     "Multi-line assignment: comma must not start a line.".into(),
                 ));
             }
-            return Err(ParseError::Unexpected(
+            return Err(ParseErrorKind::Unexpected(
                 "Expected `=` after a comma-separated target list.".into(),
             ));
         }
@@ -565,7 +599,7 @@ impl<'src> Parser<'src> {
     // A comma-separated list of expressions, e.g. `1, 2, 3` or an assignment's target/value list.
     // A trailing comma continues the list onto the next line (an assignment LHS or RHS that wraps);
     // the continuation must align to the column where the list began.
-    fn parse_expr_list(&mut self) -> Result<Vec<ExprId>, ParseError> {
+    fn parse_expr_list(&mut self) -> Result<Vec<ExprId>, ParseErrorKind> {
         let list_col = self.peek().col;
         let mut exprs = vec![self.parse_expr(0)?];
         while self.peek().kind == TokenKind::Comma {
@@ -583,7 +617,7 @@ impl<'src> Parser<'src> {
     // `list_col`. A continuation indented past the enclosing block opens an `Indent`, banked into
     // `pending_dedents` so `parse_block` later swallows the matching `Dedent` (as for a wrapped
     // `else`); a same-indent continuation is just a `Newline`.
-    fn consume_list_continuation(&mut self, list_col: u32) -> Result<(), ParseError> {
+    fn consume_list_continuation(&mut self, list_col: u32) -> Result<(), ParseErrorKind> {
         while matches!(
             self.peek().kind,
             TokenKind::Newline | TokenKind::Indent | TokenKind::Dedent
@@ -594,7 +628,7 @@ impl<'src> Parser<'src> {
             self.pos += 1;
         }
         if self.peek().col != list_col {
-            return Err(ParseError::Layout(format!(
+            return Err(ParseErrorKind::Layout(format!(
                 "Continuation at column {} must align to the list's column {list_col}.",
                 self.peek().col
             )));
@@ -618,11 +652,11 @@ impl<'src> Parser<'src> {
     // Reinterpret an already-parsed expression as an assignment target. Only a bare name or `::name`
     // is a valid place; anything else (a literal, a call, an arithmetic node) is rejected. The read
     // `Var`/`Global` node parsed for the target is left unused in the arena.
-    fn expr_as_place(&self, expr_id: ExprId) -> Result<Place, ParseError> {
+    fn expr_as_place(&self, expr_id: ExprId) -> Result<Place, ParseErrorKind> {
         match self.ast.node(expr_id) {
             Node::Var(sym_id) => Ok(Place::Local(*sym_id)),
             Node::Global(sym_id) => Ok(Place::Global(*sym_id)),
-            _ => Err(ParseError::Unexpected(
+            _ => Err(ParseErrorKind::Unexpected(
                 "Invalid assignment target; only names and `::globals` can be assigned.".into(),
             )),
         }
@@ -632,8 +666,9 @@ impl<'src> Parser<'src> {
     fn finish_compound(&mut self, place: Place, place_span: Span, op: BinOp, rhs: ExprId) -> Stmt {
         // The synthetic read of `place` carries the target's own span: it is the same name, written
         // once in the source and appearing twice after the desugaring.
-        let read = self.ast.push_spanned(Node::from(place), place_span);
-        let combined = self.ast.push(Node::Bin { op, lhs: read, rhs });
+        let read = self.ast.push(Node::from(place), place_span);
+        let span = self.joined_span(read, rhs);
+        let combined = self.ast.push(Node::Bin { op, lhs: read, rhs }, span);
         Stmt::Assign {
             target_lists: vec![vec![place]],
             target_spans: vec![vec![place_span]],

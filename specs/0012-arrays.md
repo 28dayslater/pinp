@@ -316,7 +316,7 @@ compile time, with literal, range-init, and comprehension forms, read/write inde
 error-global with a `longjmp`-based mechanism that unwinds at any nesting depth without crashing
 the process.
 
-## Data model ([parser/ast.rs](src/parser/ast.rs))
+## Data model ([parser/ast.rs](../src/parser/ast.rs))
 
 ### `ElementType`
 
@@ -385,7 +385,7 @@ x`) is deferred.
 variant contains a `Vec`, so `Copy` is removed from `PinpValue`; `Clone` and `PartialEq` are
 kept. No existing test assertions break — they all compare via `==`.
 
-## Lexer ([lexer.rs](src/lexer.rs))
+## Lexer ([lexer.rs](../src/lexer.rs))
 
 Three new `Lexeme` / `TokenKind` pairs:
 
@@ -396,7 +396,7 @@ Three new `Lexeme` / `TokenKind` pairs:
 `Dot` does not conflict with `Float` (the Float regex requires a digit after `.`; `.l` is `Dot
 Identifier`) or with `DotDot`/`DotDotLt`/`DotDotGt` (longest-match still wins for `..`).
 
-## Parser ([parser/](src/parser/))
+## Parser ([parser/](../src/parser/))
 
 ### Array literal / range-init / comprehension (null denotation of `LBracket`)
 
@@ -440,7 +440,7 @@ and `=` follows (not a compound op), extract the `array` child — it must be `V
 `ParseError::Unexpected("Invalid indexed assignment target ...")`) — and build
 `Stmt::IndexedAssign { target, index, value }` after parsing the RHS.
 
-## Sema ([sema/](src/sema/))
+## Sema ([sema/](../src/sema/))
 
 ### `assignable` / `join`
 
@@ -509,7 +509,7 @@ with anything else returns `None`.
 
 `gen_entry` currently rejects `PinpType::Range`; `PinpType::Array` is now permitted.
 
-## Codegen ([codegen/](src/codegen/))
+## Codegen ([codegen/](../src/codegen/))
 
 ### LLVM type for `Array`
 
@@ -584,7 +584,7 @@ PinpType::Array(element_type, len) => {
 }
 ```
 
-## Runtime upgrade ([runtime/](runtime/))
+## Runtime upgrade ([runtime/](../src/runtime/))
 
 ### Why the 0008 mechanism fails for nested calls
 

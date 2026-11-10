@@ -1,9 +1,7 @@
 // SPDX-License-Identifier: MIT
-#![cfg(feature = "llvm")]
 
 //! End-to-end control-flow evaluation: the `if` expression (one-line ternary and block form),
 //! `while`/`loop` statements, and the lexical mutate-outer scoping that lets loops drive a counter.
-//! Requires the `llvm` feature.
 
 mod common;
 use common::{eval_bool, eval_float, eval_int};

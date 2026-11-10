@@ -2,9 +2,16 @@
 
 # Static analysis foundations — CFG, dataflow framework, diagnostics
 
+> **Superseded in places by [0016](0016-diagnostics.md):** the diagnostic codes throughout this
+> document were renumbered `PINP0101`–`PINP0103` → `PINP1001`–`PINP1003`, and
+> `src/analysis/diagnostic.rs` moved to [src/diagnostic.rs](../src/diagnostic.rs). The
+> `unused-binding` rule was also renamed **`unused-variable`**, reports at the symbol's first
+> write rather than its last, and no longer suppresses the dead stores at a never-read symbol's
+> other writes — see 0016's implementation note 8. Everything else recorded here stands.
+
 This iteration is an internal rework and does not add any language features.
 
-pinp checks its programs with a recursive, syntax-directed walk: [sema](src/sema/analyzer.rs) carries
+pinp checks its programs with a recursive, syntax-directed walk: [sema](../src/sema/analyzer.rs) carries
 a scope stack, infers a type per node, and stops at the first error. That is enough to compile a
 correct program and reject an incorrect one, but it cannot answer any question about *how values
 flow through a program* — which is where the interesting checks live.
@@ -50,7 +57,7 @@ Deferred (see the closing section for the full list):
 `src/codegen/lower.rs` teaches *lowering* as "rewriting a program into a lower-level form", and until
 now that meant exactly one thing: AST → LLVM IR. This iteration adds AST → CFG, which is equally a
 lowering, so the bare word stops identifying anything. The convention — recorded in
-[CLAUDE.md](CLAUDE.md) so it outlives this spec — is that **a pass is named by what it produces**:
+[CLAUDE.md](../CLAUDE.md) so it outlives this spec — is that **a pass is named by what it produces**:
 
 | pass | verb | prefix |
 |---|---|---|
@@ -120,7 +127,7 @@ expression (also in `and`/`or` short-circuit). See "CFG shape" below for how v1 
 
 ---
 
-## Step 1 — Source spans ([src/parser/ast.rs](src/parser/ast.rs))
+## Step 1 — Source spans ([src/parser/ast.rs](../src/parser/ast.rs))
 
 Today the AST carries no positions at all. The lexer records 1-based `line`/`col` per token and the
 parser drops them; `SemaError` is two variants wrapping a bare `String`. A diagnostic cannot point
@@ -187,7 +194,7 @@ the boundaries (offset 0, offset at a line start, final offset).
 
 ---
 
-## Step 2 — Diagnostics ([src/analysis/diagnostic.rs](src/analysis/diagnostic.rs))
+## Step 2 — Diagnostics ([src/analysis/diagnostic.rs](../src/diagnostic.rs))
 
 ```rust
 pub enum Severity { Error, Warning }
@@ -223,7 +230,7 @@ kind of thing that silently breaks when a variant is inserted in the middle.
 
 ---
 
-## Step 3 — Control-flow graph ([src/analysis/cfg.rs](src/analysis/cfg.rs))
+## Step 3 — Control-flow graph ([src/analysis/cfg.rs](../src/cfg/))
 
 ### Shape
 
@@ -341,7 +348,7 @@ readable.
 
 ---
 
-## Step 4 — Dataflow framework ([src/analysis/dataflow.rs](src/analysis/dataflow.rs))
+## Step 4 — Dataflow framework ([src/analysis/dataflow.rs](../src/analysis/dataflow.rs))
 
 ```rust
 pub trait Lattice: Clone + PartialEq {
@@ -386,7 +393,7 @@ forever); empty-CFG and single-block edge cases.
 
 ---
 
-## Step 5 — Reachability ([src/analysis/checks/reachability.rs](src/analysis/checks/reachability.rs))
+## Step 5 — Reachability ([src/analysis/checks/reachability.rs](../src/analysis/checks/reachability.rs))
 
 The simplest client, and the one that validates the framework on a real question. Forward analysis,
 fact = reached/not; a block is unreachable if its fact is still `bottom` at fixpoint.
@@ -413,7 +420,7 @@ terminates and that is not this checker's business).
 
 ---
 
-## Step 6 — Liveness ([src/analysis/checks/liveness.rs](src/analysis/checks/liveness.rs))
+## Step 6 — Liveness ([src/analysis/checks/liveness.rs](../src/analysis/checks/liveness.rs))
 
 Backward analysis, fact = the set of `SymId`s live at a program point. Standard transfer: a read
 makes a symbol live, a write kills it, and a statement's reads are processed after its writes.
@@ -444,7 +451,7 @@ then diagnostic-level tests for each finding and each suppression.
 
 ---
 
-## Step 7 — The `check` entry point ([src/analysis/mod.rs](src/analysis/mod.rs))
+## Step 7 — The `check` entry point ([src/analysis/mod.rs](../src/analysis/mod.rs))
 
 ```rust
 /// Runs every checker over an analysed program, returning all findings in source order.
@@ -454,7 +461,7 @@ pub fn check(ast: &ProgramAst) -> Vec<Diagnostic>;
 One graph per function plus one for the top level, each handed to both checkers, with the results
 sorted by source position so a run reads top to bottom. Rendering is the text form from step 2.
 
-**Tests:** end-to-end in [tests/analysis.rs](tests/analysis.rs) — source in, findings out, checked
+**Tests:** end-to-end in [tests/analysis.rs](../tests/analysis.rs) — source in, findings out, checked
 by code and resolved line/column; a clean program yields none; a program with several findings
 reports them all, in source order. That last one is the batch-reporting property, and the one thing
 fail-fast sema structurally cannot demonstrate.
@@ -484,7 +491,7 @@ src/analysis/
         liveness.rs
 ```
 
-`analysis` sits beside `sema` in [src/lib.rs](src/lib.rs) and depends on `parser` only — it consumes
+`analysis` sits beside `sema` in [src/lib.rs](../src/lib.rs) and depends on `parser` only — it consumes
 a typed `ProgramAst` and knows nothing about codegen or LLVM, so it builds without the `llvm`
 feature. That also means its tests run in the fast, backend-free part of the suite.
 
@@ -501,7 +508,7 @@ Per the project test policy, each step's tests are written and reviewed before i
   a bounded-iteration guard, degenerate CFGs.
 - **analysis/checks** (in-module): fact-level assertions, then finding-level assertions including
   every suppression above.
-- **e2e** ([tests/analysis.rs](tests/analysis.rs)): source in, diagnostics out — code, severity,
+- **e2e** ([tests/analysis.rs](../tests/analysis.rs)): source in, diagnostics out — code, severity,
   and resolved line/column for each finding; a clean program yields none; a program with several
   findings reports them all, in source order (the batch-reporting property, which is the one thing
   fail-fast sema cannot demonstrate).

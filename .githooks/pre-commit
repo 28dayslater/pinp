@@ -7,7 +7,6 @@ if ! cargo fmt --check; then
     exit 1
 fi
 
-# `llvm` is a default feature, so this lints the codegen backend too (needs a system LLVM).
 if ! cargo clippy --all-targets -- -D warnings; then
     echo "error: clippy found issues. Fix them, then re-stage and commit." >&2
     exit 1

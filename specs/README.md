@@ -12,6 +12,16 @@ notes, stale implementation details, or ideas that were later revised. That is a
 perceived quality of these files from the point of view of an external human reader is not critical;
 clarity for ongoing development is the priority.
 
+## Milestones
+
+Most iterations are one spec, `NNNN-description.md`. Work that is one logical project but too
+involved for a single iteration — its steps cannot ship on their own, such as replacing the code
+generator — is a **milestone**: one number, an overview file `NNNN-description.md` (goal, ground
+rules, index of parts with their status), and one file per part, `NNNN-X-description.md`, lettered
+in order (`0017-A-structured-level.md`, `0017-B-flat-level.md`, …). Parts are inserted, merged,
+and reordered by changing letters, never by renumbering later specs. The next top-level number
+follows the milestone.
+
 Authoritative user-facing language documentation belongs under `docs/` once enough features exist to
 justify a consolidated manual. That manual may draw from these specs, but it should present the
 current language as it is, not preserve every iteration's design history.

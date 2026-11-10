@@ -104,7 +104,7 @@ it is merely a suppressed `Newline`.
 
 ## Data model
 
-`Stmt::Assign` generalises ([parser.rs](src/parser.rs)):
+`Stmt::Assign` generalises ([parser.rs](../src/parser/)):
 
 ```rust
 Assign {

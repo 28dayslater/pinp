@@ -14,6 +14,8 @@
 
 use rustc_hash::FxHashMap;
 
+use crate::diagnostic::{Diagnose, Diagnostic};
+use crate::lexer::Span;
 use crate::parser::{BuiltinMember, Node, PinpType, ProgramAst, SymId, TopLevel};
 
 mod analyzer;
@@ -21,13 +23,48 @@ mod analyzer;
 #[cfg(test)]
 mod tests;
 
-/// A semantic failure. pinp is fail-fast: the first error stops the pass.
+/// A semantic failure and the expression it is about. pinp is fail-fast: the first error stops the
+/// pass.
+///
+/// The span is the node the walk was on when the rule failed — see `Analyzer::analyze_expr`, which
+/// unwinds the position on success so an error raised *after* a node's operands were analysed is
+/// still positioned on that node rather than on its last operand.
 #[derive(Debug, Clone, PartialEq)]
-pub enum SemaError {
+pub struct SemaError {
+    pub kind: SemaErrorKind,
+    pub span: Span,
+}
+
+impl Diagnose for SemaError {
+    fn to_diagnostic(&self) -> Diagnostic {
+        Diagnostic::error(self.span, self.kind.message())
+    }
+}
+
+/// Comparing an error to a bare kind ignores position, which is what a test asserting *which*
+/// failure occurred wants to say.
+impl PartialEq<SemaErrorKind> for SemaError {
+    fn eq(&self, kind: &SemaErrorKind) -> bool {
+        &self.kind == kind
+    }
+}
+
+/// What kind of semantic failure occurred.
+#[derive(Debug, Clone, PartialEq)]
+pub enum SemaErrorKind {
     /// A name used but not bound: unknown variable, global, or function.
     UnknownSymbol(String),
     /// A type error: a mismatch, a bad promotion, or an operation on `Void`.
     Type(String),
+}
+
+impl SemaErrorKind {
+    /// The human-readable text, which both variants carry.
+    pub fn message(&self) -> &str {
+        match self {
+            SemaErrorKind::UnknownSymbol(message) | SemaErrorKind::Type(message) => message,
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -93,6 +130,7 @@ pub fn analyze(ast: &mut ProgramAst) -> Result<(), SemaError> {
         builtin_members,
         top_level,
         names,
+        spans,
         ..
     } = ast;
     let mut analyzer = Analyzer {
@@ -103,13 +141,20 @@ pub fn analyze(ast: &mut ProgramAst) -> Result<(), SemaError> {
         scopes: vec![FxHashMap::default()], // global frame
         fn_base: 0,
         funcs: FxHashMap::default(),
+        spans,
+        current_span: Span::UNKNOWN,
         loop_vars: Vec::new(),
     };
     for item in top_level.iter() {
-        match item {
-            TopLevel::Stmt(stmt) => analyzer.analyze_stmt(stmt)?,
-            TopLevel::Func(func) => analyzer.analyze_func(func)?,
-        }
+        let result = match item {
+            TopLevel::Stmt(stmt) => analyzer.analyze_stmt(stmt),
+            TopLevel::Func(func) => analyzer.analyze_func(func),
+        };
+        // The walk records where it was as it goes; a rule only says what went wrong.
+        result.map_err(|kind| SemaError {
+            kind,
+            span: analyzer.current_span,
+        })?;
     }
     Ok(())
 }
@@ -127,6 +172,13 @@ struct Analyzer<'ast, 'src> {
     // global frame *is* the base.
     fn_base: usize,
     funcs: FxHashMap<SymId, Signature>,
+    /// Parallel to `nodes`: where each expression came from, so a failure can be positioned.
+    spans: &'ast [Span],
+    /// The node the walk is currently on. `analyze_expr` restores the caller's value on success,
+    /// so after a child is analysed this is back to the parent — which is what makes an error
+    /// raised once the operands are known point at the whole expression rather than its last
+    /// operand.
+    current_span: Span,
     // The loop variables of the enclosing `for`s; each is read-only inside its body, so an
     // assignment to one is rejected rather than allowed to corrupt the iteration counter.
     loop_vars: Vec<SymId>,

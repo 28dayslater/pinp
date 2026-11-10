@@ -97,29 +97,29 @@ step, so a range whose bounds and step disagree at run time is simply empty.
   not *yield* a range to the host: `PinpValue` gains no `Range`, and a trailing range result is
   rejected in codegen. This mirrors arrays — storable and iterable now, surfaced later.
 
-## Data model ([parser.rs](src/parser.rs))
+## Data model ([parser.rs](../src/parser/))
 
-- `PinpType` gains `Range` ([parser.rs:31](src/parser.rs#L31)).
-- `Node` ([parser.rs:95](src/parser.rs#L95)) gains, with `enum RangeKind { Inclusive, UpExclusive, DownExclusive }`:
+- `PinpType` gains `Range` ([parser.rs:31](../src/parser/)).
+- `Node` ([parser.rs:95](../src/parser/)) gains, with `enum RangeKind { Inclusive, UpExclusive, DownExclusive }`:
   ```rust
   Range { start: ExprId, stop: ExprId, step: Option<ExprId>, kind: RangeKind },
   Membership { value: ExprId, range: ExprId },
   ```
-- `Stmt` gains `For { var: SymId, range: ExprId, body: Block }` ([parser.rs:146](src/parser.rs#L146)) —
+- `Stmt` gains `For { var: SymId, range: ExprId, body: Block }` ([parser.rs:146](../src/parser/)) —
   a `Void` statement, like `While`.
 
-## Lexer ([lexer.rs](src/lexer.rs))
+## Lexer ([lexer.rs](../src/lexer.rs))
 
 - Three new lexemes/`TokenKind`s: `DotDot` (`..`), `DotDotLt` (`..<`), `DotDotGt` (`..>`). Logos
   longest-match makes `..<`/`..>` win over `..`; `..` competes with the `Float` regex only where a
   digit follows the dot, so `.5` stays a `Float` while `1..5` is `Int DotDot Int`
-  ([lexer.rs:33](src/lexer.rs#L33)).
-- `for`/`in` join the keyword classifier ([lexer.rs:212](src/lexer.rs#L212)) as `KwFor`/`KwIn`.
+  ([lexer.rs:33](../src/lexer.rs#L33)).
+- `for`/`in` join the keyword classifier ([lexer.rs:212](../src/lexer.rs#L212)) as `KwFor`/`KwIn`.
 - The step separator reuses the existing `Colon`; `:-2` is `Colon Minus Int`.
 
-## Parser ([parser.rs](src/parser.rs))
+## Parser ([parser.rs](../src/parser/))
 
-- **Range and membership are operators in the `parse_expr` loop** ([parser.rs:984](src/parser.rs#L984)),
+- **Range and membership are operators in the `parse_expr` loop** ([parser.rs:984](../src/parser/)),
   handled beside the comparison band rather than as `infix` rows (their results are not ordinary
   `Bin`s):
   - `RANGE_BP = 50` — above the comparison band (45), below additive (60), so `a+1..b-1` is
@@ -132,18 +132,18 @@ step, so a range whose bounds and step disagree at run time is simply empty.
   - No comma form survives, so a range never introduces a comma: `parse_expr_list` (0007) is
     untouched and the multi-assignment grammar stays context-free —
     `a, r, b = 42, 7..<100:10, 666` parses because `..`/`:` bind tighter than the list comma.
-- **`for` is a statement.** `parse_stmt` ([parser.rs:839](src/parser.rs#L839)) dispatches `KwFor` to
+- **`for` is a statement.** `parse_stmt` ([parser.rs:839](../src/parser/)) dispatches `KwFor` to
   `parse_for` (beside `KwWhile`/`KwLoop`): consume `for`, an `Identifier` (interned as `var`), `in`,
   then `parse_expr(0)` for the range and `parse_block` for the body. The loop consumes its own `in`,
   so it never reaches the membership operator.
 - Whitespace around `..`/`:` is not enforced; the no-space form is the conventional style, and the
   operator parse removes the comma ambiguity that the whitespace rule once guarded against.
 
-## Sema ([sema.rs](src/sema.rs))
+## Sema ([sema.rs](../src/sema/))
 
-- `assignable`/`join` ([sema.rs:32](src/sema.rs#L32)): `Range` is assignable only to `Range` (no
+- `assignable`/`join` ([sema.rs:32](../src/sema/)): `Range` is assignable only to `Range` (no
   widening); `join` of `Range` with anything else is `None`.
-- **`Node::Range`** ([sema.rs:267](src/sema.rs#L267)): `start`, `stop`, and `step` (if present) must
+- **`Node::Range`** ([sema.rs:267](../src/sema/)): `start`, `stop`, and `step` (if present) must
   be `int_like`; a `Float`/`Void` part is a `Type` error. The node's type is `Range`. **Literal
   validation** runs only where the parts are `Node::Int` constants (variable parts are a run-time
   concern, per the spec):
@@ -155,14 +155,14 @@ step, so a range whose bounds and step disagree at run time is simply empty.
   - `DownExclusive`: literal `start <= stop` → `An ascending range must use ..<.`
 - **`Node::Membership`**: `value` must be `int_like`, `range` must be `Range`; result `Bool`.
 - **`Stmt::For`**: `range` must be `Range`. The body is analysed in a pushed frame
-  ([sema.rs:221](src/sema.rs#L221)) seeded with `var: Int`; `var` is **read-only** — assigning it is
+  ([sema.rs:221](../src/sema/)) seeded with `var: Int`; `var` is **read-only** — assigning it is
   `Cannot assign to loop variable.` (a `loop_vars` set checked in `assign_place`
-  [sema.rs:199](src/sema.rs#L199)). It does not escape the body (0006 scoping). The `for` is `Void`.
+  [sema.rs:199](../src/sema/)). It does not escape the body (0006 scoping). The `for` is `Void`.
 
-## Codegen ([codegen.rs](src/codegen.rs))
+## Codegen ([codegen.rs](../src/codegen/llvm/))
 
 - **`PinpType::Range` → struct** `{ i64 start, i64 stop, i64 step, i1 inclusive }`. `basic_type`
-  ([codegen.rs:236](src/codegen.rs#L236)) returns it; `zero` ([codegen.rs:930](src/codegen.rs#L930))
+  ([codegen.rs:236](../src/codegen/llvm/)) returns it; `zero` ([codegen.rs:930](../src/codegen/llvm/))
   returns its const-zero (a range global declares cleanly); `promote` leaves a `Range` unchanged.
 - **`Node::Range`** evaluates `start`/`stop` as `i64` (`as_int`) and the step: given → `as_int`;
   omitted → `1` (`UpExclusive`), `-1` (`DownExclusive`), or `select(stop sge start, 1, -1)`
@@ -174,7 +174,7 @@ step, so a range whose bounds and step disagree at run time is simply empty.
   It then builds the struct value, `inclusive = true` only for `..`.
 - **`Stmt::For`** evaluates the range, extracts the four fields, allocates the `i64` counter in the
   entry block, stores `start`, and emits a `while`-shaped header/body/exit
-  ([codegen.rs:417](src/codegen.rs#L417)). The header recomputes the direction-aware continue test:
+  ([codegen.rs:417](../src/codegen/llvm/)). The header recomputes the direction-aware continue test:
   `going_up = step > 0`; `up = select(inclusive, counter <= stop, counter < stop)`;
   `down = select(inclusive, counter >= stop, counter > stop)`; `cond = select(going_up, up, down)`.
   The body runs in a pushed scope binding `var` to the counter slot; the latch does `counter += step`,
@@ -185,7 +185,7 @@ step, so a range whose bounds and step disagree at run time is simply empty.
   `value </<= stop`; else mirrored); `member = on_step and in_bounds` — an `i1`. No branches, no
   runtime calls.
 - A program/function **result of type `Range`** is rejected in `gen_entry`
-  ([codegen.rs:350](src/codegen.rs#L350)); `run`/`PinpValue` are unchanged.
+  ([codegen.rs:350](../src/codegen/llvm/)); `run`/`PinpValue` are unchanged.
 
 ### Runtime errors
 

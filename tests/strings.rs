@@ -1,10 +1,8 @@
 // SPDX-License-Identifier: MIT
-#![cfg(feature = "llvm")]
 
 //! End-to-end strings: literals, `.len`, concatenation, f-string interpolation, the six
 //! comparisons, the `str(x)` conversion, and the `meminfo()` diagnostic — all round-tripped through
-//! the JIT so the 16-byte `PinpStr` crosses the host boundary on every check. Requires the `llvm`
-//! feature.
+//! the JIT so the 16-byte `PinpStr` crosses the host boundary on every check.
 //!
 //! Deterministic freeing is a later step, so nothing here asserts on allocation counts; these tests
 //! pin down *values*. Multiline literals are a later step too, so every literal below is
