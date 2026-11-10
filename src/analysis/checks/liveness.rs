@@ -2,9 +2,9 @@
 
 //! Liveness: which variables still have a read ahead of them.
 //!
-//! A backward analysis: its fact is the set of live variables, and a read makes a variable live
-//! while a write kills it. Terms shared across this layer — fact, merge, direction, finding — are
-//! defined in [`crate::analysis`].
+//! A backward analysis: its state is the set of live variables, and a read makes a variable live
+//! while a write kills it. Terms shared across this layer — lattice, join, direction, diagnostic —
+//! are defined in [`crate::analysis`].
 //!
 //! Vocabulary particular to liveness:
 //!
@@ -12,23 +12,23 @@
 //!   which only the top level can read or write. Each binding is its own variable, even when two
 //!   share a name.
 //! * Read, write: a use of a variable's value, and a store into it.
-//! * Live: a variable some later read reaches on at least one path. Merging unions the sets,
+//! * Live: a variable some later read reaches on at least one path. Joining unions the sets,
 //!   because a variable read on *any* onward path is still needed.
 //! * Kill: what a write does to the value that was there.
 //! * Dead store: a write to a variable that is not live immediately afterwards — the value is
 //!   replaced or discarded before anything looks at it.
 //! * Unused variable: a variable with no read anywhere.
 //!
-//! The last two are this module's findings, kept as separate rules. The remedies differ: a dead
+//! The last two are this module's diagnostics, kept as separate rules. The remedies differ: a dead
 //! store is one assignment to delete; an unused variable is the binding and every write to it.
-//! A variable nothing reads yields an unused-variable finding at its introduction and a dead store
+//! A variable nothing reads yields an unused-variable diagnostic at its introduction and a dead store
 //! at each later write, matching what `rustc` reports for the same shape. Compiler temporaries have
 //! no name and are never reported; nor is a variable named `_`.
 
 use rustc_hash::{FxHashMap, FxHashSet};
 
 use crate::analysis::dataflow::{
-    Analysis, Direction, MergeableFact, VariableSet, replay_backward, solve,
+    Analysis, Direction, Lattice, VariableSet, replay_backward, solve,
 };
 use crate::diagnostic::{Diagnostic, DiagnosticCode};
 use crate::ir::{
@@ -46,14 +46,14 @@ pub fn check_liveness(
     names: &[&str],
     entry_private_globals: &FxHashSet<GlobalId>,
 ) -> Vec<Diagnostic> {
-    let analysis = Liveness {
+    let analysis = LiveVariables {
         function,
         entry_private_globals,
     };
     let solution = solve(function, &analysis);
     let blocks = &function.shape.blocks;
 
-    let mut ever_read = VariableSet::nothing_known();
+    let mut ever_read = VariableSet::default();
     let mut introduction: FxHashMap<usize, Span> = FxHashMap::default();
     for (_, block) in blocks.iter() {
         for &statement in function.arena.items(block.statements) {
@@ -138,17 +138,17 @@ pub fn entry_private_globals(program: &Program<Flat>) -> FxHashSet<GlobalId> {
     private
 }
 
-struct Liveness<'function> {
+struct LiveVariables<'function> {
     function: &'function Function<Flat>,
     entry_private_globals: &'function FxHashSet<GlobalId>,
 }
 
-impl Analysis for Liveness<'_> {
-    type Fact = VariableSet;
+impl Analysis for LiveVariables<'_> {
+    type Lattice = VariableSet;
     const DIRECTION: Direction = Direction::Backward;
 
     fn boundary(&self) -> VariableSet {
-        VariableSet::nothing_known()
+        VariableSet::bottom()
     }
 
     /// One growth per variable that can join the set.
@@ -156,21 +156,21 @@ impl Analysis for Liveness<'_> {
         function.arena.locals.len() + self.entry_private_globals.len()
     }
 
-    fn transfer_statement(&self, statement: NodeId, fact: &mut VariableSet) {
+    fn transfer_statement(&self, statement: NodeId, state: &mut VariableSet) {
         if let Some(variable) = self.written(statement) {
-            fact.remove(variable);
+            state.remove(variable);
         }
-        self.reads_in(statement, fact);
+        self.reads_in(statement, state);
     }
 
-    fn transfer_terminator(&self, terminator: &Terminator, fact: &mut VariableSet) {
+    fn transfer_terminator(&self, terminator: &Terminator, state: &mut VariableSet) {
         if let Some(operand) = terminator.operand() {
-            self.reads_in(operand, fact);
+            self.reads_in(operand, state);
         }
     }
 }
 
-impl Liveness<'_> {
+impl LiveVariables<'_> {
     /// Locals are numbered first, the entry's private globals after them.
     fn local(&self, local_id: LocalId) -> usize {
         local_id.index() as usize
@@ -194,7 +194,7 @@ impl Liveness<'_> {
     /// Adds every variable read in the tree under `root`. Freeing a string is not reading it: the
     /// frees ownership places before every string store and at the end would otherwise make every
     /// string look used.
-    fn reads_in(&self, root: NodeId, fact: &mut VariableSet) {
+    fn reads_in(&self, root: NodeId, read: &mut VariableSet) {
         let arena = &self.function.arena;
         let mut pending = vec![root];
         while let Some(node_id) = pending.pop() {
@@ -204,11 +204,11 @@ impl Liveness<'_> {
                     ..
                 } => continue,
                 Operation::ReadLocal(local_id) => {
-                    fact.insert(self.local(local_id));
+                    read.insert(self.local(local_id));
                 }
                 Operation::ReadGlobal(global_id) => {
                     if let Some(variable) = self.global(global_id) {
-                        fact.insert(variable);
+                        read.insert(variable);
                     }
                 }
                 _ => {}
@@ -242,9 +242,9 @@ mod tests {
     use crate::sema::analyze;
     use indoc::indoc;
 
-    /// Findings for the function at `index` of `src` (the entry is the last), as `(code, text)`
+    /// Diagnostics for the function at `index` of `src` (the entry is the last), as `(code, text)`
     /// pairs sorted — with the globals analysed the way `analysis::check` analyses them.
-    fn findings_in(src: &str, index: usize) -> Vec<(&'static str, String)> {
+    fn diagnostics_in(src: &str, index: usize) -> Vec<(&'static str, String)> {
         let mut ast = parse(src).unwrap();
         analyze(&mut ast).unwrap();
         let program = flatten_program(desugar(&ast));
@@ -258,7 +258,9 @@ mod tests {
             check_liveness(function, &program.tables, &ast.names, &private)
                 .into_iter()
                 .map(|diagnostic| {
-                    let code = diagnostic.code.expect("a checker finding carries a code");
+                    let code = diagnostic
+                        .code
+                        .expect("a checker's diagnostic carries a code");
                     (code.name(), diagnostic.span.text(src).to_string())
                 })
                 .collect();
@@ -266,12 +268,12 @@ mod tests {
         found
     }
 
-    /// Findings for the top-level program.
-    fn findings(src: &str) -> Vec<(&'static str, String)> {
+    /// Diagnostics for the top-level program.
+    fn diagnostics(src: &str) -> Vec<(&'static str, String)> {
         let mut ast = parse(src).unwrap();
         analyze(&mut ast).unwrap();
         let entry = flatten_program(desugar(&ast)).entry;
-        findings_in(src, entry.index() as usize)
+        diagnostics_in(src, entry.index() as usize)
     }
 
     fn found(pairs: &[(&'static str, &str)]) -> Vec<(&'static str, String)> {
@@ -283,23 +285,26 @@ mod tests {
 
     #[test]
     fn a_value_read_later_is_not_reported() {
-        assert!(findings("a = 1\na + 1").is_empty());
+        assert!(diagnostics("a = 1\na + 1").is_empty());
     }
 
     #[test]
     fn an_overwritten_value_is_a_dead_store() {
-        assert_eq!(findings("a = 1\na = 2\na"), found(&[("dead-store", "a")]));
+        assert_eq!(
+            diagnostics("a = 1\na = 2\na"),
+            found(&[("dead-store", "a")])
+        );
     }
 
     #[test]
     fn a_variable_nothing_reads_is_an_unused_variable() {
-        assert_eq!(findings("a = 1\n0"), found(&[("unused-variable", "a")]));
+        assert_eq!(diagnostics("a = 1\n0"), found(&[("unused-variable", "a")]));
     }
 
     #[test]
     fn a_never_read_variable_reports_its_introduction_then_dead_stores() {
         assert_eq!(
-            findings("a = 1\na = 2\na = 3\n0"),
+            diagnostics("a = 1\na = 2\na = 3\n0"),
             found(&[
                 ("dead-store", "a"),
                 ("dead-store", "a"),
@@ -330,28 +335,28 @@ mod tests {
 
     #[test]
     fn a_self_referring_update_keeps_the_binding_live() {
-        assert!(findings("a = 1\na = a + 1\na").is_empty());
+        assert!(diagnostics("a = 1\na = a + 1\na").is_empty());
     }
 
     #[test]
     fn a_value_read_only_inside_a_loop_is_live() {
-        assert!(findings("a = 1\nn = 0\nwhile n < 3\n    n += a\nn").is_empty());
+        assert!(diagnostics("a = 1\nn = 0\nwhile n < 3\n    n += a\nn").is_empty());
     }
 
     #[test]
     fn a_store_in_a_loop_read_next_iteration_is_live() {
-        assert!(findings("total = 0\nfor idx in 1..3\n    total += idx\ntotal").is_empty());
+        assert!(diagnostics("total = 0\nfor idx in 1..3\n    total += idx\ntotal").is_empty());
     }
 
     #[test]
     fn a_value_read_on_only_one_branch_is_live() {
-        assert!(findings("a = 1\nb = 0\nif b > 0\n    b = a\nb").is_empty());
+        assert!(diagnostics("a = 1\nb = 0\nif b > 0\n    b = a\nb").is_empty());
     }
 
     #[test]
     fn the_dont_care_binder_is_never_reported() {
         assert!(
-            findings(indoc! {"
+            diagnostics(indoc! {"
                 m = [1, 2; 3, 4]
                 total = 0
                 for _, _, val in m
@@ -365,39 +370,39 @@ mod tests {
     #[test]
     fn an_unread_range_loop_index_is_not_reported() {
         // Idiomatic "repeat n times"; the loop's own test and step read the index.
-        assert!(findings("total = 0\nfor idx in 1..3\n    total += 1\ntotal").is_empty());
+        assert!(diagnostics("total = 0\nfor idx in 1..3\n    total += 1\ntotal").is_empty());
     }
 
     #[test]
     fn an_unread_array_loop_value_is_an_unused_variable() {
         // Newly reported, as `rustc` does; `_` silences it.
         assert_eq!(
-            findings("a = [1, 2]\nt = 0\nfor v in a\n    t += 1\nt"),
+            diagnostics("a = [1, 2]\nt = 0\nfor v in a\n    t += 1\nt"),
             found(&[("unused-variable", "v")])
         );
-        assert!(findings("a = [1, 2]\nt = 0\nfor _ in a\n    t += 1\nt").is_empty());
+        assert!(diagnostics("a = [1, 2]\nt = 0\nfor _ in a\n    t += 1\nt").is_empty());
     }
 
     #[test]
     fn an_unread_index_binder_is_the_loop_index_and_not_reported() {
-        assert!(findings("a = [1, 2]\nt = 0\nfor i, v in a\n    t += v\nt").is_empty());
+        assert!(diagnostics("a = [1, 2]\nt = 0\nfor i, v in a\n    t += v\nt").is_empty());
     }
 
     #[test]
     fn an_unread_float_comprehension_variable_is_an_unused_variable() {
         assert_eq!(
-            findings("[1.0 for x: float in 0..3]"),
+            diagnostics("[1.0 for x: float in 0..3]"),
             found(&[("unused-variable", "x")])
         );
         assert!(
-            findings("[1 for x in 0..3]").is_empty(),
+            diagnostics("[1 for x in 0..3]").is_empty(),
             "an int one is the loop index"
         );
     }
 
     #[test]
     fn a_global_read_from_a_function_is_not_reported() {
-        assert!(findings("g = 1\nread(): int is ::g\nread()").is_empty());
+        assert!(diagnostics("g = 1\nread(): int is ::g\nread()").is_empty());
     }
 
     #[test]
@@ -409,8 +414,8 @@ mod tests {
                 0
             bump()
         "};
-        assert!(findings_in(src, 0).is_empty(), "in the function");
-        assert!(findings(src).is_empty(), "at the top level");
+        assert!(diagnostics_in(src, 0).is_empty(), "in the function");
+        assert!(diagnostics(src).is_empty(), "at the top level");
     }
 
     #[test]
@@ -422,44 +427,47 @@ mod tests {
             other = 2
             f() + other
         "};
-        assert_eq!(findings(src), found(&[("dead-store", "other")]));
+        assert_eq!(diagnostics(src), found(&[("dead-store", "other")]));
     }
 
     #[test]
     fn a_function_local_nothing_reads_is_reported() {
         let src = "f(n: int): int is\n    unused = n * 2\n    n\nf(1)";
-        assert_eq!(findings_in(src, 0), found(&[("unused-variable", "unused")]));
+        assert_eq!(
+            diagnostics_in(src, 0),
+            found(&[("unused-variable", "unused")])
+        );
     }
 
     #[test]
     fn an_unread_parameter_is_not_reported() {
-        assert!(findings_in("f(n: int): int is 5\nf(1)", 0).is_empty());
+        assert!(diagnostics_in("f(n: int): int is 5\nf(1)", 0).is_empty());
     }
 
     #[test]
     fn a_function_result_counts_as_a_read() {
         let src = "f(n: int): int is\n    doubled = n * 2\n    doubled\nf(1)";
-        assert!(findings_in(src, 0).is_empty());
+        assert!(diagnostics_in(src, 0).is_empty());
     }
 
     #[test]
     fn a_read_inside_an_if_expression_counts() {
-        assert!(findings("a = 1\nb = a if a > 0 else 0\nb").is_empty());
+        assert!(diagnostics("a = 1\nb = a if a > 0 else 0\nb").is_empty());
     }
 
     #[test]
     fn a_read_through_interpolation_counts() {
-        assert!(findings("name = 'x'\nf'hello {name}'").is_empty());
+        assert!(diagnostics("name = 'x'\nf'hello {name}'").is_empty());
     }
 
     #[test]
     fn a_read_through_indexing_counts() {
-        assert!(findings("idx = 1\narr = [1, 2, 3]\narr[idx]").is_empty());
+        assert!(diagnostics("idx = 1\narr = [1, 2, 3]\narr[idx]").is_empty());
     }
 
     #[test]
     fn writing_one_element_is_not_a_whole_new_value() {
-        assert!(findings("arr = [1, 2, 3]\narr[0] = 9\narr[0]").is_empty());
+        assert!(diagnostics("arr = [1, 2, 3]\narr[0] = 9\narr[0]").is_empty());
     }
 
     #[test]
@@ -475,24 +483,27 @@ mod tests {
                 x = 2
             0
         "};
-        assert_eq!(findings(src), found(&[("unused-variable", "x")]));
+        assert_eq!(diagnostics(src), found(&[("unused-variable", "x")]));
     }
 
     #[test]
     fn swapping_through_a_multiple_assignment_reports_nothing() {
-        assert!(findings("a, b = 1, 2\na, b = b, a\na + b").is_empty());
+        assert!(diagnostics("a, b = 1, 2\na, b = b, a\na + b").is_empty());
     }
 
     #[test]
     fn a_chained_assignment_reports_the_unread_target() {
-        assert_eq!(findings("a = b = 1\na"), found(&[("unused-variable", "b")]));
+        assert_eq!(
+            diagnostics("a = b = 1\na"),
+            found(&[("unused-variable", "b")])
+        );
     }
 
     #[test]
     fn compiler_temporaries_are_never_reported() {
         // `and`, `or`, and if-expressions all write temporaries; none has a name to report.
         assert!(
-            findings("a = 1\nb = (a > 0 and a < 5) or a == 9\nc = 1 if b else 2\nc").is_empty()
+            diagnostics("a = 1\nb = (a > 0 and a < 5) or a == 9\nc = 1 if b else 2\nc").is_empty()
         );
     }
 
@@ -507,14 +518,17 @@ mod tests {
             src += &format!("    s += v{index}\n");
         }
         src += "    s\nf()";
-        assert_eq!(findings_in(&src, 0), found(&[("unused-variable", "v69")]));
+        assert_eq!(
+            diagnostics_in(&src, 0),
+            found(&[("unused-variable", "v69")])
+        );
     }
 
     #[test]
-    fn both_findings_can_appear_in_one_run() {
+    fn both_diagnostics_can_appear_in_one_run() {
         let src = "dead = 1\ndead = 2\nunread = 3\ndead";
         assert_eq!(
-            findings(src),
+            diagnostics(src),
             found(&[("dead-store", "dead"), ("unused-variable", "unread")])
         );
     }
@@ -524,11 +538,14 @@ mod tests {
         // Every string store frees the old value first, and the end of the program frees them all;
         // neither is a use of the value.
         assert_eq!(
-            findings("s = 'a'\ns = 'b'\ns"),
+            diagnostics("s = 'a'\ns = 'b'\ns"),
             found(&[("dead-store", "s")])
         );
-        assert_eq!(findings("s = 'a'\n0"), found(&[("unused-variable", "s")]));
+        assert_eq!(
+            diagnostics("s = 'a'\n0"),
+            found(&[("unused-variable", "s")])
+        );
         let src = "f(): int is\n    t = 'x'\n    0\nf()";
-        assert_eq!(findings_in(src, 0), found(&[("unused-variable", "t")]));
+        assert_eq!(diagnostics_in(src, 0), found(&[("unused-variable", "t")]));
     }
 }

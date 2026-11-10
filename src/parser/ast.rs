@@ -287,7 +287,7 @@ pub enum Stmt {
     Assign {
         target_lists: Vec<Vec<Place>>,
         /// Where each target was written, shaped exactly like `target_lists`. A `Place` is a bare
-        /// symbol id with nowhere to hang a position, so a finding about a binding — an unused one,
+        /// symbol id with nowhere to hang a position, so a diagnostic about a binding — an unused one,
         /// or a store nothing reads — takes its span from here.
         target_spans: Vec<Vec<Span>>,
         values: Vec<ExprId>,

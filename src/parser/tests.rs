@@ -1832,7 +1832,7 @@ fn variable_reads_carry_their_span() {
 
 #[test]
 fn a_global_span_covers_the_marker() {
-    // `::g` is how the binding is written, so that is what a finding should underline.
+    // `::g` is how the binding is written, so that is what a diagnostic should underline.
     let src = "g = 1\nf(): int is ::g";
     let ast = parse_ok(src);
     let span = ast

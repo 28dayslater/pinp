@@ -21,7 +21,7 @@ impl Severity {
     }
 }
 
-/// A class of a finding.
+/// A class of diagnostic.
 ///
 /// Known codes for various errors issued by the parser, static analyser, etc.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -95,7 +95,7 @@ impl DiagnosticCode {
         self.info().description
     }
 
-    /// How severe a finding of this class is. Everything is advisory for now.
+    /// How severe a diagnostic of this class is. Everything is advisory for now.
     pub const fn severity(self) -> Severity {
         self.info().severity
     }
@@ -118,10 +118,10 @@ pub trait Diagnose {
     }
 }
 
-/// One finding.
+/// One diagnostic.
 #[derive(Debug, Clone, PartialEq)]
 pub struct Diagnostic {
-    /// The rule this finding belongs to, for the analysis layer's advisory checks. `None` for a
+    /// The rule this diagnostic belongs to, for the analysis layer's advisory checks. `None` for a
     /// lexer, parser, or sema error: those are one-offs a suppression pragma would never key on,
     /// and minting a permanent code for each would spend the namespace for nothing.
     pub code: Option<DiagnosticCode>,
@@ -134,7 +134,7 @@ pub struct Diagnostic {
 }
 
 impl Diagnostic {
-    /// A rule's finding at `span`, taking its severity from the rule.
+    /// A rule's diagnostic at `span`, taking its severity from the rule.
     pub fn new(code: DiagnosticCode, span: Span, message: impl Into<String>) -> Diagnostic {
         Diagnostic {
             code: Some(code),
@@ -162,8 +162,8 @@ impl Diagnostic {
         self
     }
 
-    /// One line per finding: `line:col: severity[CODE]: message`, then one indented line per note.
-    /// A finding with no [`DiagnosticCode`] renders `line:col: severity: message` — nothing is
+    /// One line per diagnostic: `line:col: severity[CODE]: message`, then one indented line per note.
+    /// A diagnostic with no [`DiagnosticCode`] renders `line:col: severity: message` — nothing is
     /// bracketed. A span that was never recorded prints without a position rather than pointing at
     /// byte 0.
     ///
@@ -241,7 +241,7 @@ mod tests {
     }
 
     #[test]
-    fn rendering_places_the_finding() {
+    fn rendering_places_the_diagnostic() {
         let src = "a = 1\nb = 2\n";
         let line_index = LineIndex::new(src);
         let diagnostic = Diagnostic::new(
@@ -270,7 +270,7 @@ mod tests {
     }
 
     #[test]
-    fn notes_render_indented_under_the_finding() {
+    fn notes_render_indented_under_the_diagnostic() {
         let src = "a = 1\na = 2\n";
         let line_index = LineIndex::new(src);
         let diagnostic = Diagnostic::new(

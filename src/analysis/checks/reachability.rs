@@ -2,22 +2,22 @@
 
 //! Unreachable code: statements no execution can arrive at.
 //!
-//! A forward analysis over the simplest fact there is — reached, or not. Every block starts knowing
-//! nothing (`false`), the entry is seeded as reached, and anything still `false` at fixpoint has no
+//! A forward analysis over the simplest lattice there is — reached, or not. Every block starts at
+//! bottom (`false`), the entry is seeded as reached, and anything still `false` at fixpoint has no
 //! path leading to it. Terms shared across this layer are defined in [`crate::analysis`].
 //!
 //! Vocabulary particular to reachability:
 //!
-//! * Reached: some path from the entry arrives at this point. Merging is "reached from anywhere",
+//! * Reached: some path from the entry arrives at this point. Joining is "reached from anywhere",
 //!   so a point stays unreached only when no path whatsoever leads to it.
-//! * Unreachable: the finding — a statement no execution can arrive at.
+//! * Unreachable: the diagnostic — a statement no execution can arrive at.
 //!
 //! What makes anything unreachable in a language with no `return` or `break` is a condition that
 //! cannot vary. Only a **constant** `true`/`false` counts here, and a counted loop over a range of
 //! two integer constants that is provably empty: `while 1 > 2` is not folded, because doing
 //! constant arithmetic by hand would duplicate what constant propagation will do properly later.
 
-use crate::analysis::dataflow::{Analysis, Direction, ReachabilityFact, solve};
+use crate::analysis::dataflow::{Analysis, Direction, ReachabilityLattice, solve};
 use crate::diagnostic::{Diagnostic, DiagnosticCode};
 use crate::ir::{BlockId, Constant, Flat, Function, NodeId, Operation, ProgramTables, Terminator};
 use crate::lexer::Span;
@@ -71,11 +71,11 @@ struct Reachability<'function> {
 }
 
 impl Analysis for Reachability<'_> {
-    type Fact = ReachabilityFact;
+    type Lattice = ReachabilityLattice;
     const DIRECTION: Direction = Direction::Forward;
 
-    fn boundary(&self) -> ReachabilityFact {
-        ReachabilityFact::reached()
+    fn boundary(&self) -> ReachabilityLattice {
+        ReachabilityLattice::reached()
     }
 
     fn height(&self, _function: &Function<Flat>) -> usize {
@@ -83,9 +83,9 @@ impl Analysis for Reachability<'_> {
     }
 
     // Reaching a statement says nothing about the next one: a block runs whole once entered.
-    fn transfer_statement(&self, _statement: NodeId, _fact: &mut ReachabilityFact) {}
+    fn transfer_statement(&self, _statement: NodeId, _state: &mut ReachabilityLattice) {}
 
-    fn transfer_terminator(&self, _terminator: &Terminator, _fact: &mut ReachabilityFact) {}
+    fn transfer_terminator(&self, _terminator: &Terminator, _state: &mut ReachabilityLattice) {}
 
     fn feasible_successors(&self, function: &Function<Flat>, block_id: BlockId) -> Vec<BlockId> {
         let Terminator::Branch {
@@ -190,8 +190,8 @@ mod tests {
     use crate::sema::analyze;
     use indoc::indoc;
 
-    /// The text of each finding in every function of `src`, in source order.
-    fn findings(src: &str) -> Vec<String> {
+    /// The text of each diagnostic in every function of `src`, in source order.
+    fn diagnostics(src: &str) -> Vec<String> {
         let mut ast = parse(src).unwrap();
         analyze(&mut ast).unwrap();
         let program = flatten_program(desugar(&ast));
@@ -219,7 +219,7 @@ mod tests {
                 n = 2
             n
         "};
-        assert_eq!(findings(src), vec!["n"], "the body's assignment to `n`");
+        assert_eq!(diagnostics(src), vec!["n"], "the body's assignment to `n`");
     }
 
     #[test]
@@ -231,7 +231,7 @@ mod tests {
                 n = 2
             n
         "};
-        assert!(findings(src).is_empty());
+        assert!(diagnostics(src).is_empty());
     }
 
     #[test]
@@ -242,7 +242,7 @@ mod tests {
                 n = 2
             n
         "};
-        assert!(findings(src).is_empty(), "deliberately not folded");
+        assert!(diagnostics(src).is_empty(), "deliberately not folded");
     }
 
     #[test]
@@ -253,7 +253,7 @@ mod tests {
                 n = 2
             n
         "};
-        assert_eq!(findings(src), vec!["n"]);
+        assert_eq!(diagnostics(src), vec!["n"]);
     }
 
     #[test]
@@ -266,7 +266,7 @@ mod tests {
                 n = 3
             n
         "};
-        assert_eq!(findings(src), vec!["n"], "only the else arm");
+        assert_eq!(diagnostics(src), vec!["n"], "only the else arm");
     }
 
     #[test]
@@ -279,21 +279,21 @@ mod tests {
                 n = 3
             n
         "};
-        assert_eq!(findings(src), vec!["n"]);
+        assert_eq!(diagnostics(src), vec!["n"]);
     }
 
     #[test]
     fn an_if_expression_with_a_constant_condition_has_a_dead_arm() {
         // Newly reported: the AST-borrowing graph treated an if-expression as atomic.
         let src = "n = 1\nx = 10 if false else 20\nn + x";
-        assert_eq!(findings(src), vec!["10"]);
+        assert_eq!(diagnostics(src), vec!["10"]);
     }
 
     #[test]
     fn a_constant_false_left_operand_is_not_followed_through_and() {
         // `and` becomes a branch on a temporary holding the left operand; reachability folds
         // constant conditions only, not values carried through variables.
-        assert!(findings("n = 1\nb = false and n > 0\nb").is_empty());
+        assert!(diagnostics("n = 1\nb = false and n > 0\nb").is_empty());
     }
 
     #[test]
@@ -301,7 +301,11 @@ mod tests {
         // Sema rejects a literal range whose spelling contradicts its bounds (`1..>5`), so the
         // empty ones are equal bounds with an exclusive stop — or a written step leading away.
         for range in ["1..<1", "3..>3", "5..>1:2", "1..<5:-2"] {
-            assert_eq!(findings(&loop_over(range)).len(), 1, "`{range}` is empty");
+            assert_eq!(
+                diagnostics(&loop_over(range)).len(),
+                1,
+                "`{range}` is empty"
+            );
         }
     }
 
@@ -311,7 +315,7 @@ mod tests {
             "1..3", "1..<2", "5..>1", "1..1", "1..5:2", "1..1:7", "5..1:-2",
         ] {
             assert!(
-                findings(&loop_over(range)).is_empty(),
+                diagnostics(&loop_over(range)).is_empty(),
                 "`{range}` runs at least once"
             );
         }
@@ -320,7 +324,7 @@ mod tests {
     #[test]
     fn an_inclusive_range_without_a_step_counts_toward_its_stop() {
         // `5..1` runs 5, 4, 3, 2, 1 — today's checker took it for empty.
-        assert!(findings(&loop_over("5..1")).is_empty());
+        assert!(diagnostics(&loop_over("5..1")).is_empty());
     }
 
     #[test]
@@ -332,13 +336,13 @@ mod tests {
                 total += idx
             total
         "};
-        assert!(findings(src).is_empty());
-        assert!(findings("r = 1..<1\nt = 0\nfor i in r\n    t += i\nt").is_empty());
+        assert!(diagnostics(src).is_empty());
+        assert!(diagnostics("r = 1..<1\nt = 0\nfor i in r\n    t += i\nt").is_empty());
     }
 
     #[test]
     fn a_loop_over_an_array_always_enters_its_body() {
-        assert!(findings("a = [1, 2]\nt = 0\nfor v in a\n    t += v\nt").is_empty());
+        assert!(diagnostics("a = [1, 2]\nt = 0\nfor v in a\n    t += v\nt").is_empty());
     }
 
     #[test]
@@ -350,7 +354,7 @@ mod tests {
                 n = 2
             n
         "};
-        assert_eq!(findings(src), vec!["n"], "the trailing `n`");
+        assert_eq!(diagnostics(src), vec!["n"], "the trailing `n`");
     }
 
     #[test]
@@ -365,7 +369,7 @@ mod tests {
                 n = 4
             n
         "};
-        assert_eq!(findings(src), vec!["n", "n", "n"]);
+        assert_eq!(diagnostics(src), vec!["n", "n", "n"]);
     }
 
     #[test]
@@ -379,7 +383,7 @@ mod tests {
                     total += 1
             total
         "};
-        assert!(findings(src).is_empty());
+        assert!(diagnostics(src).is_empty());
     }
 
     #[test]
@@ -392,12 +396,12 @@ mod tests {
                 m
             f(1)
         "};
-        assert_eq!(findings(src), vec!["m"]);
+        assert_eq!(diagnostics(src), vec!["m"]);
     }
 
     #[test]
     fn a_dead_string_assignment_is_reported_at_its_target() {
         // The free of the old value comes first in the block, and carries the target's position.
-        assert_eq!(findings("s = 'a'\nif false\n    s = 'b'\ns"), vec!["s"]);
+        assert_eq!(diagnostics("s = 'a'\nif false\n    s = 'b'\ns"), vec!["s"]);
     }
 }
