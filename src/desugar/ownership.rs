@@ -12,13 +12,13 @@
 //!   A function frees its slots before it returns; the top level frees the globals too. A slot
 //!   never written holds the empty string, whose free is harmless.
 //! * **Consumers.** An operation that only reads its strings — a join, a comparison, a length —
-//!   takes an owned operand through a temporary of its own (an *alias*), freed once the operation
+//!   takes an owned operand through an *ownership temporary* of its own, freed once the operation
 //!   has run. A string discarded unread is freed at once.
 //! * **Results.** A function's string result is moved out to the caller, a borrowed one copied
 //!   first, since the slot it was read from is freed on the way out.
 //!
-//! Aliases are temporaries this module makes to move an owned string from where it is made to
-//! where it is used: a read of one hands the string on, and none is freed at the end.
+//! Ownership temporaries are what this module makes to move an owned string from where it is
+//! made to where it is used: a read of one hands the string on, and none is freed at the end.
 
 use super::*;
 use crate::ir::RuntimeFunction;
@@ -32,7 +32,9 @@ impl Desugarer<'_> {
                 function,
                 RuntimeFunction::StrConcat | RuntimeFunction::StrCopy
             ),
-            Operation::ReadLocal(local_id) => self.function.aliases.contains(&local_id),
+            Operation::ReadLocal(local_id) => {
+                self.function.ownership_temporaries.contains(&local_id)
+            }
             _ => false,
         }
     }
@@ -62,12 +64,13 @@ impl Desugarer<'_> {
         self.statement_node(Operation::Evaluate(call), span)
     }
 
-    /// Moves the owned `value` into a new alias, written in `out`; returns a read of it.
-    fn alias(&mut self, value: NodeId, span: Span, out: &mut Vec<NodeId>) -> NodeId {
-        let alias = self.temporary(PinpType::Str);
-        self.function.aliases.insert(alias);
-        out.push(self.write_local(alias, value, span));
-        self.read_local(alias, span)
+    /// Saves the owned `value` in a new ownership temporary, written in `out`; returns a read of
+    /// it.
+    fn save_owned(&mut self, value: NodeId, span: Span, out: &mut Vec<NodeId>) -> NodeId {
+        let temporary = self.temporary(PinpType::Str);
+        self.function.ownership_temporaries.insert(temporary);
+        out.push(self.write_local(temporary, value, span));
+        self.read_local(temporary, span)
     }
 
     /// Stores the string `value` in `binding`: the old value freed, a borrowed one copied. The new
@@ -82,7 +85,7 @@ impl Desugarer<'_> {
     ) {
         let mut value = self.owned(value);
         if self.reads_binding(value, binding) || self.calls_a_function(value) {
-            value = self.alias(value, span, out);
+            value = self.save_owned(value, span, out);
         }
         let old = self.read(binding, span);
         out.push(self.free(old, span));
@@ -103,7 +106,7 @@ impl Desugarer<'_> {
     }
 
     /// Builds `make(operands)` for an operation that only reads its string operands. Owned ones
-    /// are moved into aliases first and freed once it has run — and so is every borrowed one
+    /// are saved in ownership temporaries first and freed once it has run — and so is every borrowed one
     /// before an operand that calls a function, which could otherwise free it first. The result
     /// is then computed ahead of the statement too, into a temporary of its own.
     pub(super) fn consume(
@@ -134,8 +137,8 @@ impl Desugarer<'_> {
             if owned[index] || call_follows {
                 let operand_span = self.function.arena.spans[operand];
                 let value = self.owned(operand);
-                if !self.is_alias_read(value) {
-                    operands[index] = self.alias(value, operand_span, out);
+                if !self.is_ownership_temporary_read(value) {
+                    operands[index] = self.save_owned(value, operand_span, out);
                 }
                 to_free.push((operands[index], operand_span));
             }
@@ -143,16 +146,16 @@ impl Desugarer<'_> {
         let operation = make(self, &operands);
         let consumed = self.push(operation, result_type, span);
         let result = match result_type {
-            PinpType::Str => self.alias(consumed, span, out),
+            PinpType::Str => self.save_owned(consumed, span, out),
             _ => {
                 let temporary = self.temporary(result_type);
                 out.push(self.write_local(temporary, consumed, span));
                 self.read_local(temporary, span)
             }
         };
-        for (alias_read, alias_span) in to_free {
-            let again = self.reread_local(alias_read);
-            out.push(self.free(again, alias_span));
+        for (temporary_read, temporary_span) in to_free {
+            let again = self.reread_local(temporary_read);
+            out.push(self.free(again, temporary_span));
         }
         result
     }
@@ -169,7 +172,7 @@ impl Desugarer<'_> {
         let mut slots: Vec<Binding> = Vec::new();
         for (local_id, local) in self.function.arena.locals.iter() {
             let is_string = self.tables.types.get(local.type_id) == PinpType::Str;
-            if is_string && !self.function.aliases.contains(&local_id) {
+            if is_string && !self.function.ownership_temporaries.contains(&local_id) {
                 slots.push(Binding::Local(local_id));
             }
         }
@@ -185,9 +188,9 @@ impl Desugarer<'_> {
             match self.node_type(result) {
                 PinpType::Str => {
                     let value = self.owned(result);
-                    match slots.is_empty() || self.is_alias_read(value) {
+                    match slots.is_empty() || self.is_ownership_temporary_read(value) {
                         true => value,
-                        false => self.alias(value, span, out),
+                        false => self.save_owned(value, span, out),
                     }
                 }
                 _ if slots.is_empty() || self.is_untouched_by_frees(result) => result,
@@ -205,9 +208,9 @@ impl Desugarer<'_> {
         result
     }
 
-    fn is_alias_read(&self, node: NodeId) -> bool {
+    fn is_ownership_temporary_read(&self, node: NodeId) -> bool {
         matches!(self.function.arena.operations[node],
-            Operation::ReadLocal(local_id) if self.function.aliases.contains(&local_id))
+            Operation::ReadLocal(local_id) if self.function.ownership_temporaries.contains(&local_id))
     }
 
     /// Whether a result can be computed after the frees: a constant, or a read of a variable that
@@ -222,7 +225,7 @@ impl Desugarer<'_> {
     /// Another node reading the local `read` reads.
     fn reread_local(&mut self, read: NodeId) -> NodeId {
         let Operation::ReadLocal(local_id) = self.function.arena.operations[read] else {
-            unreachable!("an alias is read through `ReadLocal`")
+            unreachable!("an ownership temporary is read through `ReadLocal`")
         };
         let span = self.function.arena.spans[read];
         self.read_local(local_id, span)

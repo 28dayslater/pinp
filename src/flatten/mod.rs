@@ -73,7 +73,7 @@ pub fn flatten(function: Function<Structured>, tables: &mut ProgramTables) -> Fu
             terminator: terminator.expect("flattening terminates every block it creates"),
         });
     }
-    Function {
+    let flat = Function {
         id,
         parameter_count,
         arena,
@@ -82,7 +82,9 @@ pub fn flatten(function: Function<Structured>, tables: &mut ProgramTables) -> Fu
             entry,
             counted_loop_ranges,
         },
-    }
+    };
+    debug_assert_eq!(crate::ir::verify(&flat), Ok(()), "flattening broke the IR");
+    flat
 }
 
 /// What is known, before running, about how a counted loop's range runs.

@@ -34,21 +34,21 @@ use crate::ir::{BlockId, Flat, Function, NodeId, SideTable, Terminator};
 /// ordered by how much they say, where [`nothing_known`](Self::nothing_known) is the "bottom" and
 /// [`merge`](Self::merge) is the "join". Those are the words to search for; the methods are spelled
 /// here as what they do.
-pub trait MergeableFact: Clone + PartialEq {
+///
+/// The contract, which the solver relies on and cannot check:
+///
+/// * `merge` is associative, commutative, and idempotent — the order in which paths are combined,
+///   and combining one twice, make no difference;
+/// * `nothing_known()` is its identity — merging it into a fact changes nothing;
+/// * a fact can grow only a bounded number of times: [`Analysis::height`].
+pub trait MergeableFact: Clone {
     /// What is known about a point the solver has not examined yet: nothing.
-    ///
-    /// [`solve`] starts every block here, so merging it into another fact must add nothing.
     fn nothing_known() -> Self;
 
     /// Combines another path's fact into this one, returning whether this fact gained anything.
     ///
-    /// [`solve`] calls this once per incoming edge, and the returned flag is its termination
-    /// signal: a block whose fact stopped growing does not re-queue its neighbours.
-    ///
-    /// Merging must only ever *add* information, never remove it, and there must be a limit to how
-    /// much can be added — otherwise the facts never settle. Neither property can be checked here;
-    /// a `merge` that reports a gain for ever is what [`solve`]'s visit budget turns into a failed
-    /// assertion rather than a hung process.
+    /// The returned flag is [`solve`]'s signal: a block whose fact did not grow does not re-queue
+    /// its neighbours.
     fn merge(&mut self, other: &Self) -> bool;
 }
 
@@ -64,11 +64,18 @@ pub enum Direction {
 /// One analysis: a lattice, a direction, and the transfer functions over a block's contents.
 ///
 /// An analysis holds the function it analyses, so a transfer function can look at a statement's
-/// operation and children.
+/// operation and children. Transfer functions must be **monotone**: a fact that says more going in
+/// never says less coming out. [`solve`] merges each new result into the block's fact, so a lapse
+/// cannot make facts oscillate — but it can make them less precise than they should be.
 pub trait Analysis {
     type Fact: MergeableFact;
 
     const DIRECTION: Direction;
+
+    /// How many times a fact can grow in `function`, at most: the longest chain of ever-larger
+    /// facts. One for a yes-or-no fact; the number of variables for a set of them. [`solve`] treats
+    /// a block whose fact grows more often as a fact type without a bound, and stops.
+    fn height(&self, function: &Function<Flat>) -> usize;
 
     /// The fact where the analysis starts — at the entry block for a forward analysis, after every
     /// returning block for a backward one. A block ending in a runtime error starts from nothing:
@@ -91,7 +98,7 @@ pub trait Analysis {
     /// graph's, so it lives here — the graph records what the program *says*.
     ///
     /// [`solve`] honours this in both directions: an edge dropped here carries no facts either way.
-    fn live_successors(&self, function: &Function<Flat>, block_id: BlockId) -> Vec<BlockId> {
+    fn feasible_successors(&self, function: &Function<Flat>, block_id: BlockId) -> Vec<BlockId> {
         function.successors(block_id)
     }
 }
@@ -117,56 +124,48 @@ impl<F: Clone> Solution<F> {
     }
 }
 
-/// How many block visits `solve` allows before it decides the analysis will never converge.
-///
-/// A correct analysis over a lattice of finite height needs a small multiple of the block count. A
-/// bound turns the one bug this framework cannot rule out — a non-monotone `join` — into a loud
-/// failure instead of a hung process.
-const VISIT_BUDGET_PER_BLOCK: usize = 64;
-
 /// Runs `analysis` over `function` until the facts stop changing.
+///
+/// Each block's result is merged into its fact rather than replacing it, so facts only grow, and
+/// a block is re-queued only when a neighbour's fact grew — at most [`Analysis::height`] times per
+/// block, which is what bounds the work.
 ///
 /// # Panics
 ///
-/// If the analysis has not converged after [`VISIT_BUDGET_PER_BLOCK`] visits per block, which means
-/// its `merge` is not monotone or its lattice has no finite height.
+/// If a block's fact grows more than [`Analysis::height`] times: the fact type has no bound, or the
+/// analysis understates it. A loud failure instead of a hung process.
 pub fn solve<A: Analysis>(function: &Function<Flat>, analysis: &A) -> Solution<A::Fact> {
     let blocks = &function.shape.blocks;
     let mut before = SideTable::new(A::Fact::nothing_known());
     let mut after = SideTable::new(A::Fact::nothing_known());
     let predecessors = function.predecessors();
+    let height = analysis.height(function);
+    let mut growths: SideTable<BlockId, usize> = SideTable::default();
 
     // Every block starts on the worklist. Seeding only the boundary would stall immediately: the
     // first evaluation of a block whose neighbours are all still "nothing known" produces that
     // too, sees no change, and so never enqueues anyone.
-    let mut worklist: Vec<BlockId> = blocks.iter().map(|(block_id, _)| block_id).collect();
+    let mut worklist = Worklist::default();
+    let mut order: Vec<BlockId> = blocks.iter().map(|(block_id, _)| block_id).collect();
     if A::DIRECTION == Direction::Forward {
         // `pop` takes from the end, so reversing makes the entry block the first one evaluated —
         // facts then flow with the edges, and convergence takes fewer passes.
-        worklist.reverse();
+        order.reverse();
     }
-
-    let budget = blocks.len() * VISIT_BUDGET_PER_BLOCK + 1;
-    let mut visits = 0;
+    worklist.extend(order);
 
     while let Some(block_id) = worklist.pop() {
-        visits += 1;
-        assert!(
-            visits <= budget,
-            "dataflow analysis did not converge after {visits} block visits — its `merge` is \
-             probably not monotone"
-        );
         let block = &blocks[block_id];
         let statements = function.arena.items(block.statements);
 
-        match A::DIRECTION {
+        let grew = match A::DIRECTION {
             Direction::Forward => {
                 // Input is everything the predecessors produced — over the edges that can be
                 // taken, so a predecessor whose branch never comes this way contributes nothing.
                 let mut incoming = A::Fact::nothing_known();
                 for &predecessor in &predecessors[block_id] {
                     if analysis
-                        .live_successors(function, predecessor)
+                        .feasible_successors(function, predecessor)
                         .contains(&block_id)
                     {
                         incoming.merge(&after[predecessor]);
@@ -181,16 +180,16 @@ pub fn solve<A: Analysis>(function: &Function<Flat>, analysis: &A) -> Solution<A
                     analysis.transfer_statement(statement, &mut fact);
                 }
                 analysis.transfer_terminator(&block.terminator, &mut fact);
-
-                if fact != after[block_id] {
-                    after[block_id] = fact;
-                    worklist.extend(analysis.live_successors(function, block_id));
+                let grew = after[block_id].merge(&fact);
+                if grew {
+                    worklist.extend(analysis.feasible_successors(function, block_id));
                 }
+                grew
             }
             Direction::Backward => {
                 // Input is everything the reachable successors will need.
                 let mut incoming = A::Fact::nothing_known();
-                for successor in analysis.live_successors(function, block_id) {
+                for successor in analysis.feasible_successors(function, block_id) {
                     incoming.merge(&before[successor]);
                 }
                 if matches!(block.terminator, Terminator::Return(_)) {
@@ -202,16 +201,49 @@ pub fn solve<A: Analysis>(function: &Function<Flat>, analysis: &A) -> Solution<A
                 for &statement in statements.iter().rev() {
                     analysis.transfer_statement(statement, &mut fact);
                 }
-
-                if fact != before[block_id] {
-                    before[block_id] = fact;
-                    worklist.extend_from_slice(&predecessors[block_id]);
+                let grew = before[block_id].merge(&fact);
+                if grew {
+                    worklist.extend(predecessors[block_id].iter().copied());
                 }
+                grew
             }
+        };
+        if grew {
+            growths[block_id] += 1;
+            assert!(
+                growths[block_id] <= height,
+                "dataflow analysis did not converge: a fact grew more than the analysis's height \
+                 of {height} allows — the fact type is unbounded, or the height understated"
+            );
         }
     }
 
     Solution { before, after }
+}
+
+/// Blocks waiting to be evaluated, each at most once at a time: a block queued twice would only be
+/// evaluated twice for the same input.
+#[derive(Default)]
+struct Worklist {
+    pending: Vec<BlockId>,
+    queued: SideTable<BlockId, bool>,
+}
+
+impl Worklist {
+    fn extend(&mut self, block_ids: impl IntoIterator<Item = BlockId>) {
+        for block_id in block_ids {
+            if !self.queued[block_id] {
+                self.queued[block_id] = true;
+                self.pending.push(block_id);
+            }
+        }
+    }
+
+    fn pop(&mut self) -> Option<BlockId> {
+        let block_id = self.pending.pop()?;
+        self.queued[block_id] = false;
+        Some(block_id)
+    }
 }
 
 /// Walks a solved backward analysis through `block_id` statement by statement, last first, calling
@@ -233,6 +265,8 @@ pub fn replay_backward<A: Analysis>(
     }
 }
 
+/// Whether execution can reach a point: the fact of reachability. It can grow once, from not
+/// reached to reached.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub struct ReachabilityFact(bool);
 
@@ -259,18 +293,10 @@ impl MergeableFact for ReachabilityFact {
     }
 }
 
-/// A set of symbols: the fact shape of any analysis asking "which bindings satisfy X *here*".
-///
-/// Liveness is the first user — the symbols still to be read — and definite assignment and
-/// ownership want the same shape. Joining is union, so a fact only ever grows and the lattice
-/// height is bounded by the number of symbols in the program, which is what makes [`solve`]
-/// terminate.
-///
-/// A dedicated bitset would make `join` a word-wise OR and get the changed flag out of the same
-/// loop; the sets here are small enough that it would be a refinement with no behavioural
-/// difference.
-/// A set of variables, numbered densely from zero by the analysis using it: one bit each, so
-/// merging two sets is a word-wise `or`. Two sets with the same members are equal, however they
+/// A set of variables, by index: the fact shape of any analysis asking "which variables satisfy X
+/// *here*". Liveness is the first user — the variables still to be read. The analysis using it
+/// numbers its variables densely from zero; each is one bit, so merging is a word-wise `or` and a
+/// set can grow at most once per variable. Two sets with the same members are equal, however they
 /// grew.
 #[derive(Debug, Clone, Default)]
 pub struct VariableSet {
@@ -382,6 +408,10 @@ mod tests {
             ReachabilityFact::reached()
         }
 
+        fn height(&self, _function: &Function<Flat>) -> usize {
+            1
+        }
+
         fn transfer_statement(&self, _statement: NodeId, _fact: &mut ReachabilityFact) {}
 
         fn transfer_terminator(&self, _terminator: &Terminator, _fact: &mut ReachabilityFact) {}
@@ -398,6 +428,10 @@ mod tests {
 
         fn boundary(&self) -> VariableSet {
             VariableSet::nothing_known()
+        }
+
+        fn height(&self, _function: &Function<Flat>) -> usize {
+            self.function.arena.locals.len()
         }
 
         fn transfer_statement(&self, statement: NodeId, fact: &mut VariableSet) {
@@ -422,11 +456,19 @@ mod tests {
             ReachabilityFact::reached()
         }
 
+        fn height(&self, _function: &Function<Flat>) -> usize {
+            1
+        }
+
         fn transfer_statement(&self, _statement: NodeId, _fact: &mut ReachabilityFact) {}
 
         fn transfer_terminator(&self, _terminator: &Terminator, _fact: &mut ReachabilityFact) {}
 
-        fn live_successors(&self, function: &Function<Flat>, block_id: BlockId) -> Vec<BlockId> {
+        fn feasible_successors(
+            &self,
+            function: &Function<Flat>,
+            block_id: BlockId,
+        ) -> Vec<BlockId> {
             match function.shape.blocks[block_id].terminator {
                 Terminator::Branch { else_block, .. } => vec![else_block],
                 _ => function.successors(block_id),
@@ -651,6 +693,10 @@ mod tests {
             NeverSettles(0)
         }
 
+        fn height(&self, _function: &Function<Flat>) -> usize {
+            8
+        }
+
         fn transfer_statement(&self, _statement: NodeId, _fact: &mut NeverSettles) {}
 
         fn transfer_terminator(&self, _terminator: &Terminator, _fact: &mut NeverSettles) {}
@@ -661,5 +707,69 @@ mod tests {
     fn a_non_monotone_analysis_is_caught_rather_than_looping_forever() {
         let function = flat_entry(LOOP);
         solve(&function, &Divergent);
+    }
+
+    /// A fact that can grow a thousand times: a count, merged by `max`.
+    #[derive(Clone, PartialEq, Debug)]
+    struct Count(u32);
+
+    const CAP: u32 = 1000;
+
+    impl MergeableFact for Count {
+        fn nothing_known() -> Count {
+            Count(0)
+        }
+
+        fn merge(&mut self, other: &Count) -> bool {
+            let changed = other.0 > self.0;
+            self.0 = self.0.max(other.0);
+            changed
+        }
+    }
+
+    /// Every statement adds one, up to `CAP`: monotone, finite, and slow to settle around a loop.
+    struct Counting;
+
+    impl Analysis for Counting {
+        type Fact = Count;
+        const DIRECTION: Direction = Direction::Forward;
+
+        fn boundary(&self) -> Count {
+            Count(0)
+        }
+
+        fn height(&self, _function: &Function<Flat>) -> usize {
+            CAP as usize
+        }
+
+        fn transfer_statement(&self, _statement: NodeId, fact: &mut Count) {
+            fact.0 = (fact.0 + 1).min(CAP);
+        }
+
+        fn transfer_terminator(&self, _terminator: &Terminator, _fact: &mut Count) {}
+    }
+
+    #[test]
+    fn a_tall_but_finite_lattice_converges() {
+        // The review's case: a correct analysis whose facts grow many times, which a visit budget
+        // proportional to the block count alone took for divergence.
+        let function = flat_entry(LOOP);
+        let solution = solve(&function, &Counting);
+        assert_eq!(
+            solution.after(function.shape.entry).0,
+            1,
+            "the entry runs once"
+        );
+        let (returning, _) = function
+            .shape
+            .blocks
+            .iter()
+            .find(|(_, block)| matches!(block.terminator, Terminator::Return(_)))
+            .unwrap();
+        assert_eq!(
+            solution.before(returning).0,
+            CAP,
+            "the loop counts up to the cap"
+        );
     }
 }

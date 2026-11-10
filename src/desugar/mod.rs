@@ -89,7 +89,7 @@ struct FunctionState {
     is_entry: bool,
     /// The temporaries that move an owned string from where it is made to where it is used; see
     /// [`ownership`].
-    aliases: FxHashSet<LocalId>,
+    ownership_temporaries: FxHashSet<LocalId>,
 }
 
 struct Desugarer<'ast> {
@@ -216,12 +216,18 @@ impl<'ast> Desugarer<'ast> {
         let result = self.free_on_exit(result, end_span, &mut body);
         let mut arena = std::mem::take(&mut self.function).arena;
         let body = arena.list(&body);
-        Function {
+        let function = Function {
             id,
             parameter_count,
             arena,
             shape: Structured { body, result },
-        }
+        };
+        debug_assert_eq!(
+            crate::ir::verify(&function),
+            Ok(()),
+            "desugaring broke the IR"
+        );
+        function
     }
 
     // -------------------------------------------------------------------------

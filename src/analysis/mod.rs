@@ -57,21 +57,24 @@ use crate::parser::ProgramAst;
 /// compiling. The AST must already have been through [`crate::sema::analyze`].
 pub fn check(ast: &ProgramAst) -> Vec<Diagnostic> {
     let program = flatten_program(desugar(ast));
-    let owned_globals = checks::liveness::owned_globals(&program);
+    let entry_private_globals = checks::liveness::entry_private_globals(&program);
     let no_globals = FxHashSet::default();
 
     let mut diagnostics = Vec::new();
     for (_, function) in program.functions.iter() {
-        let owned = match function.id == program.entry {
-            true => &owned_globals,
+        let private = match function.id == program.entry {
+            true => &entry_private_globals,
             false => &no_globals,
         };
-        diagnostics.extend(checks::reachability::check(function, &program.tables));
-        diagnostics.extend(checks::liveness::check(
+        diagnostics.extend(checks::reachability::check_reachability(
+            function,
+            &program.tables,
+        ));
+        diagnostics.extend(checks::liveness::check_liveness(
             function,
             &program.tables,
             &ast.names,
-            owned,
+            private,
         ));
     }
 

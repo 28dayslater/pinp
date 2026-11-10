@@ -53,3 +53,29 @@ entries and in the plan's resolved list):
 - **No behaviour change** through B: `PinpJit` compiled from the AST and the IR was exercised by
   tests only. From C, `PinpJit` compiles from the IR; each behaviour change is listed in C's
   notebook.
+
+---
+
+## Review (2026-11-09)
+
+An outside review of the committed milestone found the architecture sound and raised seven
+points, addressed as follows.
+
+1. **The solver's visit budget could stop a correct analysis** whose facts grow many times. Now
+   each analysis states its `height` — how often a fact can grow — and `solve` stops only when one
+   block's fact grows more often than that; a block is never queued twice at once. Test: a
+   thousand-step counter converges.
+2. **The solver's contract was incomplete.** The docs now state that `merge` is associative,
+   commutative, and idempotent with `nothing_known()` as identity, and that transfer functions
+   must be monotone; `solve` merges each result into the block's fact and re-queues on `merge`'s
+   flag, as documented, instead of comparing whole facts.
+3. **The IR verifier ran only in tests.** Desugaring and flattening now verify their output in
+   debug builds.
+4. **Names:** `live_successors` → `feasible_successors` ("live" belongs to liveness); desugaring's
+   string `aliases` → *ownership temporaries* (nothing is shared); `owned_globals` →
+   `entry_private_globals` ("owned" belongs to string ownership). Stale `VariableSet` and lost
+   `ReachabilityFact` docs rewritten.
+5. **`check` versus CLAUDE.md's `check_*`:** the checkers are `check_reachability` and
+   `check_liveness` (human, 2026-11-09).
+6. **Compiling and analysing each desugar and flatten**, and 7. **source reads and generated
+   reads look alike to liveness**: both recorded as preconditions in the plan's part E sketch.

@@ -271,6 +271,16 @@ No behaviour change: `PinpJit` still compiles from the AST.
 *Moved out of milestone 0017 on 2026-10-27: optimisations are future work, an iteration of their
 own. The letter stays vacant so references to F and G keep their meaning. The sketch stands:*
 
+*Two preconditions, from the 0017 review (2026-11-09):*
+
+- *One pipeline.* Compiling (`codegen::cranelift::compile`) and analysing (`analysis::check`)
+  each desugar and flatten on their own. Before passes edit the program, a shared driver builds
+  `Program<Flat>` once and hands the same program to analysis, optimisation, and emission.
+- *Source use and generated use.* Liveness skips `str_free` arguments, and a counted loop's own
+  test and step read its index, so a binder the source never reads looks read. For diagnostics
+  that is deliberate; facts that drive optimisation — removing stores, eliding copies — must keep
+  the two kinds of use apart explicitly.
+
 1. **Editing API** on `Function` (its first part arrives with the lowering passes):
    `replace_operation`, `remove_statement`, `set_terminator`, `insert_before`, applied directly
    (no edit batching — decided 2026-09-27).

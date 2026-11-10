@@ -38,17 +38,17 @@ use crate::ir::{
 use crate::lexer::Span;
 use crate::parser::SymId;
 
-/// Reports dead stores and unused variables in `function`. `owned_globals` are the globals
-/// analysed like its locals: at the top level, those no function reads or writes.
-pub fn check(
+/// Reports dead stores and unused variables in `function`. `entry_private_globals` are the globals
+/// analysed like its locals: at the top level, those no other function reads or writes.
+pub fn check_liveness(
     function: &Function<Flat>,
     tables: &ProgramTables,
     names: &[&str],
-    owned_globals: &FxHashSet<GlobalId>,
+    entry_private_globals: &FxHashSet<GlobalId>,
 ) -> Vec<Diagnostic> {
     let analysis = Liveness {
         function,
-        owned_globals,
+        entry_private_globals,
     };
     let solution = solve(function, &analysis);
     let blocks = &function.shape.blocks;
@@ -114,10 +114,10 @@ pub fn check(
     diagnostics
 }
 
-/// The globals the top level owns: every global no other function reads or writes. Those are
+/// The globals private to the top level: every global no other function reads or writes. Those are
 /// analysed like the top level's locals; any other is live wherever the top level ends.
-pub fn owned_globals(program: &Program<Flat>) -> FxHashSet<GlobalId> {
-    let mut owned: FxHashSet<GlobalId> = program
+pub fn entry_private_globals(program: &Program<Flat>) -> FxHashSet<GlobalId> {
+    let mut private: FxHashSet<GlobalId> = program
         .tables
         .globals
         .iter()
@@ -131,16 +131,16 @@ pub fn owned_globals(program: &Program<Flat>) -> FxHashSet<GlobalId> {
             if let Operation::ReadGlobal(global_id) | Operation::WriteGlobal { global_id, .. } =
                 operation
             {
-                owned.remove(global_id);
+                private.remove(global_id);
             }
         }
     }
-    owned
+    private
 }
 
 struct Liveness<'function> {
     function: &'function Function<Flat>,
-    owned_globals: &'function FxHashSet<GlobalId>,
+    entry_private_globals: &'function FxHashSet<GlobalId>,
 }
 
 impl Analysis for Liveness<'_> {
@@ -149,6 +149,11 @@ impl Analysis for Liveness<'_> {
 
     fn boundary(&self) -> VariableSet {
         VariableSet::nothing_known()
+    }
+
+    /// One growth per variable that can join the set.
+    fn height(&self, function: &Function<Flat>) -> usize {
+        function.arena.locals.len() + self.entry_private_globals.len()
     }
 
     fn transfer_statement(&self, statement: NodeId, fact: &mut VariableSet) {
@@ -166,13 +171,13 @@ impl Analysis for Liveness<'_> {
 }
 
 impl Liveness<'_> {
-    /// Locals are numbered first, owned globals after them.
+    /// Locals are numbered first, the entry's private globals after them.
     fn local(&self, local_id: LocalId) -> usize {
         local_id.index() as usize
     }
 
     fn global(&self, global_id: GlobalId) -> Option<usize> {
-        self.owned_globals
+        self.entry_private_globals
             .contains(&global_id)
             .then(|| self.function.arena.locals.len() + global_id.index() as usize)
     }
@@ -243,14 +248,14 @@ mod tests {
         let mut ast = parse(src).unwrap();
         analyze(&mut ast).unwrap();
         let program = flatten_program(desugar(&ast));
-        let owned = owned_globals(&program);
+        let private = entry_private_globals(&program);
         let function = program.functions.iter().nth(index).unwrap().1;
-        let owned = match function.id == program.entry {
-            true => owned,
+        let private = match function.id == program.entry {
+            true => private,
             false => FxHashSet::default(),
         };
         let mut found: Vec<(&'static str, String)> =
-            check(function, &program.tables, &ast.names, &owned)
+            check_liveness(function, &program.tables, &ast.names, &private)
                 .into_iter()
                 .map(|diagnostic| {
                     let code = diagnostic.code.expect("a checker finding carries a code");
@@ -310,11 +315,16 @@ mod tests {
         analyze(&mut ast).unwrap();
         let program = flatten_program(desugar(&ast));
         let entry = &program.functions[program.entry];
-        let unused: Vec<u32> = check(entry, &program.tables, &ast.names, &owned_globals(&program))
-            .into_iter()
-            .filter(|diagnostic| diagnostic.code == Some(DiagnosticCode::UnusedVariable))
-            .map(|diagnostic| diagnostic.span.start)
-            .collect();
+        let unused: Vec<u32> = check_liveness(
+            entry,
+            &program.tables,
+            &ast.names,
+            &entry_private_globals(&program),
+        )
+        .into_iter()
+        .filter(|diagnostic| diagnostic.code == Some(DiagnosticCode::UnusedVariable))
+        .map(|diagnostic| diagnostic.span.start)
+        .collect();
         assert_eq!(unused, vec![0], "the first `alpha`, at offset 0");
     }
 

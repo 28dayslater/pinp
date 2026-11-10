@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: MIT
 
-//! [`verify`]: the IR's invariants, checked after every pass that builds or edits a function.
+//! [`verify`]: the IR's invariants. Desugaring and flattening check their output in debug builds,
+//! and every later pass that builds or edits a function is to do the same.
 
 use super::{BlockId, Function, Level, NodeId, Operation, Position, Shape, SideTable};
 

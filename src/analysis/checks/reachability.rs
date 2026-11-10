@@ -24,7 +24,7 @@ use crate::lexer::Span;
 use crate::parser::{RangeKind, UnOp};
 
 /// Reports the first statement of every block no execution can reach.
-pub fn check(function: &Function<Flat>, tables: &ProgramTables) -> Vec<Diagnostic> {
+pub fn check_reachability(function: &Function<Flat>, tables: &ProgramTables) -> Vec<Diagnostic> {
     let analysis = Reachability { function, tables };
     let solution = solve(function, &analysis);
     function
@@ -78,12 +78,16 @@ impl Analysis for Reachability<'_> {
         ReachabilityFact::reached()
     }
 
+    fn height(&self, _function: &Function<Flat>) -> usize {
+        1
+    }
+
     // Reaching a statement says nothing about the next one: a block runs whole once entered.
     fn transfer_statement(&self, _statement: NodeId, _fact: &mut ReachabilityFact) {}
 
     fn transfer_terminator(&self, _terminator: &Terminator, _fact: &mut ReachabilityFact) {}
 
-    fn live_successors(&self, function: &Function<Flat>, block_id: BlockId) -> Vec<BlockId> {
+    fn feasible_successors(&self, function: &Function<Flat>, block_id: BlockId) -> Vec<BlockId> {
         let Terminator::Branch {
             cond,
             then_block,
@@ -194,7 +198,7 @@ mod tests {
         let mut found: Vec<Diagnostic> = program
             .functions
             .iter()
-            .flat_map(|(_, function)| check(function, &program.tables))
+            .flat_map(|(_, function)| check_reachability(function, &program.tables))
             .collect();
         found.sort_by_key(|diagnostic| diagnostic.span.start);
         found
