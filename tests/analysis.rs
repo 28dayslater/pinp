@@ -1,9 +1,9 @@
 // SPDX-License-Identifier: MIT
 
-//! End-to-end static analysis: source in, findings out.
+//! End-to-end static analysis: source in, diagnostics out.
 //!
 //! These go through the public [`pinp::analysis::check`] rather than a single checker, so they
-//! cover what a user of the layer actually sees — every checker over every function, findings in
+//! cover what a user of the layer actually sees — every checker over every function, diagnostics in
 //! source order, each resolved to a line and column.
 
 use pinp::analysis::{Diagnostic, check};
@@ -11,8 +11,8 @@ use pinp::lexer::LineIndex;
 use pinp::parser::parse;
 use pinp::sema::analyze;
 
-/// Analyses `src`, returning each finding as `(code, line, column, text-it-points-at)`.
-fn findings(src: &str) -> Vec<(&'static str, u32, u32, String)> {
+/// Analyses `src`, returning each diagnostic as `(code, line, column, text-it-points-at)`.
+fn diagnostics(src: &str) -> Vec<(&'static str, u32, u32, String)> {
     let mut ast = parse(src).expect("program should parse");
     analyze(&mut ast).expect("program should type-check");
     let line_index = LineIndex::new(src);
@@ -23,7 +23,7 @@ fn findings(src: &str) -> Vec<(&'static str, u32, u32, String)> {
             (
                 diagnostic
                     .code
-                    .expect("a checker finding always carries a code")
+                    .expect("a checker's diagnostic always carries a code")
                     .code(),
                 line,
                 column,
@@ -41,7 +41,7 @@ for idx in 1..5
     total += idx
 total
 ";
-    assert_eq!(findings(src), Vec::new());
+    assert_eq!(diagnostics(src), Vec::new());
 }
 
 #[test]
@@ -52,7 +52,7 @@ spare = 2
 kept
 ";
     assert_eq!(
-        findings(src),
+        diagnostics(src),
         vec![("PINP1003", 2, 1, "spare".to_string())],
         "line 2, column 1 — where `spare` is written"
     );
@@ -65,7 +65,7 @@ a = 1
 a = 2
 a
 ";
-    assert_eq!(findings(src), vec![("PINP1002", 1, 1, "a".to_string())]);
+    assert_eq!(diagnostics(src), vec![("PINP1002", 1, 1, "a".to_string())]);
 }
 
 #[test]
@@ -76,11 +76,11 @@ while false
     n = 2
 n
 ";
-    assert_eq!(findings(src), vec![("PINP1001", 3, 5, "n".to_string())]);
+    assert_eq!(diagnostics(src), vec![("PINP1001", 3, 5, "n".to_string())]);
 }
 
 #[test]
-fn every_finding_is_reported_in_one_run_in_source_order() {
+fn every_diagnostic_is_reported_in_one_run_in_source_order() {
     // The batch-reporting property: sema stops at its first error, and this layer deliberately does
     // not. The order is the file's, not the checkers' or the graphs'.
     let src = "\
@@ -91,11 +91,11 @@ if false
     first = 4
 first
 ";
-    let found = findings(src);
+    let found = diagnostics(src);
     let lines: Vec<u32> = found.iter().map(|(_, line, _, _)| *line).collect();
     assert!(
         lines.windows(2).all(|pair| pair[0] <= pair[1]),
-        "findings must be ordered by position, got {found:?}"
+        "diagnostics must be ordered by position, got {found:?}"
     );
     let codes: Vec<&str> = found.iter().map(|(code, _, _, _)| *code).collect();
     assert!(codes.contains(&"PINP1002"), "the overwritten `first`");
@@ -104,7 +104,7 @@ first
 }
 
 #[test]
-fn findings_inside_a_function_are_reported_too() {
+fn diagnostics_inside_a_function_are_reported_too() {
     let src = "\
 compute(n: int): int is
     spare = n * 2
@@ -112,14 +112,14 @@ compute(n: int): int is
 compute(3)
 ";
     assert_eq!(
-        findings(src),
+        diagnostics(src),
         vec![("PINP1003", 2, 5, "spare".to_string())],
         "the function's own graph is checked"
     );
 }
 
 #[test]
-fn findings_from_several_functions_are_merged_in_source_order() {
+fn diagnostics_from_several_functions_are_merged_in_source_order() {
     let src = "\
 one(): int is
     a = 1
@@ -129,7 +129,7 @@ two(): int is
     3
 one() + two()
 ";
-    let found = findings(src);
+    let found = diagnostics(src);
     assert_eq!(found.len(), 2);
     assert_eq!(found[0].3, "a");
     assert_eq!(found[1].3, "b");
@@ -140,7 +140,7 @@ one() + two()
 }
 
 #[test]
-fn a_rendered_finding_reads_as_a_diagnostic() {
+fn a_checker_diagnostic_renders_like_any_other() {
     let src = "spare = 1\n0\n";
     let mut ast = parse(src).unwrap();
     analyze(&mut ast).unwrap();
@@ -169,7 +169,7 @@ fn analysis_never_reports_on_the_language_test_programs() {
         "g = 1\nbump(): int is ::g + 1\nbump()",
         "arr = [idx * 2 for idx in 1..4]\narr[0]",
     ] {
-        assert_eq!(findings(src), Vec::new(), "false positive on:\n{src}");
+        assert_eq!(diagnostics(src), Vec::new(), "false positive on:\n{src}");
     }
 }
 
@@ -182,7 +182,7 @@ for idx in 5..1
     total += idx
 total
 ";
-    assert_eq!(findings(src), Vec::new());
+    assert_eq!(diagnostics(src), Vec::new());
 }
 
 #[test]
@@ -194,7 +194,10 @@ for value in a
     count += 1
 count
 ";
-    assert_eq!(findings(src), vec![("PINP1003", 3, 5, "value".to_string())]);
+    assert_eq!(
+        diagnostics(src),
+        vec![("PINP1003", 3, 5, "value".to_string())]
+    );
 }
 
 #[test]
@@ -203,5 +206,5 @@ fn a_dead_if_expression_arm_is_located() {
 x = 10 if false else 20
 x
 ";
-    assert_eq!(findings(src), vec![("PINP1001", 1, 5, "10".to_string())]);
+    assert_eq!(diagnostics(src), vec![("PINP1001", 1, 5, "10".to_string())]);
 }
