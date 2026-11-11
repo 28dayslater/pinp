@@ -96,6 +96,7 @@ impl PinpJit {
             }
             PinpType::Void => PinpValue::Void,
             PinpType::Range => unreachable!("a program cannot evaluate to a range"),
+            PinpType::Never => unreachable!("`return` outside a function is rejected"),
             PinpType::Matrix(elem_type, row_count, col_count) => {
                 let matrix_ptr = result_buf[0] as *const u8;
                 let total = row_count * col_count;

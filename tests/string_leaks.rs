@@ -543,3 +543,106 @@ fn swapping_strings_is_balanced() {
     ));
     assert_eq!(as_str(value), format!("b {LONG}a {LONG}"));
 }
+
+// --- return (0018) ---------------------------------------------------------------------------
+
+/// `describe` returns a string from five places: a literal, a parameter, a local built from it, a
+/// concatenation, and its final expression — with other string locals live at each return.
+fn describe_program(n: i64) -> String {
+    format!(
+        indoc! {"
+            describe(n: int): str is
+                name = '{0}'
+                spare = name + '{0}'
+                if n < 0
+                    return '{0} negative'
+                elif n == 0
+                    return name
+                label = name + '!'
+                if n == 1
+                    return label
+                for i in 1..n
+                    other = label + spare
+                    if i == 3
+                        return label + other
+                spare
+            describe({1})
+        "},
+        LONG, n
+    )
+}
+
+#[test]
+fn every_kind_of_returned_string_balances() {
+    let expected = [
+        (-1, format!("{LONG} negative")),
+        (0, LONG.to_string()),
+        (1, format!("{LONG}!")),
+        (2, format!("{LONG}{LONG}")),
+        (5, format!("{LONG}!{LONG}!{LONG}{LONG}")),
+    ];
+    for (n, value) in expected {
+        assert_eq!(
+            as_str(run_balanced(&describe_program(n))),
+            value,
+            "for n = {n}"
+        );
+    }
+}
+
+#[test]
+fn a_return_from_a_void_function_frees_its_strings() {
+    let value = run_balanced(&format!(
+        indoc! {"
+            g = 0
+            note(n: int) is
+                s = '{0}' + '{0}'
+                if n > 0
+                    return
+                ::g = s.len
+            note(1)
+            note(0)
+            g
+        "},
+        LONG
+    ));
+    assert_eq!(value, PinpValue::Int(2 * LONG.len() as i64));
+}
+
+#[test]
+fn a_string_returned_from_a_loop_balances_across_calls() {
+    let value = run_balanced(&format!(
+        indoc! {"
+            pick(k: int): str is
+                for i in 1..5
+                    s = '{0}' + str(i)
+                    if i == k
+                        return s
+                '{0} none'
+            a = pick(2)
+            b = pick(9)
+            a + b
+        "},
+        LONG
+    ));
+    assert_eq!(as_str(value), format!("{LONG}2{LONG} none"));
+}
+
+#[test]
+fn a_return_frees_a_string_assigned_later_in_the_loop_on_an_earlier_pass() {
+    // `s` is first assigned below the `return`, so it is not yet known when the `return` is
+    // desugared — but on the second pass it already holds the first pass's string.
+    let value = run_balanced(&format!(
+        indoc! {"
+            f(k: int): int is
+                for i in 1..3
+                    if i == k
+                        return i
+                    s = '{0}' + str(i)
+                0
+            f(2)
+        "},
+        LONG
+    ));
+    assert_eq!(value, PinpValue::Int(2));
+}

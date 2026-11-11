@@ -20,6 +20,7 @@ impl Desugarer<'_> {
     pub(super) fn statement(&mut self, stmt: &Stmt, out: &mut Vec<NodeId>) {
         match stmt {
             Stmt::Expr(expr_id) => self.effect(*expr_id, out),
+            Stmt::Return { value, span } => self.return_statement(*value, *span, out),
             Stmt::Assign {
                 target_lists,
                 target_spans,
@@ -106,6 +107,79 @@ impl Desugarer<'_> {
                 self.element_assignment(*target, *target_span, &indices, *value, *compound_op, out)
             }
         }
+    }
+
+    /// `return [value]`, the value converted to the function's type. The frees every exit needs
+    /// are placed by [`finish`](Desugarer::finish), once every local the function has is known: a
+    /// `return` early in a loop body must also free a string assigned later in it, on an earlier
+    /// pass.
+    fn return_statement(&mut self, value: Option<ExprId>, span: Span, out: &mut Vec<NodeId>) {
+        let value = match value {
+            // An `if` every branch of which returns: those returns are the exits.
+            Some(expr_id) if self.ast.type_of(expr_id) == PinpType::Never => {
+                return self.effect(expr_id, out);
+            }
+            Some(expr_id) => {
+                let return_type = self
+                    .function
+                    .return_type
+                    .expect("sema rejects `return` outside a function");
+                let value = self.expr(expr_id, out);
+                Some(self.convert(value, return_type))
+            }
+            None => None,
+        };
+        self.function.has_returns = true;
+        out.push(self.statement_node(Operation::Return(value), span));
+    }
+
+    /// `statements`, with what leaving the function needs placed before each `return` in them, at
+    /// any depth: the returned value saved where the frees cannot reach it, then every string slot
+    /// freed — what [`free_on_exit`](Desugarer::free_on_exit) does at the end.
+    pub(super) fn place_return_frees(&mut self, statements: &[NodeId]) -> Vec<NodeId> {
+        let mut placed = Vec::with_capacity(statements.len());
+        for &statement in statements {
+            let operation = match self.function.arena.operations[statement] {
+                Operation::Return(value) => {
+                    let span = self.function.arena.spans[statement];
+                    Operation::Return(self.free_on_exit(value, span, &mut placed))
+                }
+                Operation::If {
+                    cond,
+                    then_body,
+                    else_body,
+                } => Operation::If {
+                    cond,
+                    then_body: self.place_return_frees_in(then_body),
+                    else_body: self.place_return_frees_in(else_body),
+                },
+                Operation::While { header, cond, body } => Operation::While {
+                    header,
+                    cond,
+                    body: self.place_return_frees_in(body),
+                },
+                Operation::DoWhile { body, cond, until } => Operation::DoWhile {
+                    body: self.place_return_frees_in(body),
+                    cond,
+                    until,
+                },
+                Operation::CountedLoop { index, range, body } => Operation::CountedLoop {
+                    index,
+                    range,
+                    body: self.place_return_frees_in(body),
+                },
+                operation => operation,
+            };
+            self.function.arena.operations[statement] = operation;
+            placed.push(statement);
+        }
+        placed
+    }
+
+    fn place_return_frees_in(&mut self, body: List<NodeId>) -> List<NodeId> {
+        let statements = self.function.arena.items(body).to_vec();
+        let placed = self.place_return_frees(&statements);
+        self.function.arena.list(&placed)
     }
 
     fn statements(&mut self, stmts: &[Stmt], out: &mut Vec<NodeId>) {
@@ -258,6 +332,10 @@ impl Desugarer<'_> {
         match (block.result, sink) {
             (None, _) => {}
             (Some(result), Sink::Effect) => self.effect(result, out),
+            // A nested `if` every branch of which returns has no value to write.
+            (Some(result), Sink::Write(..)) if self.ast.type_of(result) == PinpType::Never => {
+                self.effect(result, out)
+            }
             (Some(result), Sink::Write(temporary, span)) => {
                 let value = self.expr(result, out);
                 let target_type = self.binding_type(Binding::Local(temporary));

@@ -69,7 +69,7 @@ sum_to(n: int): float is
     # No () around condition like in C and no trailing : like in Python
     while i < n
         s, i = s + i/2, i+1
-    s  # Last expression in scope is the return value. "return" will be available.
+    s  # The last expression is the function's value
 
 sum_to(5)  # 5.0
 ```
@@ -80,6 +80,17 @@ sum_to(5)  # 5.0
 max(a: int, b: int): int is a if a > b else b
 
 max(3, 9)
+```
+
+`return` leaves a function early:
+
+```
+sign(n: int): int is
+    if n < 0
+        return -1
+    if n == 0
+        return 0
+    1
 ```
 
 Ranges and `for … in`:

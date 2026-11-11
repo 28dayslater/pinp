@@ -639,3 +639,268 @@ fn a_step_from_a_variable_decides_direction_at_run_time() {
     let printed = flattened("s = 2\nt = 0\nfor i in 5..>1:s\n    t += i\nt");
     assert!(printed.contains("select: bool"), "{printed}");
 }
+
+// --- return (0018) -----------------------------------------------------------------------
+
+/// The printed flat function `index` of `src`.
+fn flat_function(src: &str, index: usize) -> String {
+    flattened(src)
+        .split("function f")
+        .nth(index + 1)
+        .map(|text| format!("function f{}\n", text.trim_end()))
+        .expect("the function exists")
+}
+
+/// The lines of block `label` (`"block3"`), without the label itself.
+fn block_lines<'text>(text: &'text str, label: &str) -> Vec<&'text str> {
+    text.lines()
+        .skip_while(|line| *line != label && !line.starts_with(&format!("{label} ")))
+        .skip(1)
+        .take_while(|line| line.starts_with(' '))
+        .collect()
+}
+
+/// How many lines of `text` are exactly `line`.
+fn count_lines(text: &str, line: &str) -> usize {
+    text.lines()
+        .filter(|candidate| candidate.trim() == line)
+        .count()
+}
+
+/// The terminator line of every block, in order.
+fn terminators(text: &str) -> Vec<String> {
+    // A block's own lines are indented by two; only its terminator starts with one of these words.
+    text.lines()
+        .filter(|line| line.starts_with("  ") && !line.starts_with("   "))
+        .map(str::trim)
+        .filter(|line| {
+            ["return", "goto", "branch", "unreachable", "runtime_error"]
+                .iter()
+                .any(|word| line.starts_with(word))
+        })
+        .map(str::to_string)
+        .collect()
+}
+
+#[test]
+fn a_return_ends_its_block_and_code_after_it_lands_in_a_block_nothing_enters() {
+    assert_eq!(
+        flat_function(
+            indoc! {"
+                f(n: int): int is
+                    return n
+                    n + 1
+                f(1)
+            "},
+            0
+        ),
+        indoc! {"
+            function f0 f (1 parameter), flat
+            locals
+              l0 n: int
+            block0 (entry)
+              return
+                read_local l0 n: int
+            block1
+              evaluate
+                add: int
+                  read_local l0 n: int
+                  constant 1: int
+              unreachable
+        "}
+    );
+}
+
+#[test]
+fn a_bare_return_ends_its_block_without_an_operand() {
+    let text = flat_function(
+        indoc! {"
+            g = 0
+            f(n: int) is
+                if n > 0
+                    return
+                ::g = n
+            f(1)
+        "},
+        0,
+    );
+    assert_eq!(block_lines(&text, "block1"), ["  return"], "{text}");
+}
+
+#[test]
+fn a_function_whose_every_path_returns_ends_in_unreachable() {
+    let text = flat_function(
+        indoc! {"
+            abs(n: int): int is
+                if n < 0
+                    return -n
+                else
+                    return n
+            abs(1)
+        "},
+        0,
+    );
+    let ends = terminators(&text);
+    assert_eq!(
+        ends.first().map(String::as_str),
+        Some("branch block1 block2"),
+        "{text}"
+    );
+    // Blocks 1 and 2 return; the join, block 3, is where nothing arrives.
+    assert_eq!(block_lines(&text, "block3"), ["  unreachable"], "{text}");
+    assert_eq!(
+        ends.iter().filter(|end| *end == "return").count(),
+        2,
+        "{text}"
+    );
+}
+
+#[test]
+fn a_function_with_an_early_return_still_returns_its_result() {
+    let text = flat_function(
+        indoc! {"
+            sign(n: int): int is
+                if n < 0
+                    return -1
+                1
+            sign(1)
+        "},
+        0,
+    );
+    assert!(
+        block_lines(&text, "block2") == ["  return", "    constant 1: int"],
+        "{text}"
+    );
+    assert!(!text.contains("unreachable"), "{text}");
+}
+
+#[test]
+fn a_counted_loop_whose_body_ends_in_return_does_not_step() {
+    let text = flat_function(
+        indoc! {"
+            f(n: int): int is
+                for i in 1..n
+                    return i
+                0
+            f(3)
+        "},
+        0,
+    );
+    // Only the initial write of `i`; the step after the return could never run.
+    assert_eq!(count_lines(&text, "write_local l1 i"), 1, "{text}");
+}
+
+#[test]
+fn a_counted_loop_whose_body_returns_on_one_path_still_steps() {
+    let text = flat_function(
+        indoc! {"
+            f(n: int): int is
+                for i in 1..n
+                    if i > 2
+                        return i
+                0
+            f(3)
+        "},
+        0,
+    );
+    assert_eq!(count_lines(&text, "write_local l1 i"), 2, "{text}");
+}
+
+#[test]
+fn a_counted_loop_after_an_early_return_steps_as_usual() {
+    let text = flat_function(
+        indoc! {"
+            f(n: int): int is
+                t = 0
+                if n < 0
+                    return 0
+                for i in 1..n
+                    t += i
+                t
+            f(3)
+        "},
+        0,
+    );
+    assert_eq!(count_lines(&text, "write_local l2 i"), 2, "{text}");
+    assert!(!text.contains("unreachable"), "{text}");
+}
+
+#[test]
+fn a_counted_loop_whose_body_returns_on_both_branches_does_not_step() {
+    let text = flat_function(
+        indoc! {"
+            f(n: int): int is
+                for i in 1..n
+                    if i > 2
+                        return i
+                    else
+                        return 0
+                0
+            f(3)
+        "},
+        0,
+    );
+    assert_eq!(count_lines(&text, "write_local l1 i"), 1, "{text}");
+}
+
+#[test]
+fn a_do_while_whose_body_returns_leaves_the_function_end_unreached_but_returning() {
+    // The result is still returned at the end: sema does not treat loops as diverging, and the
+    // signature wants a value.
+    let text = flat_function(
+        indoc! {"
+            f(n: int): int is
+                loop
+                    return n
+                until n > 0
+                0
+            f(1)
+        "},
+        0,
+    );
+    assert!(
+        block_lines(&text, "block2") == ["  return", "    constant 0: int"],
+        "{text}"
+    );
+}
+
+#[test]
+fn a_void_function_that_always_returns_ends_in_unreachable() {
+    let text = flat_function(
+        indoc! {"
+            g = 0
+            f(n: int) is
+                ::g = n
+                return
+            f(1)
+        "},
+        0,
+    );
+    assert_eq!(block_lines(&text, "block1"), ["  unreachable"], "{text}");
+}
+
+#[test]
+fn a_return_inside_a_while_leaves_the_loop_exit_reachable() {
+    let text = flat_function(
+        indoc! {"
+            f(n: int): int is
+                while n > 0
+                    return n
+                0
+            f(1)
+        "},
+        0,
+    );
+    assert!(
+        block_lines(&text, "block3") == ["  return", "    constant 0: int"],
+        "{text}"
+    );
+    assert_eq!(
+        terminators(&text)
+            .iter()
+            .filter(|end| *end == "return")
+            .count(),
+        2,
+        "{text}"
+    );
+}

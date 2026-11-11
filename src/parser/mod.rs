@@ -22,7 +22,7 @@
 //! [`crate::sema::SemaError`]. Type annotations (`int`/`float`/`void`) are the one exception: they
 //! are resolved here while building the signature, since that is a fixed lexical mapping.
 
-use crate::diagnostic::{Diagnose, Diagnostic};
+use crate::diagnostic::{Diagnose, Diagnostic, DiagnosticCode};
 use crate::lexer::{Span, Token, TokenKind, lex};
 
 mod ast;
@@ -50,7 +50,10 @@ pub struct ParseError {
 
 impl Diagnose for ParseError {
     fn to_diagnostic(&self) -> Diagnostic {
-        Diagnostic::error(self.span, self.kind.message())
+        match self.kind.code() {
+            Some(code) => Diagnostic::new(code, self.span, self.kind.message()),
+            None => Diagnostic::error(self.span, self.kind.message()),
+        }
     }
 }
 
@@ -79,6 +82,8 @@ pub enum ParseErrorKind {
     /// A single `if` carried more arms than `MAX_IF_ARMS` — a deliberate sanity cap on an
     /// otherwise-unbounded (but stack-safe) `elif` ladder.
     TooManyArms(String),
+    /// An error with a stable [`DiagnosticCode`] of its own.
+    Coded(DiagnosticCode, String),
 }
 
 impl ParseErrorKind {
@@ -89,7 +94,16 @@ impl ParseErrorKind {
             | ParseErrorKind::Unexpected(message)
             | ParseErrorKind::Layout(message)
             | ParseErrorKind::TooDeeplyNested(message)
-            | ParseErrorKind::TooManyArms(message) => message,
+            | ParseErrorKind::TooManyArms(message)
+            | ParseErrorKind::Coded(_, message) => message,
+        }
+    }
+
+    /// The error's stable code, if it has one.
+    pub fn code(&self) -> Option<DiagnosticCode> {
+        match self {
+            ParseErrorKind::Coded(code, _) => Some(*code),
+            _ => None,
         }
     }
 }

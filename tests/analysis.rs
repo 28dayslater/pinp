@@ -6,6 +6,7 @@
 //! cover what a user of the layer actually sees — every checker over every function, diagnostics in
 //! source order, each resolved to a line and column.
 
+use indoc::indoc;
 use pinp::analysis::{Diagnostic, check};
 use pinp::lexer::LineIndex;
 use pinp::parser::parse;
@@ -207,4 +208,37 @@ x = 10 if false else 20
 x
 ";
     assert_eq!(diagnostics(src), vec![("PINP1001", 1, 5, "10".to_string())]);
+}
+
+#[test]
+fn code_after_a_return_is_reported_as_unreachable() {
+    let src = indoc! {"
+        f(n: int): int is
+            return n
+            n + 1
+        f(1)
+    "};
+    assert_eq!(
+        diagnostics(src),
+        vec![("PINP1001", 3, 5, "n + 1".to_string())]
+    );
+}
+
+#[test]
+fn early_returns_alone_produce_no_diagnostics() {
+    let src = indoc! {"
+        sign(n: int): int is
+            if n < 0
+                return -1
+            if n == 0
+                return 0
+            1
+        abs(n: int): int is
+            if n < 0
+                return -n
+            else
+                return n
+        sign(-2) + abs(-3)
+    "};
+    assert_eq!(diagnostics(src), Vec::new());
 }

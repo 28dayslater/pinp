@@ -8,7 +8,7 @@ use crate::parser::{BinOp, RangeKind, UnOp};
 /// A level of the IR: which operations may still appear in a function.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Level {
-    /// Nested control flow: `If`, `While`, `DoWhile`, `CountedLoop`.
+    /// Nested control flow: `If`, `While`, `DoWhile`, `CountedLoop`, and `Return`.
     Structured,
     /// Basic blocks and terminators; no nested control flow. Every value operation is allowed at
     /// both levels.
@@ -209,6 +209,9 @@ pub enum Operation {
         range: NodeId,
         body: List<NodeId>,
     },
+    /// Leaves the function with `value` (none for `void`). At the flat level the block's
+    /// terminator returns instead.
+    Return(Option<NodeId>),
 }
 
 const _: () = assert!(size_of::<Operation>() == 16);
@@ -219,7 +222,7 @@ impl Operation {
         use Operation::*;
         match self {
             Binary { op, .. } => !matches!(op, BinOp::And | BinOp::Or | BinOp::IntDiv | BinOp::Mod),
-            If { .. } | While { .. } | DoWhile { .. } | CountedLoop { .. } => {
+            If { .. } | While { .. } | DoWhile { .. } | CountedLoop { .. } | Return(_) => {
                 level == Level::Structured
             }
             _ => true,
@@ -240,6 +243,7 @@ impl Operation {
                 | While { .. }
                 | DoWhile { .. }
                 | CountedLoop { .. }
+                | Return(_)
         )
     }
 

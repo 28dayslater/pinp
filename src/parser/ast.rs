@@ -37,6 +37,9 @@ pub enum PinpType {
     /// An immutable string. Its runtime representation is the 16-byte `PinpStr` descriptor.
     Str,
     Void,
+    /// The type of a construct that never finishes — a `return`, or an `if` every branch of which
+    /// returns. It has no values, so it is assignable to every type; no source text names it.
+    Never,
     Range,
     /// A 1D array of `n` elements of `ArrayElementType`, heap-allocated via `pinp_alloc`.
     Array(ArrayElementType, usize),
@@ -335,6 +338,12 @@ pub enum Stmt {
         index: ExprId,
         value: ExprId,
         compound_op: Option<BinOp>,
+    },
+    /// `return [value]` — leaves the enclosing function.
+    Return {
+        value: Option<ExprId>,
+        /// Covers `return` and its value: a statement has no node of its own to hang one on.
+        span: Span,
     },
     /// `mat[row, col] = value` or `mat[row, col] <op>= rhs` — write one element of a 2D matrix.
     IndexedAssign2D {

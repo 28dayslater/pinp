@@ -152,6 +152,11 @@ impl Arena {
                 visit(range, Value);
                 each(body, Statement, &mut visit);
             }
+            Return(value) => {
+                if let Some(value) = value {
+                    visit(value, Value);
+                }
+            }
         }
     }
 

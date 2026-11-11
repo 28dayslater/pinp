@@ -212,6 +212,7 @@ pub enum TokenKind {
     KwUntil,
     KwLoop,
     KwFor,
+    KwReturn,
     KwIn,
     /// The bare `_` character: the don't-care binder in `for` loops.
     Underscore,
@@ -388,6 +389,7 @@ pub fn lex(src: &str) -> Result<Vec<Token<'_>>, LexError> {
                 "until" => TokenKind::KwUntil,
                 "loop" => TokenKind::KwLoop,
                 "for" => TokenKind::KwFor,
+                "return" => TokenKind::KwReturn,
                 "in" => TokenKind::KwIn,
                 _ => TokenKind::Identifier,
             },
@@ -588,6 +590,17 @@ mod tests {
         assert_eq!(
             kinds("if elif else while until loop"),
             vec![KwIf, KwElif, KwElse, KwWhile, KwUntil, KwLoop, Eof]
+        );
+    }
+
+    #[test]
+    fn return_is_a_keyword_only_as_a_whole_word() {
+        use TokenKind::*;
+        assert_eq!(
+            kinds("return returns return_value _return Return"),
+            vec![
+                KwReturn, Identifier, Identifier, Identifier, Identifier, Eof
+            ]
         );
     }
 

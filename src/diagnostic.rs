@@ -33,6 +33,20 @@ pub enum DiagnosticCode {
     DeadStore,
     /// A variable that is never used.
     UnusedVariable,
+    /// `return` where an expression belongs.
+    ReturnAsValue,
+    /// A function with a return type whose end can be reached without a value.
+    MissingReturn,
+    /// `return` in the top-level code of a program.
+    ReturnOutsideFunction,
+    /// A returned value not assignable to the function's return type.
+    ReturnTypeMismatch,
+    /// `return` with a value in a `void` function.
+    VoidFunctionReturnsValue,
+    /// A bare `return` in a function with a return type.
+    MissingReturnValue,
+    /// A value that can never exist — an `if` every branch of which returns — used as one.
+    NeverValue,
 }
 
 /// Everything a rule is, in one row.
@@ -50,10 +64,17 @@ pub struct RuleInfo {
 impl DiagnosticCode {
     /// Every code, so the SARIF emitter can list the rules it might report and a test can hold the
     /// numbering to account.
-    pub const ALL: [DiagnosticCode; 3] = [
+    pub const ALL: [DiagnosticCode; 10] = [
         DiagnosticCode::UnreachableCode,
         DiagnosticCode::DeadStore,
         DiagnosticCode::UnusedVariable,
+        DiagnosticCode::ReturnAsValue,
+        DiagnosticCode::MissingReturn,
+        DiagnosticCode::ReturnOutsideFunction,
+        DiagnosticCode::ReturnTypeMismatch,
+        DiagnosticCode::VoidFunctionReturnsValue,
+        DiagnosticCode::MissingReturnValue,
+        DiagnosticCode::NeverValue,
     ];
 
     /// The rule's row. The accessors below read from here, so a variant is edited in one place.
@@ -77,6 +98,48 @@ impl DiagnosticCode {
                 description: "Variables that are never used.",
                 severity: Severity::Warning,
             },
+            DiagnosticCode::ReturnAsValue => RuleInfo {
+                code: "PINP2001",
+                name: "return-as-value",
+                description: "`return` used where a value is expected.",
+                severity: Severity::Error,
+            },
+            DiagnosticCode::MissingReturn => RuleInfo {
+                code: "PINP3001",
+                name: "missing-return",
+                description: "Functions with a return type that can end without a value.",
+                severity: Severity::Error,
+            },
+            DiagnosticCode::ReturnOutsideFunction => RuleInfo {
+                code: "PINP3002",
+                name: "return-outside-function",
+                description: "`return` outside a function.",
+                severity: Severity::Error,
+            },
+            DiagnosticCode::ReturnTypeMismatch => RuleInfo {
+                code: "PINP3003",
+                name: "return-type-mismatch",
+                description: "Returned values of the wrong type.",
+                severity: Severity::Error,
+            },
+            DiagnosticCode::VoidFunctionReturnsValue => RuleInfo {
+                code: "PINP3004",
+                name: "void-function-returns-value",
+                description: "`return` with a value in a void function.",
+                severity: Severity::Error,
+            },
+            DiagnosticCode::MissingReturnValue => RuleInfo {
+                code: "PINP3005",
+                name: "missing-return-value",
+                description: "A bare `return` in a function with a return type.",
+                severity: Severity::Error,
+            },
+            DiagnosticCode::NeverValue => RuleInfo {
+                code: "PINP3006",
+                name: "never-value",
+                description: "Expressions that never produce a value, used as one.",
+                severity: Severity::Error,
+            },
         }
     }
 
@@ -95,7 +158,7 @@ impl DiagnosticCode {
         self.info().description
     }
 
-    /// How severe a diagnostic of this class is. Everything is advisory for now.
+    /// How severe a diagnostic of this class is.
     pub const fn severity(self) -> Severity {
         self.info().severity
     }
@@ -121,9 +184,8 @@ pub trait Diagnose {
 /// One diagnostic.
 #[derive(Debug, Clone, PartialEq)]
 pub struct Diagnostic {
-    /// The rule this diagnostic belongs to, for the analysis layer's advisory checks. `None` for a
-    /// lexer, parser, or sema error: those are one-offs a suppression pragma would never key on,
-    /// and minting a permanent code for each would spend the namespace for nothing.
+    /// The rule this diagnostic belongs to. `None` for a lexer, parser, or sema error from before
+    /// 0018, which minted the first error codes; giving the older ones codes is a chore of its own.
     pub code: Option<DiagnosticCode>,
     pub severity: Severity,
     pub span: Span,
@@ -211,6 +273,13 @@ mod tests {
         assert_eq!(DiagnosticCode::UnreachableCode.code(), "PINP1001");
         assert_eq!(DiagnosticCode::DeadStore.code(), "PINP1002");
         assert_eq!(DiagnosticCode::UnusedVariable.code(), "PINP1003");
+        assert_eq!(DiagnosticCode::ReturnAsValue.code(), "PINP2001");
+        assert_eq!(DiagnosticCode::MissingReturn.code(), "PINP3001");
+        assert_eq!(DiagnosticCode::ReturnOutsideFunction.code(), "PINP3002");
+        assert_eq!(DiagnosticCode::ReturnTypeMismatch.code(), "PINP3003");
+        assert_eq!(DiagnosticCode::VoidFunctionReturnsValue.code(), "PINP3004");
+        assert_eq!(DiagnosticCode::MissingReturnValue.code(), "PINP3005");
+        assert_eq!(DiagnosticCode::NeverValue.code(), "PINP3006");
 
         let codes: FxHashSet<&str> = DiagnosticCode::ALL.iter().map(|code| code.code()).collect();
         assert_eq!(
@@ -233,11 +302,29 @@ mod tests {
             let listed = match code {
                 DiagnosticCode::UnreachableCode
                 | DiagnosticCode::DeadStore
-                | DiagnosticCode::UnusedVariable => true,
+                | DiagnosticCode::UnusedVariable
+                | DiagnosticCode::ReturnAsValue
+                | DiagnosticCode::MissingReturn
+                | DiagnosticCode::ReturnOutsideFunction
+                | DiagnosticCode::ReturnTypeMismatch
+                | DiagnosticCode::VoidFunctionReturnsValue
+                | DiagnosticCode::MissingReturnValue
+                | DiagnosticCode::NeverValue => true,
             };
             assert!(listed);
         }
-        assert_eq!(DiagnosticCode::ALL.len(), 3);
+        assert_eq!(DiagnosticCode::ALL.len(), 10);
+    }
+
+    #[test]
+    fn analysis_rules_warn_and_parser_and_sema_rules_are_errors() {
+        for code in DiagnosticCode::ALL {
+            let expected = match code.code().starts_with("PINP1") {
+                true => Severity::Warning,
+                false => Severity::Error,
+            };
+            assert_eq!(code.severity(), expected, "{}", code.code());
+        }
     }
 
     #[test]

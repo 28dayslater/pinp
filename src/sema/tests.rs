@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: MIT
 
 use super::*;
+use crate::diagnostic::DiagnosticCode;
 use crate::parser::{ArrayElementType, BinOp, Node, PinpType, ProgramAst, Stmt, TopLevel, parse};
 use indoc::indoc;
 
@@ -2916,5 +2917,581 @@ fn mixed_str_int_ternary_is_void() {
     assert_eq!(
         sema_error("x = 'a' if true else 5"),
         SemaErrorKind::Type("Cannot assign a void value.".into())
+    );
+}
+
+// --- return (0018) -----------------------------------------------------------------------
+
+/// The code of the semantic error `src` produces; panics on an uncoded one.
+fn sema_code(src: &str) -> DiagnosticCode {
+    let kind = sema_error(src);
+    kind.code()
+        .unwrap_or_else(|| panic!("Expected a coded error, got {kind:?}."))
+}
+
+fn coded(code: DiagnosticCode, message: &str) -> SemaErrorKind {
+    SemaErrorKind::Coded(code, message.into())
+}
+
+/// `src` analyses without error.
+fn accepted(src: &str) {
+    let mut ast = parse(src).expect("source should parse");
+    if let Err(error) = analyze(&mut ast) {
+        panic!("Expected no error, got {error:?} in:\n{src}");
+    }
+}
+
+/// The type of the first `if` in `src`.
+fn first_if_type(src: &str) -> PinpType {
+    let ast = analyzed(src);
+    let if_id = ast
+        .nodes
+        .iter()
+        .position(|node| matches!(node, Node::If { .. }))
+        .expect("an if");
+    ast.types[if_id]
+}
+
+#[test]
+fn a_returned_value_must_be_assignable_to_the_declared_type() {
+    accepted(indoc! {"
+        f(n: int): int is
+            return n
+        f(1)
+    "});
+    accepted(indoc! {"
+        f(n: int): float is
+            return n
+        f(1)
+    "});
+    accepted(indoc! {"
+        f(b: bool): bool is
+            return b
+        f(true)
+    "});
+    accepted(indoc! {"
+        f(n: int): str is
+            s = str(n)
+            return s
+        f(1)
+    "});
+    accepted(indoc! {"
+        f(b: bool): int is
+            return b
+        f(true)
+    "});
+    assert_eq!(
+        sema_error(indoc! {"
+            f(x: float): int is
+                return x
+            f(1.0)
+        "}),
+        coded(
+            DiagnosticCode::ReturnTypeMismatch,
+            "Function `f` returns Float but is declared Int."
+        )
+    );
+    for src in [
+        indoc! {"
+            f(n: int): int is
+                s = str(n)
+                return s
+            f(1)
+        "},
+        indoc! {"
+            f(n: int): str is
+                return n
+            f(1)
+        "},
+        indoc! {"
+            f(n: int): bool is
+                return n
+            f(1)
+        "},
+        indoc! {"
+            f(n: int): int is
+                return [n, n]
+            f(1)
+        "},
+        indoc! {"
+            f(n: int): int is
+                return 1..n
+            f(1)
+        "},
+    ] {
+        assert_eq!(
+            sema_code(src),
+            DiagnosticCode::ReturnTypeMismatch,
+            "in:\n{src}"
+        );
+    }
+}
+
+#[test]
+fn a_void_function_returns_bare() {
+    accepted(indoc! {"
+        g = 0
+        f(n: int) is
+            if n > 0
+                return
+            ::g = n
+        f(1)
+    "});
+    assert_eq!(
+        sema_error(indoc! {"
+            f(n: int) is
+                return n
+            f(1)
+        "}),
+        coded(
+            DiagnosticCode::VoidFunctionReturnsValue,
+            "Function `f` is void and cannot return a value."
+        )
+    );
+    // Even a void value is a value: `return` in a void function stays bare.
+    assert_eq!(
+        sema_code(indoc! {"
+            g() is
+                meminfo()
+            f() is
+                return g()
+            f()
+        "}),
+        DiagnosticCode::VoidFunctionReturnsValue
+    );
+}
+
+#[test]
+fn a_bare_return_in_a_function_with_a_type_is_an_error() {
+    assert_eq!(
+        sema_error(indoc! {"
+            f(n: int): int is
+                if n > 0
+                    return
+                n
+            f(1)
+        "}),
+        coded(
+            DiagnosticCode::MissingReturnValue,
+            "Function `f` must return a value of type Int."
+        )
+    );
+    assert_eq!(
+        sema_code(indoc! {"
+            f(): str is
+                return
+            f()
+        "}),
+        DiagnosticCode::MissingReturnValue
+    );
+}
+
+#[test]
+fn return_outside_a_function_is_an_error() {
+    let expected = coded(
+        DiagnosticCode::ReturnOutsideFunction,
+        "Return outside a function.",
+    );
+    for src in [
+        "return 1",
+        "return",
+        indoc! {"
+            x = 1
+            if x > 0
+                return x
+            x
+        "},
+        indoc! {"
+            n = 3
+            while n > 0
+                return
+        "},
+        indoc! {"
+            for i in 1..3
+                return i
+        "},
+        indoc! {"
+            loop
+                return
+            until true
+        "},
+        indoc! {"
+            f(): int is 1
+            return f()
+        "},
+    ] {
+        assert_eq!(sema_error(src), expected, "in:\n{src}");
+    }
+}
+
+#[test]
+fn an_if_whose_every_branch_returns_is_never() {
+    let src = indoc! {"
+        abs(n: int): int is
+            if n < 0
+                return -n
+            else
+                return n
+        abs(-2)
+    "};
+    accepted(src);
+    assert_eq!(first_if_type(src), PinpType::Never);
+}
+
+#[test]
+fn every_arm_of_an_elif_chain_returning_with_an_else_is_never() {
+    let src = indoc! {"
+        sign(n: int): int is
+            if n < 0
+                return -1
+            elif n == 0
+                return 0
+            else
+                return 1
+        sign(5)
+    "};
+    accepted(src);
+    assert_eq!(first_if_type(src), PinpType::Never);
+}
+
+#[test]
+fn a_returning_branch_does_not_affect_the_join() {
+    // The other branch decides the type: int, int promoted to float, str.
+    let int_if = indoc! {"
+        f(n: int): int is
+            if n < 0
+                return 0
+            else
+                n
+        f(1)
+    "};
+    accepted(int_if);
+    assert_eq!(first_if_type(int_if), PinpType::Int);
+
+    let float_if = indoc! {"
+        f(n: int): float is
+            if n < 0
+                return 0
+            else
+                n / 2
+        f(1)
+    "};
+    accepted(float_if);
+    assert_eq!(first_if_type(float_if), PinpType::Float);
+
+    let str_if = indoc! {"
+        f(n: int): str is
+            if n < 0
+                'neg'
+            else
+                return 'pos'
+        f(1)
+    "};
+    accepted(str_if);
+    assert_eq!(first_if_type(str_if), PinpType::Str);
+}
+
+#[test]
+fn an_if_without_else_stays_void_even_when_its_arm_returns() {
+    let src = indoc! {"
+        f(n: int) is
+            if n < 0
+                return
+        f(1)
+    "};
+    accepted(src);
+    assert_eq!(first_if_type(src), PinpType::Void);
+}
+
+#[test]
+fn a_block_with_a_return_anywhere_in_it_diverges() {
+    // The then-branch returns before its trailing `n`, so it never yields that value.
+    let src = indoc! {"
+        f(n: int): int is
+            if n > 0
+                return 1
+                n
+            else
+                2
+        f(1)
+    "};
+    accepted(src);
+    assert_eq!(first_if_type(src), PinpType::Int);
+}
+
+#[test]
+fn returns_nested_at_depth_make_the_outer_if_diverge() {
+    accepted(indoc! {"
+        f(a: int, b: int): int is
+            if a > 0
+                if b > 0
+                    return 1
+                else
+                    return 2
+            else
+                return 3
+        f(1, 2)
+    "});
+}
+
+#[test]
+fn a_never_value_cannot_be_assigned() {
+    assert_eq!(
+        sema_error(indoc! {"
+            f(n: int): int is
+                x = if n > 0
+                    return 1
+                else
+                    return 2
+                x
+            f(1)
+        "}),
+        coded(
+            DiagnosticCode::NeverValue,
+            "Expression never produces a value."
+        )
+    );
+}
+
+#[test]
+fn a_function_with_a_type_must_return_on_every_path() {
+    let expected = coded(
+        DiagnosticCode::MissingReturn,
+        "Not all paths return a value in function `sign()`.",
+    );
+    for src in [
+        // `if` without `else`, its arm returning.
+        indoc! {"
+            sign(n: int): int is
+                if n < 0
+                    return -1
+                if n == 0
+                    return 0
+            sign(1)
+        "},
+        // `if`/`elif`, all returning, no `else`.
+        indoc! {"
+            sign(n: int): int is
+                if n < 0
+                    return -1
+                elif n == 0
+                    return 0
+            sign(1)
+        "},
+        // `if`/`else`, one branch returning, the other ending in an assignment.
+        indoc! {"
+            sign(n: int): int is
+                if n < 0
+                    return -1
+                else
+                    m = n
+            sign(1)
+        "},
+        // An inner `if` without `else` in the outer `else`.
+        indoc! {"
+            sign(n: int): int is
+                if n < 0
+                    return -1
+                else
+                    if n == 0
+                        return 0
+            sign(1)
+        "},
+        // Body ending in an assignment.
+        indoc! {"
+            sign(n: int): int is
+                m = n
+            sign(1)
+        "},
+        // Body ending in a loop that returns on every pass: the loop may not run at all.
+        indoc! {"
+            sign(n: int): int is
+                while n > 0
+                    return 1
+            sign(1)
+        "},
+        indoc! {"
+            sign(n: int): int is
+                loop
+                    return 1
+                until n > 0
+            sign(1)
+        "},
+        indoc! {"
+            sign(n: int): int is
+                for i in 1..n
+                    return i
+            sign(1)
+        "},
+        // A return only inside a loop, under a condition.
+        indoc! {"
+            sign(n: int): int is
+                for i in 1..n
+                    if i > 2
+                        return i
+            sign(1)
+        "},
+    ] {
+        assert_eq!(sema_error(src), expected, "in:\n{src}");
+    }
+}
+
+#[test]
+fn each_missing_return_shape_is_accepted_once_completed() {
+    for src in [
+        indoc! {"
+            sign(n: int): int is
+                if n < 0
+                    return -1
+                if n == 0
+                    return 0
+                1
+            sign(1)
+        "},
+        indoc! {"
+            sign(n: int): int is
+                if n < 0
+                    return -1
+                elif n == 0
+                    return 0
+                else
+                    return 1
+            sign(1)
+        "},
+        indoc! {"
+            sign(n: int): int is
+                if n < 0
+                    return -1
+                else
+                    m = n
+                0
+            sign(1)
+        "},
+        indoc! {"
+            sign(n: int): int is
+                m = n
+                return m
+            sign(1)
+        "},
+        indoc! {"
+            sign(n: int): int is
+                while n > 0
+                    return 1
+                0
+            sign(1)
+        "},
+        indoc! {"
+            sign(n: int): int is
+                for i in 1..n
+                    if i > 2
+                        return i
+                return 0
+            sign(1)
+        "},
+    ] {
+        accepted(src);
+    }
+}
+
+#[test]
+fn a_wrong_typed_final_value_keeps_its_own_message() {
+    assert!(matches!(
+        sema_error(indoc! {"
+            f(n: int): int is
+                if n > 0
+                    return 1
+                2.5
+            f(1)
+        "}),
+        SemaErrorKind::Type(message) if message.contains("body yields Float")
+    ));
+}
+
+#[test]
+fn a_void_function_may_end_in_a_statement() {
+    accepted(indoc! {"
+        g = 0
+        set(x: int) is
+            ::g = x
+        set(1)
+    "});
+    accepted(indoc! {"
+        g = 0
+        set(x: int) is
+            while x > 0
+                x -= 1
+                ::g = x
+        set(1)
+    "});
+    accepted(indoc! {"
+        g = 0
+        set(x: int) is
+            if x > 0
+                ::g = x
+        set(1)
+    "});
+}
+
+#[test]
+fn return_sees_locals_of_nested_bodies_parameters_and_globals() {
+    accepted(indoc! {"
+        g = 5
+        f(n: int): int is
+            if n > 0
+                m = n * 2
+                return m
+            for i in 1..n
+                return i + n
+            return ::g
+        f(1)
+    "});
+}
+
+#[test]
+fn a_nested_return_is_checked_against_the_enclosing_function() {
+    accepted(indoc! {"
+        f(n: int): float is
+            while n > 0
+                return n
+            0.5
+        f(1)
+    "});
+    assert_eq!(
+        sema_code(indoc! {"
+            f(n: int): int is
+                while n > 0
+                    if n > 1
+                        return 0.5
+                0
+            f(1)
+        "}),
+        DiagnosticCode::ReturnTypeMismatch
+    );
+}
+
+#[test]
+fn a_return_value_is_analysed_like_any_expression() {
+    assert!(matches!(
+        sema_error(indoc! {"
+            f(): int is
+                return nope
+            f()
+        "}),
+        SemaErrorKind::UnknownSymbol(_)
+    ));
+}
+
+#[test]
+fn a_function_after_one_with_returns_is_checked_against_its_own_type() {
+    // The enclosing function's type must not leak into the next definition.
+    assert_eq!(
+        sema_code(indoc! {"
+            f(): str is
+                return 'a'
+            g(): int is
+                return 'b'
+            g()
+        "}),
+        DiagnosticCode::ReturnTypeMismatch
     );
 }

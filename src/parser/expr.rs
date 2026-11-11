@@ -492,6 +492,11 @@ impl<'src> Parser<'src> {
     // `if`.
     fn parse_primary(&mut self) -> Result<ExprId, ParseErrorKind> {
         match self.peek().kind {
+            // Not consumed, so the error lands on the `return` itself.
+            TokenKind::KwReturn => Err(ParseErrorKind::Coded(
+                DiagnosticCode::ReturnAsValue,
+                "Return cannot be used as a value.".into(),
+            )),
             TokenKind::Int => {
                 let token = self.advance();
                 let value = parse_int(token.text)?;

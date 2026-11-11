@@ -55,7 +55,8 @@ fn words(pinp_type: PinpType) -> &'static [Type] {
         PinpType::Str => &[I64, I64],
         PinpType::Range => &[I64, I64, I64, I8],
         PinpType::Array(..) | PinpType::Matrix(..) => &[I64],
-        PinpType::Void => &[],
+        // A never value is never computed, so it has nothing to hold.
+        PinpType::Void | PinpType::Never => &[],
     }
 }
 
@@ -458,6 +459,10 @@ impl<'emit, 'program> FunctionEmitter<'emit, 'program> {
             }
             Terminator::Switch { .. } => unimplemented!("`Switch` is not produced yet"),
             Terminator::RuntimeError(_) => unimplemented!("`RuntimeError` is not produced yet"),
+            // Never executed; a trap is the cheapest instruction that ends a block.
+            Terminator::Unreachable => {
+                self.builder.ins().trap(TrapCode::unwrap_user(1));
+            }
         }
     }
 

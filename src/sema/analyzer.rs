@@ -88,24 +88,43 @@ impl Analyzer<'_, '_> {
         let old_base = self.fn_base;
         self.scopes.push(frame);
         self.fn_base = self.scopes.len() - 1;
+        self.current_function = Some((func.name, func.return_type));
+        let mut diverges = false;
         for stmt in &func.body.stmts {
-            self.analyze_stmt(stmt)?;
+            diverges |= self.analyze_stmt(stmt)?;
         }
-        let result = func
-            .body
-            .result
-            .expect("a function body always ends in a result expression");
-        let result_type = self.analyze_expr(result)?;
+        let result = match func.body.result {
+            Some(result) => Some((result, self.analyze_expr(result)?)),
+            None => None,
+        };
+        self.current_function = None;
         self.scopes.pop();
         self.fn_base = old_base;
 
-        if !assignable(result_type, func.return_type) {
-            let kind = SemaErrorKind::Type(format!(
-                "Function `{}` body yields {result_type:?} but is declared {:?}.",
-                self.name(func.name),
-                func.return_type
-            ));
-            return Err(self.error_at_expr(result, kind));
+        let diverges = diverges || matches!(result, Some((_, PinpType::Never)));
+        match result {
+            _ if diverges => {}
+            Some((result, result_type)) if result_type != PinpType::Void => {
+                if !assignable(result_type, func.return_type) {
+                    let kind = SemaErrorKind::Type(format!(
+                        "Function `{}` body yields {result_type:?} but is declared {:?}.",
+                        self.name(func.name),
+                        func.return_type
+                    ));
+                    return Err(self.error_at_expr(result, kind));
+                }
+            }
+            _ if func.return_type != PinpType::Void => {
+                let kind = SemaErrorKind::Coded(
+                    DiagnosticCode::MissingReturn,
+                    format!(
+                        "Not all paths return a value in function `{}()`.",
+                        self.name(func.name)
+                    ),
+                );
+                return Err(self.error_at(func.name_span, kind));
+            }
+            _ => {}
         }
         // Register only now: a call can reach a function only after its definition (so no forward
         // references and no recursion).
@@ -119,11 +138,14 @@ impl Analyzer<'_, '_> {
         Ok(())
     }
 
-    pub(super) fn analyze_stmt(&mut self, stmt: &Stmt) -> Result<(), SemaErrorKind> {
+    /// Checks one statement, returning whether it *diverges* — control never continues past it:
+    /// a `return`, or an `if` every branch of which returns.
+    pub(super) fn analyze_stmt(&mut self, stmt: &Stmt) -> Result<bool, SemaErrorKind> {
         match stmt {
-            Stmt::Expr(expr_id) => {
-                self.analyze_expr(*expr_id)?;
-                Ok(())
+            Stmt::Expr(expr_id) => Ok(self.analyze_expr(*expr_id)? == PinpType::Never),
+            Stmt::Return { value, span } => {
+                self.analyze_return(*value, *span)?;
+                Ok(true)
             }
             Stmt::Assign {
                 target_lists,
@@ -139,6 +161,13 @@ impl Analyzer<'_, '_> {
                         let kind = SemaErrorKind::Type("Cannot assign a void value.".into());
                         return Err(self.error_at_expr(*value, kind));
                     }
+                    if value_type == PinpType::Never {
+                        let kind = SemaErrorKind::Coded(
+                            DiagnosticCode::NeverValue,
+                            "Expression never produces a value.".into(),
+                        );
+                        return Err(self.error_at_expr(*value, kind));
+                    }
                     value_types.push(value_type);
                 }
                 for (group, spans) in target_lists.iter().zip(target_spans) {
@@ -148,17 +177,18 @@ impl Analyzer<'_, '_> {
                         self.assign_place(*place, *target_span, *value, *value_type)?;
                     }
                 }
-                Ok(())
+                Ok(false)
             }
+            // A loop never diverges, even when its body does: the body may not run at all.
             Stmt::While { cond, body } => {
                 self.check_condition(*cond)?;
                 self.analyze_block(body)?;
-                Ok(())
+                Ok(false)
             }
             Stmt::Loop { body, cond, .. } => {
                 self.analyze_block(body)?;
                 self.check_condition(*cond)?;
-                Ok(())
+                Ok(false)
             }
             Stmt::For {
                 var, source, body, ..
@@ -183,7 +213,7 @@ impl Analyzer<'_, '_> {
                 self.analyze_block(body)?;
                 self.loop_vars.pop();
                 self.scopes.pop();
-                Ok(())
+                Ok(false)
             }
             Stmt::ForArray {
                 binders,
@@ -229,7 +259,7 @@ impl Analyzer<'_, '_> {
                     self.loop_vars.pop();
                 }
                 self.scopes.pop();
-                Ok(())
+                Ok(false)
             }
             Stmt::IndexedAssign {
                 target,
@@ -239,7 +269,7 @@ impl Analyzer<'_, '_> {
                 compound_op,
             } => {
                 self.indexed_assign_check(*target, *target_span, *index, *value, *compound_op)?;
-                Ok(())
+                Ok(false)
             }
             Stmt::IndexedAssign2D {
                 target,
@@ -257,9 +287,56 @@ impl Analyzer<'_, '_> {
                     *value,
                     *compound_op,
                 )?;
-                Ok(())
+                Ok(false)
             }
         }
+    }
+
+    /// Checks a `return` against the enclosing function: it must be in one, and carry a value
+    /// exactly when the function has a return type, of a type assignable to it.
+    fn analyze_return(&mut self, value: Option<ExprId>, span: Span) -> Result<(), SemaErrorKind> {
+        let Some((name, return_type)) = self.current_function else {
+            let kind = SemaErrorKind::Coded(
+                DiagnosticCode::ReturnOutsideFunction,
+                "Return outside a function.".into(),
+            );
+            return Err(self.error_at(span, kind));
+        };
+        let Some(value) = value else {
+            if return_type == PinpType::Void {
+                return Ok(());
+            }
+            let kind = SemaErrorKind::Coded(
+                DiagnosticCode::MissingReturnValue,
+                format!(
+                    "Function `{}` must return a value of type {return_type:?}.",
+                    self.name(name)
+                ),
+            );
+            return Err(self.error_at(span, kind));
+        };
+        let value_type = self.analyze_expr(value)?;
+        if return_type == PinpType::Void {
+            let kind = SemaErrorKind::Coded(
+                DiagnosticCode::VoidFunctionReturnsValue,
+                format!(
+                    "Function `{}` is void and cannot return a value.",
+                    self.name(name)
+                ),
+            );
+            return Err(self.error_at_expr(value, kind));
+        }
+        if !assignable(value_type, return_type) {
+            let kind = SemaErrorKind::Coded(
+                DiagnosticCode::ReturnTypeMismatch,
+                format!(
+                    "Function `{}` returns {value_type:?} but is declared {return_type:?}.",
+                    self.name(name)
+                ),
+            );
+            return Err(self.error_at_expr(value, kind));
+        }
+        Ok(())
     }
 
     /// Checks one assignment target against the type of the value bound to it: a `::global` must
@@ -310,20 +387,25 @@ impl Analyzer<'_, '_> {
         }
     }
 
-    /// Analyses a control-flow body in its own scope, returning the type of its trailing result
-    /// expression (or `None` when it ends in a statement). The scope is popped on the way out, so a
-    /// name first assigned here does not escape.
-    fn analyze_block(&mut self, block: &Block) -> Result<Option<PinpType>, SemaErrorKind> {
+    /// Analyses a control-flow body in its own scope, returning its type: `Never` when a statement
+    /// in it diverges, else the type of its trailing result expression, or `Void` when it ends in a
+    /// statement. The scope is popped on the way out, so a name first assigned here does not
+    /// escape.
+    fn analyze_block(&mut self, block: &Block) -> Result<PinpType, SemaErrorKind> {
         self.scopes.push(FxHashMap::default());
+        let mut diverges = false;
         for stmt in &block.stmts {
-            self.analyze_stmt(stmt)?;
+            diverges |= self.analyze_stmt(stmt)?;
         }
         let result_type = match block.result {
-            Some(expr_id) => Some(self.analyze_expr(expr_id)?),
-            None => None,
+            Some(expr_id) => self.analyze_expr(expr_id)?,
+            None => PinpType::Void,
         };
         self.scopes.pop();
-        Ok(result_type)
+        Ok(match diverges {
+            true => PinpType::Never,
+            false => result_type,
+        })
     }
 
     /// A condition (`if`/`while`/`loop`) must be `Bool` — there is no truthiness.
@@ -462,14 +544,15 @@ impl Analyzer<'_, '_> {
     }
 
     /// Types an `if`: each condition must be `Bool`; the node's type is the join of every branch's
-    /// result, but only when an `else` is present and every branch (arms and `else`) ends in an
-    /// expression. Otherwise it is `Void` — usable as a statement, but not as a value.
+    /// type, but only when an `else` is present. Without one, or when the branches share no type,
+    /// it is `Void` — usable as a statement, but not as a value. Branches that return do not take
+    /// part, so an `if` all of whose branches return is `Never`.
     fn if_type(
         &mut self,
         arms: &[crate::parser::IfArm],
         else_block: Option<&Block>,
     ) -> Result<PinpType, SemaErrorKind> {
-        let mut branch_types = Vec::with_capacity(arms.len());
+        let mut branch_types = Vec::with_capacity(arms.len() + 1);
         for arm in arms {
             self.check_condition(arm.cond)?;
             branch_types.push(self.analyze_block(&arm.body)?);
@@ -477,16 +560,11 @@ impl Analyzer<'_, '_> {
         let Some(else_body) = else_block else {
             return Ok(PinpType::Void);
         };
-        let else_type = self.analyze_block(else_body)?;
+        branch_types.push(self.analyze_block(else_body)?);
 
-        // A missing branch result, or branches that do not share a common type, leave the `if`
-        // valueless (`Void`).
-        let mut joined = match else_type {
-            Some(branch_type) => branch_type,
-            None => return Ok(PinpType::Void),
-        };
-        for branch in branch_types {
-            match branch.and_then(|branch_type| join(joined, branch_type)) {
+        let mut joined = PinpType::Never;
+        for branch_type in branch_types {
+            match join(joined, branch_type) {
                 Some(wider) => joined = wider,
                 None => return Ok(PinpType::Void),
             }
@@ -1238,6 +1316,7 @@ impl Analyzer<'_, '_> {
                 // TODO: element-wise negation on arrays/matrices may be allowed for matrix algebra later.
                 PinpType::Str
                 | PinpType::Void
+                | PinpType::Never
                 | PinpType::Range
                 | PinpType::Array(_, _)
                 | PinpType::Matrix(_, _, _) => Err(SemaErrorKind::Type(format!(
