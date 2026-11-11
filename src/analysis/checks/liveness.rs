@@ -548,4 +548,122 @@ mod tests {
         let src = "f(): int is\n    t = 'x'\n    0\nf()";
         assert_eq!(diagnostics_in(src, 0), found(&[("unused-variable", "t")]));
     }
+
+    // --- return (0018) ---------------------------------------------------------------------
+
+    #[test]
+    fn a_returned_value_is_not_a_dead_store_at_any_depth() {
+        for src in [
+            indoc! {"
+                f(n: int): int is
+                    t = n * 2
+                    return t
+                f(1)
+            "},
+            indoc! {"
+                f(n: int): int is
+                    if n > 0
+                        t = n * 2
+                        return t
+                    0
+                f(1)
+            "},
+            indoc! {"
+                f(n: int): int is
+                    for i in 1..n
+                        t = i * 2
+                        if t > 3
+                            return t
+                    0
+                f(1)
+            "},
+        ] {
+            assert!(diagnostics_in(src, 0).is_empty(), "in:\n{src}");
+        }
+    }
+
+    #[test]
+    fn a_write_read_on_one_path_and_returned_past_on_another_is_clean() {
+        let src = indoc! {"
+            f(n: int): int is
+                t = n * 2
+                if n < 0
+                    return 0
+                t
+            f(1)
+        "};
+        assert!(diagnostics_in(src, 0).is_empty());
+    }
+
+    #[test]
+    fn a_write_followed_only_by_a_return_that_ignores_it_is_a_dead_store() {
+        // `t` is read at the end, but the second write is followed only by `return 0`.
+        let src = indoc! {"
+            f(n: int): int is
+                t = n * 2
+                if n < 0
+                    t = 5
+                    return 0
+                t
+            f(1)
+        "};
+        assert_eq!(diagnostics_in(src, 0), found(&[("dead-store", "t")]));
+    }
+
+    #[test]
+    fn a_variable_read_only_after_a_return_gets_a_dead_store_not_never_used() {
+        let src = indoc! {"
+            f(n: int): int is
+                a = n
+                return 0
+                a
+            f(1)
+        "};
+        assert_eq!(diagnostics_in(src, 0), found(&[("dead-store", "a")]));
+    }
+
+    #[test]
+    fn a_return_inside_a_loop_does_not_hide_reads_on_its_other_paths() {
+        let src = indoc! {"
+            f(n: int): int is
+                t = 0
+                for i in 1..n
+                    if i > 5
+                        return 0
+                    t += i
+                t
+            f(3)
+        "};
+        assert!(diagnostics_in(src, 0).is_empty());
+    }
+
+    #[test]
+    fn the_frees_before_each_return_are_not_reads() {
+        let src = indoc! {"
+            f(n: int): int is
+                s = 'never read'
+                if n > 0
+                    return 1
+                return 2
+            f(1)
+        "};
+        assert_eq!(diagnostics_in(src, 0), found(&[("unused-variable", "s")]));
+    }
+
+    #[test]
+    fn several_returns_reading_different_variables_report_none_of_them() {
+        let src = indoc! {"
+            f(n: int): int is
+                a = n + 1
+                b = n + 2
+                c = n + 3
+                if n < 0
+                    return a
+                elif n == 0
+                    return b
+                c
+            f(1)
+        "};
+        assert!(diagnostics_in(src, 0).is_empty());
+    }
 }

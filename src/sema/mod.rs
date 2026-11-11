@@ -14,7 +14,7 @@
 
 use rustc_hash::FxHashMap;
 
-use crate::diagnostic::{Diagnose, Diagnostic};
+use crate::diagnostic::{Diagnose, Diagnostic, DiagnosticCode};
 use crate::lexer::Span;
 use crate::parser::{BuiltinMember, Node, PinpType, ProgramAst, SymId, TopLevel};
 
@@ -37,7 +37,10 @@ pub struct SemaError {
 
 impl Diagnose for SemaError {
     fn to_diagnostic(&self) -> Diagnostic {
-        Diagnostic::error(self.span, self.kind.message())
+        match self.kind.code() {
+            Some(code) => Diagnostic::new(code, self.span, self.kind.message()),
+            None => Diagnostic::error(self.span, self.kind.message()),
+        }
     }
 }
 
@@ -56,13 +59,25 @@ pub enum SemaErrorKind {
     UnknownSymbol(String),
     /// A type error: a mismatch, a bad promotion, or an operation on `Void`.
     Type(String),
+    /// An error with a stable [`DiagnosticCode`] of its own.
+    Coded(DiagnosticCode, String),
 }
 
 impl SemaErrorKind {
-    /// The human-readable text, which both variants carry.
+    /// The human-readable text, which every variant carries.
     pub fn message(&self) -> &str {
         match self {
-            SemaErrorKind::UnknownSymbol(message) | SemaErrorKind::Type(message) => message,
+            SemaErrorKind::UnknownSymbol(message)
+            | SemaErrorKind::Type(message)
+            | SemaErrorKind::Coded(_, message) => message,
+        }
+    }
+
+    /// The error's stable code, if it has one.
+    pub fn code(&self) -> Option<DiagnosticCode> {
+        match self {
+            SemaErrorKind::Coded(code, _) => Some(*code),
+            _ => None,
         }
     }
 }
@@ -73,14 +88,16 @@ impl SemaErrorKind {
 
 /// `from` is assignable to `to` if identical, or by widening up the promotion lattice
 /// `Bool -> Int -> Float`. Narrowing (e.g. `Float -> Int`, anything `-> Bool`) is never implicit.
+/// `Never` is assignable to everything: no value of it ever arrives.
 fn assignable(from: PinpType, to: PinpType) -> bool {
     use PinpType::*;
-    from == to || matches!((from, to), (Bool, Int) | (Bool, Float) | (Int, Float))
+    from == to || from == Never || matches!((from, to), (Bool, Int) | (Bool, Float) | (Int, Float))
 }
 
 /// The wider of two types under the `Bool -> Int -> Float` lattice — the common type an `if`'s
-/// branches join to. `None` when neither is assignable to the other (e.g. a `Void` branch), which
-/// makes the whole `if` `Void` and so usable only as a statement.
+/// branches join to. `Never` is the identity: a branch that returns does not take part. `None`
+/// when neither is assignable to the other (e.g. a `Void` branch), which makes the whole `if`
+/// `Void` and so usable only as a statement.
 fn join(left: PinpType, right: PinpType) -> Option<PinpType> {
     if assignable(left, right) {
         Some(right)
@@ -144,10 +161,11 @@ pub fn analyze(ast: &mut ProgramAst) -> Result<(), SemaError> {
         spans,
         current_span: Span::UNKNOWN,
         loop_vars: Vec::new(),
+        current_function: None,
     };
     for item in top_level.iter() {
         let result = match item {
-            TopLevel::Stmt(stmt) => analyzer.analyze_stmt(stmt),
+            TopLevel::Stmt(stmt) => analyzer.analyze_stmt(stmt).map(|_| ()),
             TopLevel::Func(func) => analyzer.analyze_func(func),
         };
         // The walk records where it was as it goes; a rule only says what went wrong.
@@ -182,4 +200,7 @@ struct Analyzer<'ast, 'src> {
     // The loop variables of the enclosing `for`s; each is read-only inside its body, so an
     // assignment to one is rejected rather than allowed to corrupt the iteration counter.
     loop_vars: Vec<SymId>,
+    /// The function being analysed, by name and return type; `None` at the top level, where
+    /// `return` is an error.
+    current_function: Option<(SymId, PinpType)>,
 }

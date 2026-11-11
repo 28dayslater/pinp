@@ -12,10 +12,11 @@
 //!   so a point stays unreached only when no path whatsoever leads to it.
 //! * Unreachable: the diagnostic — a statement no execution can arrive at.
 //!
-//! What makes anything unreachable in a language with no `return` or `break` is a condition that
-//! cannot vary. Only a **constant** `true`/`false` counts here, and a counted loop over a range of
-//! two integer constants that is provably empty: `while 1 > 2` is not folded, because doing
-//! constant arithmetic by hand would duplicate what constant propagation will do properly later.
+//! Two things make code unreachable. A `return` is one: the code after it in the same body lands
+//! in a block no edge enters. The other is a condition that cannot vary. Only a **constant**
+//! `true`/`false` counts here, and a counted loop over a range of two integer constants that is
+//! provably empty: `while 1 > 2` is not folded, because doing constant arithmetic by hand would
+//! duplicate what constant propagation will do properly later.
 
 use crate::analysis::dataflow::{Analysis, Direction, ReachabilityLattice, solve};
 use crate::diagnostic::{Diagnostic, DiagnosticCode};
@@ -403,5 +404,148 @@ mod tests {
     fn a_dead_string_assignment_is_reported_at_its_target() {
         // The free of the old value comes first in the block, and carries the target's position.
         assert_eq!(diagnostics("s = 'a'\nif false\n    s = 'b'\ns"), vec!["s"]);
+    }
+
+    // --- return (0018) ---------------------------------------------------------------------
+
+    #[test]
+    fn code_after_a_return_is_reported_once_at_its_first_statement() {
+        let src = indoc! {"
+            f(n: int): int is
+                return n
+                m = n + 1
+                m = m + 2
+                m
+            f(1)
+        "};
+        assert_eq!(diagnostics(src), vec!["m"]);
+    }
+
+    #[test]
+    fn a_trailing_expression_after_a_return_is_reported() {
+        assert_eq!(
+            diagnostics(indoc! {"
+                f(n: int): int is
+                    return n
+                    n + 1
+                f(1)
+            "}),
+            vec!["n + 1"]
+        );
+    }
+
+    #[test]
+    fn code_after_an_if_else_that_returns_on_both_arms_is_reported() {
+        let src = indoc! {"
+            f(n: int): int is
+                if n < 0
+                    return -n
+                else
+                    return n
+                n * 2
+            f(1)
+        "};
+        assert_eq!(diagnostics(src), vec!["n * 2"]);
+    }
+
+    #[test]
+    fn code_after_returning_ifs_without_else_is_reachable() {
+        let src = indoc! {"
+            sign(n: int): int is
+                if n < 0
+                    return -1
+                if n == 0
+                    return 0
+                1
+            sign(1)
+        "};
+        assert!(diagnostics(src).is_empty());
+    }
+
+    #[test]
+    fn a_return_ending_a_loop_body_reports_nothing() {
+        // The loop step after the return is the compiler's, not the user's: it is not generated.
+        for src in [
+            indoc! {"
+                f(n: int): int is
+                    for i in 1..n
+                        return i
+                    0
+                f(1)
+            "},
+            indoc! {"
+                f(n: int): int is
+                    for i, v in [1, 2]
+                        return v
+                    0
+                f(1)
+            "},
+            indoc! {"
+                f(n: int): int is
+                    while n > 0
+                        return n
+                    0
+                f(1)
+            "},
+            indoc! {"
+                f(n: int): int is
+                    for i in 1..n
+                        if i > 1
+                            return i
+                        else
+                            return 0
+                    0
+                f(1)
+            "},
+        ] {
+            assert!(diagnostics(src).is_empty(), "in:\n{src}");
+        }
+    }
+
+    #[test]
+    fn a_function_that_always_returns_reports_nothing_at_its_end() {
+        for src in [
+            indoc! {"
+                abs(n: int): int is
+                    if n < 0
+                        return -n
+                    else
+                        return n
+                abs(1)
+            "},
+            indoc! {"
+                f(n: int): str is
+                    s = str(n)
+                    t = s + 'x'
+                    if t.len > 3
+                        return t
+                    else
+                        return s
+                f(12)
+            "},
+            indoc! {"
+                g = 0
+                f(n: int) is
+                    ::g = n
+                    return
+                f(1)
+            "},
+        ] {
+            assert!(diagnostics(src).is_empty(), "in:\n{src}");
+        }
+    }
+
+    #[test]
+    fn a_do_while_whose_body_returns_reports_its_condition() {
+        // The condition after the body can never be evaluated.
+        let src = indoc! {"
+            f(n: int): int is
+                loop
+                    return n
+                until n > 0
+                0
+            f(1)
+        "};
+        assert_eq!(diagnostics(src)[0], "n > 0");
     }
 }

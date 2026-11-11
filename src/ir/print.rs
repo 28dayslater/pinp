@@ -294,6 +294,7 @@ impl<'a> Writer<'a> {
                 false => "do_while".to_string(),
             },
             CountedLoop { index, .. } => format!("counted_loop {}", self.local(index)),
+            Return(_) => "return".to_string(),
         }
     }
 
@@ -355,6 +356,7 @@ impl<'a> Writer<'a> {
                 text
             }
             Terminator::Return(_) => "return".to_string(),
+            Terminator::Unreachable => "unreachable".to_string(),
             Terminator::RuntimeError(message) => {
                 let constant = self.printer.tables.constants.get(message);
                 format!("runtime_error {}", self.constant(constant))
@@ -408,6 +410,7 @@ fn type_name(pinp_type: PinpType) -> String {
         PinpType::Float => "float".to_string(),
         PinpType::Str => "str".to_string(),
         PinpType::Void => "void".to_string(),
+        PinpType::Never => "never".to_string(),
         PinpType::Range => "range".to_string(),
         PinpType::Array(element, length) => format!("{}[{length}]", element_name(element)),
         PinpType::Matrix(element, rows, columns) => {

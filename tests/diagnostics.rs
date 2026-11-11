@@ -395,3 +395,109 @@ fn to_diagnostic_preserves_the_message_verbatim() {
     let error = lex("x = $\n").expect_err("source should not lex");
     assert_eq!(error.to_diagnostic().message, error.message);
 }
+
+// --- return (0018) -----------------------------------------------------------------------
+
+/// The rendered first line of the semantic error for `src`.
+fn sema_rendered(src: &str) -> String {
+    let mut ast = parse(src).expect("source should parse");
+    let error = analyze(&mut ast).expect_err("source should not analyze");
+    error.render(&LineIndex::new(src))
+}
+
+#[test]
+fn a_missing_return_points_at_the_function_name_and_carries_its_code() {
+    let src = indoc! {"
+        sign(n: int): int is
+            if n < 0
+                return -1
+        sign(1)
+    "};
+    assert_eq!(sema_failure(src), (1, 1, "sign".to_string()));
+    assert_eq!(
+        sema_rendered(src),
+        "1:1: error[PINP3001]: Not all paths return a value in function `sign()`."
+    );
+}
+
+#[test]
+fn a_misplaced_or_mistyped_return_points_at_the_offending_part() {
+    for (src, place, code) in [
+        (
+            indoc! {"
+                x = 1
+                return x
+            "},
+            (2, 1, "return x"),
+            "PINP3002",
+        ),
+        (
+            indoc! {"
+                f(x: float): int is
+                    return x
+                f(1.0)
+            "},
+            (2, 12, "x"),
+            "PINP3003",
+        ),
+        (
+            indoc! {"
+                f(x: int) is
+                    return x + 1
+                f(1)
+            "},
+            (2, 12, "x + 1"),
+            "PINP3004",
+        ),
+        (
+            indoc! {"
+                f(): int is
+                    return
+                f()
+            "},
+            (2, 5, "return"),
+            "PINP3005",
+        ),
+    ] {
+        assert_eq!(
+            sema_failure(src),
+            (place.0, place.1, place.2.to_string()),
+            "in:\n{src}"
+        );
+        assert!(
+            sema_rendered(src).contains(&format!("error[{code}]")),
+            "in:\n{src}"
+        );
+    }
+}
+
+#[test]
+fn a_never_value_points_at_the_expression() {
+    let src = indoc! {"
+        f(n: int): int is
+            x = if n > 0
+                return 1
+            else
+                return 2
+            x
+        f(1)
+    "};
+    let (line, column, _) = sema_failure(src);
+    assert_eq!((line, column), (2, 9));
+    assert!(sema_rendered(src).contains("error[PINP3006]"));
+}
+
+#[test]
+fn return_as_a_value_points_at_the_return() {
+    let src = indoc! {"
+        f(): int is
+            x = return 1
+            x
+    "};
+    assert_eq!(parse_failure(src), (2, 9, "return".to_string()));
+    assert!(
+        parse_error(src)
+            .render(&LineIndex::new(src))
+            .starts_with("2:9: error[PINP2001]: Return cannot be used as a value.")
+    );
+}

@@ -60,7 +60,7 @@ pub fn desugar(ast: &ProgramAst) -> Program {
             TopLevel::Stmt(stmt) => desugarer.statement(stmt, &mut entry_body),
         }
     }
-    let entry = desugarer.finish(entry_id, 0, &entry_body, entry_result);
+    let entry = desugarer.finish(entry_id, 0, &entry_body, entry_result, false);
     let mut program_functions = IdVec::default();
     for function in functions.into_iter().chain([entry]) {
         program_functions.push(function);
@@ -90,6 +90,10 @@ struct FunctionState {
     /// The temporaries that move an owned string from where it is made to where it is used; see
     /// [`ownership`].
     ownership_temporaries: FxHashSet<LocalId>,
+    /// The declared return type; `None` for the entry, where `return` cannot appear.
+    return_type: Option<PinpType>,
+    /// Whether a `return` was desugared, so [`Desugarer::finish`] has frees to place before it.
+    has_returns: bool,
 }
 
 struct Desugarer<'ast> {
@@ -179,41 +183,73 @@ impl<'ast> Desugarer<'ast> {
             parameters.insert(param.name, Binding::Local(local_id));
         }
         self.function.scopes.push(parameters);
+        self.function.return_type = Some(func.return_type);
+        let diverges = func.body.stmts.iter().any(|stmt| self.diverges(stmt))
+            || func
+                .body
+                .result
+                .is_some_and(|result| self.ast.type_of(result) == PinpType::Never);
         let mut body = Vec::new();
         for stmt in &func.body.stmts {
             self.statement(stmt, &mut body);
         }
-        let result_expr = func
-            .body
-            .result
-            .expect("a function body always ends in a result expression");
-        let result = match func.return_type {
-            PinpType::Void => {
+        // A body that always returns has no value at its end; a trailing expression the user wrote
+        // is still placed, as a statement, so that it can be reported as unreachable.
+        let result = match func.body.result {
+            Some(result_expr) if !diverges && func.return_type != PinpType::Void => {
+                let value = self.expr(result_expr, &mut body);
+                Some(self.convert(value, func.return_type))
+            }
+            Some(result_expr) => {
                 self.effect(result_expr, &mut body);
                 None
             }
-            return_type => {
-                let value = self.expr(result_expr, &mut body);
-                Some(self.convert(value, return_type))
-            }
+            None => None,
         };
         let function_id = self.function_ids[&func.name];
-        self.finish(function_id, func.params.len() as u32, &body, result)
+        self.finish(
+            function_id,
+            func.params.len() as u32,
+            &body,
+            result,
+            diverges,
+        )
     }
 
+    /// Whether control never continues past `stmt`, as sema typed it.
+    fn diverges(&self, stmt: &Stmt) -> bool {
+        match stmt {
+            Stmt::Return { .. } => true,
+            Stmt::Expr(expr_id) => self.ast.type_of(*expr_id) == PinpType::Never,
+            _ => false,
+        }
+    }
+
+    /// Completes a function: the frees before every `return` and, unless the body `diverges`, at
+    /// its end. Code placed at the end of a diverging body could never run, and would be reported
+    /// as unreachable.
     fn finish(
         &mut self,
         id: FunctionId,
         parameter_count: u32,
         body: &[NodeId],
         result: Option<NodeId>,
+        diverges: bool,
     ) -> Function<Structured> {
-        let mut body = body.to_vec();
-        let end_span = match (result, body.last()) {
-            (Some(node), _) | (None, Some(&node)) => self.function.arena.spans[node],
-            (None, None) => Span::UNKNOWN,
+        let mut body = match self.function.has_returns {
+            true => self.place_return_frees(body),
+            false => body.to_vec(),
         };
-        let result = self.free_on_exit(result, end_span, &mut body);
+        let result = match diverges {
+            true => None,
+            false => {
+                let end_span = match (result, body.last()) {
+                    (Some(node), _) | (None, Some(&node)) => self.function.arena.spans[node],
+                    (None, None) => Span::UNKNOWN,
+                };
+                self.free_on_exit(result, end_span, &mut body)
+            }
+        };
         let mut arena = std::mem::take(&mut self.function).arena;
         let body = arena.list(&body);
         let function = Function {

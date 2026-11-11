@@ -213,14 +213,9 @@ impl<'src> Parser<'src> {
     // a return type).
     fn parse_func_body(&mut self, has_return_type: bool) -> Result<Block, ParseErrorKind> {
         if self.peek().kind == TokenKind::Newline {
-            // Block form: a run of statements ending in a result expression.
-            let block = self.parse_block()?;
-            if block.result.is_none() {
-                return Err(ParseErrorKind::Unexpected(
-                    "Function body must end with an expression.".into(),
-                ));
-            }
-            Ok(block)
+            // Block form: a run of statements, perhaps ending in a result expression. Whether every
+            // path yields a value is sema's question.
+            self.parse_block()
         } else {
             // Single-line form: `is` then an expression — which must declare a return type.
             if !has_return_type {
@@ -352,6 +347,24 @@ impl<'src> Parser<'src> {
         Ok(Stmt::Loop { body, cond, until })
     }
 
+    // `return [<expr>]`: bare when the statement ends right after the keyword.
+    fn parse_return(&mut self) -> Result<Stmt, ParseErrorKind> {
+        let keyword = self.advance();
+        let value = match self.peek().kind {
+            TokenKind::Newline | TokenKind::Dedent | TokenKind::Eof => None,
+            _ => Some(self.parse_expr(0)?),
+        };
+        let end = match value {
+            Some(value) => self.ast.span_of(value).end,
+            None => keyword.span().end,
+        };
+        let span = Span {
+            start: keyword.span().start,
+            end,
+        };
+        Ok(Stmt::Return { value, span })
+    }
+
     // `for <binder>[, <binder>…] in <source> <block>`.
     // 1 binder → `Stmt::For`; 2–3 binders → `Stmt::ForArray`; 4+ → `ParseError`.
     fn parse_for(&mut self) -> Result<Stmt, ParseErrorKind> {
@@ -457,6 +470,7 @@ impl<'src> Parser<'src> {
             TokenKind::KwWhile => return self.parse_while(),
             TokenKind::KwLoop => return self.parse_loop(),
             TokenKind::KwFor => return self.parse_for(),
+            TokenKind::KwReturn => return self.parse_return(),
             _ => {}
         }
         // Otherwise parse as Python does: one or more comma-separated lists joined by `=`. A single

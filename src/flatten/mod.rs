@@ -3,9 +3,10 @@
 //! Flattening: a structured function rewritten as its control-flow graph — the flat level.
 //!
 //! Nested control flow (`If`, `While`, `DoWhile`, `CountedLoop`) becomes basic blocks joined by
-//! branches and gotos; every other statement moves into a block unchanged. The function keeps its
-//! arena, so every node keeps its id, type, and span, and the side tables indexed by them stay
-//! valid. Runtime checks stay inside their expressions: the backend splits blocks at them.
+//! branches and gotos, and a `Return` the terminator of its block; every other statement moves
+//! into a block unchanged. The function keeps its arena, so every node keeps its id, type, and
+//! span, and the side tables indexed by them stay valid. Runtime checks stay inside their
+//! expressions: the backend splits blocks at them.
 //!
 //! Blocks are numbered as they are met: an `If` creates its then, else, and join blocks, and a
 //! loop its header, body, and exit blocks, before what is inside them is flattened.
@@ -52,12 +53,17 @@ pub fn flatten(function: Function<Structured>, tables: &mut ProgramTables) -> Fu
         statements: Vec::new(),
         terminators: Vec::new(),
         current: BlockId::from_index(0),
+        reachable: true,
         counted_loop_ranges: SideTable::default(),
     };
     let entry = flattener.new_block();
     flattener.current = entry;
     flattener.statements_of(shape.body);
-    flattener.terminate(Terminator::Return(shape.result));
+    let end = match (shape.result, flattener.reachable) {
+        (None, false) => Terminator::Unreachable,
+        (result, _) => Terminator::Return(result),
+    };
+    flattener.terminate(end);
 
     let Flattener {
         mut arena,
@@ -104,6 +110,9 @@ struct Flattener<'tables> {
     statements: Vec<Vec<NodeId>>,
     terminators: Vec<Option<Terminator>>,
     current: BlockId,
+    /// Whether control can reach the current block, as far as the structure says — no condition
+    /// is evaluated. Code the compiler generates is not placed where it cannot run.
+    reachable: bool,
     counted_loop_ranges: SideTable<BlockId, Option<NodeId>>,
 }
 
@@ -130,7 +139,14 @@ impl Flattener<'_> {
     }
 
     fn statement(&mut self, statement: NodeId) {
+        let reachable = self.reachable;
         match self.arena.operations[statement] {
+            Operation::Return(value) => {
+                self.terminate(Terminator::Return(value));
+                // What follows lands in a block nothing enters.
+                self.current = self.new_block();
+                self.reachable = false;
+            }
             Operation::If {
                 cond,
                 then_body,
@@ -147,12 +163,16 @@ impl Flattener<'_> {
                 self.current = then_block;
                 self.statements_of(then_body);
                 self.terminate(Terminator::Goto(join));
+                let mut join_reachable = self.reachable;
+                self.reachable = reachable;
                 if let Some(else_block) = else_block {
                     self.current = else_block;
                     self.statements_of(else_body);
                     self.terminate(Terminator::Goto(join));
                 }
+                join_reachable |= self.reachable;
                 self.current = join;
+                self.reachable = join_reachable;
             }
             Operation::While { header, cond, body } => {
                 let (header_block, body_block, exit) =
@@ -169,6 +189,7 @@ impl Flattener<'_> {
                 self.statements_of(body);
                 self.terminate(Terminator::Goto(header_block));
                 self.current = exit;
+                self.reachable = reachable;
             }
             Operation::DoWhile { body, cond, until } => {
                 let (body_block, exit) = (self.new_block(), self.new_block());
@@ -184,6 +205,7 @@ impl Flattener<'_> {
                     then_block,
                     else_block,
                 });
+                // The exit is reached only from the end of the body, so it inherits its flag.
                 self.current = exit;
             }
             Operation::CountedLoop { index, range, body } => {
@@ -224,22 +246,27 @@ impl Flattener<'_> {
             then_block: body_block,
             else_block: exit,
         });
+        let reachable = self.reachable;
         self.current = body_block;
         self.statements_of(body);
-        let current = self.read_local(index, span);
-        let step = self.field(saved_range, RangeFieldKind::Step, span);
-        let next = self.push(
-            Operation::Binary {
-                op: BinOp::Add,
-                lhs: current,
-                rhs: step,
-            },
-            PinpType::Int,
-            span,
-        );
-        self.append_write(index, next, span);
+        // A body that always returns never gets to its step.
+        if self.reachable {
+            let current = self.read_local(index, span);
+            let step = self.field(saved_range, RangeFieldKind::Step, span);
+            let next = self.push(
+                Operation::Binary {
+                    op: BinOp::Add,
+                    lhs: current,
+                    rhs: step,
+                },
+                PinpType::Int,
+                span,
+            );
+            self.append_write(index, next, span);
+        }
         self.terminate(Terminator::Goto(header));
         self.current = exit;
+        self.reachable = reachable;
     }
 
     /// What the range's own node says: a range written in place has a known kind, and a known

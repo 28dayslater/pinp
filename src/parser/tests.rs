@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: MIT
 
 use super::*;
+use crate::diagnostic::DiagnosticCode;
 use crate::lexer::Span;
 use indoc::indoc;
 
@@ -2103,4 +2104,309 @@ fn a_wrapped_ternary_still_continues_onto_its_else_line() {
              else 42
     "});
     assert_eq!(ast.top_level.len(), 1);
+}
+
+// --- return (0018) -----------------------------------------------------------------------
+
+/// The statements of the first function's body, then its trailing result.
+fn body_of<'ast>(ast: &'ast ProgramAst, index: usize) -> &'ast Block {
+    &func(ast, index).body
+}
+
+/// Every `return` in `stmts`, at any depth, as `(value, span)`.
+fn returns_in(stmts: &[Stmt]) -> Vec<(Option<ExprId>, Span)> {
+    let mut found = Vec::new();
+    for stmt in stmts {
+        match stmt {
+            Stmt::Return { value, span } => found.push((*value, *span)),
+            Stmt::While { body, .. }
+            | Stmt::Loop { body, .. }
+            | Stmt::For { body, .. }
+            | Stmt::ForArray { body, .. } => found.extend(returns_in(&body.stmts)),
+            _ => {}
+        }
+    }
+    found
+}
+
+#[test]
+fn return_with_a_value_records_it_and_spans_the_whole_statement() {
+    let src = indoc! {"
+        f(n: int): int is
+            return n + 1
+    "};
+    let ast = parse_ok(src);
+    let body = body_of(&ast, 0);
+    let [Stmt::Return { value, span }] = body.stmts.as_slice() else {
+        panic!("Expected one return statement, got {:?}.", body.stmts);
+    };
+    assert!(matches!(
+        ast.node(value.unwrap()),
+        Node::Bin { op: BinOp::Add, .. }
+    ));
+    assert_eq!(span.text(src), "return n + 1");
+    assert!(
+        body.result.is_none(),
+        "a return is a statement, not the result"
+    );
+}
+
+#[test]
+fn a_bare_return_ends_at_the_line_end_a_dedent_or_the_end_of_input() {
+    let at_line_end = indoc! {"
+        f() is
+            return
+    "};
+    let at_end_of_input = at_line_end.trim_end();
+    let before_a_comment = indoc! {"
+        f() is
+            return # done
+    "};
+    for src in [at_line_end, at_end_of_input, before_a_comment] {
+        let ast = parse_ok(src);
+        let [(value, span)] = returns_in(&body_of(&ast, 0).stmts)[..] else {
+            panic!("Expected one return in {src:?}.");
+        };
+        assert_eq!(value, None, "a bare return in {src:?}");
+        assert_eq!(span.text(src), "return", "in {src:?}");
+    }
+}
+
+#[test]
+fn a_bare_return_ends_at_a_dedent() {
+    let ast = parse_ok(indoc! {"
+        f() is
+            if true
+                return
+            ::g = 1
+    "});
+    let Stmt::Expr(if_id) = body_of(&ast, 0).stmts[0] else {
+        panic!("Expected an if statement.");
+    };
+    let Node::If { arms, .. } = ast.node(if_id) else {
+        panic!("Expected an if.");
+    };
+    assert!(matches!(
+        arms[0].body.stmts[..],
+        [Stmt::Return { value: None, .. }]
+    ));
+    assert_eq!(
+        body_of(&ast, 0).stmts.len(),
+        2,
+        "the assignment follows the if"
+    );
+}
+
+#[test]
+fn a_return_value_may_be_a_ternary() {
+    let ast = parse_ok(indoc! {"
+        f(c: bool): int is
+            return 1 if c else 2
+    "});
+    let [
+        Stmt::Return {
+            value: Some(value), ..
+        },
+    ] = body_of(&ast, 0).stmts.as_slice()
+    else {
+        panic!("Expected a return with a value.");
+    };
+    assert!(matches!(ast.node(*value), Node::If { .. }));
+}
+
+#[test]
+fn return_parses_inside_every_kind_of_body() {
+    for src in [
+        indoc! {"
+            f(n: int): int is
+                if n > 0
+                    return 1
+                elif n < 0
+                    return 2
+                else
+                    return 3
+        "},
+        indoc! {"
+            f(n: int): int is
+                while n > 0
+                    return 1
+                0
+        "},
+        indoc! {"
+            f(n: int): int is
+                loop
+                    return 1
+                while n > 0
+                0
+        "},
+        indoc! {"
+            f(n: int): int is
+                loop
+                    return 1
+                until n > 0
+                0
+        "},
+        indoc! {"
+            f(n: int): int is
+                for i in 1..n
+                    return i
+                0
+        "},
+        indoc! {"
+            f(n: int): int is
+                for i, v in [1, 2]
+                    return v
+                0
+        "},
+        indoc! {"
+            f(n: int): int is
+                if n > 0
+                    while n > 0
+                        for i in 1..n
+                            return i
+                0
+        "},
+    ] {
+        assert!(parse(src).is_ok(), "in:\n{src}");
+    }
+}
+
+#[test]
+fn return_is_found_inside_loop_bodies() {
+    let ast = parse_ok(indoc! {"
+        f(n: int): int is
+            while n > 0
+                for i in 1..n
+                    return i
+            0
+    "});
+    assert_eq!(returns_in(&body_of(&ast, 0).stmts).len(), 1);
+}
+
+#[test]
+fn a_function_body_may_end_in_a_return_a_loop_or_an_assignment() {
+    // Whether every path yields a value is sema's question now; the parser only records shape.
+    for src in [
+        indoc! {"
+            f(n: int): int is
+                return n
+        "},
+        indoc! {"
+            f(n: int): int is
+                while n > 0
+                    return n
+        "},
+        indoc! {"
+            f(n: int): int is
+                m = n
+        "},
+        indoc! {"
+            f(n: int) is
+                ::g = n
+        "},
+    ] {
+        let ast = parse_ok(src);
+        assert!(body_of(&ast, 0).result.is_none(), "in {src:?}");
+    }
+}
+
+#[test]
+fn statements_after_a_return_still_parse() {
+    let ast = parse_ok(indoc! {"
+        f(n: int): int is
+            return n
+            m = n + 1
+            m
+    "});
+    let body = body_of(&ast, 0);
+    assert!(matches!(body.stmts[0], Stmt::Return { .. }));
+    assert_eq!(body.stmts.len(), 2);
+    assert!(body.result.is_some());
+}
+
+#[test]
+fn return_at_the_top_level_parses_and_is_left_to_sema() {
+    let ast = parse_ok("return 1");
+    assert!(matches!(
+        ast.top_level[0],
+        TopLevel::Stmt(Stmt::Return { value: Some(_), .. })
+    ));
+}
+
+#[test]
+fn return_cannot_be_used_as_a_value() {
+    for src in [
+        "f(): int is return 1",
+        indoc! {"
+            f(): int is
+                x = return 1
+                x
+        "},
+        indoc! {"
+            f(): int is
+                1 + return 2
+        "},
+        indoc! {"
+            f(): int is
+                return return 1
+        "},
+        indoc! {"
+            f(c: bool): int is
+                1 if c else return 2
+        "},
+        indoc! {"
+            f(c: bool): int is
+                return 1 if c else return 2
+        "},
+        indoc! {"
+            g(n: int): int is n
+            f(): int is
+                g(return 1)
+        "},
+        indoc! {"
+            f(): int is
+                (return 1)
+        "},
+        indoc! {"
+            f(): int is
+                [return 1]
+        "},
+        indoc! {"
+            f() is
+                x = -return
+        "},
+    ] {
+        let kind = parse_error(src);
+        assert_eq!(
+            kind,
+            ParseErrorKind::Coded(
+                DiagnosticCode::ReturnAsValue,
+                "Return cannot be used as a value.".into()
+            ),
+            "in {src:?}"
+        );
+        assert_eq!(kind.code(), Some(DiagnosticCode::ReturnAsValue));
+    }
+}
+
+#[test]
+fn return_takes_one_value() {
+    assert!(matches!(
+        parse_error(indoc! {"
+            f(): int is
+                return 1, 2
+        "}),
+        ParseErrorKind::Unexpected(_)
+    ));
+}
+
+#[test]
+fn return_is_not_an_assignment_target() {
+    assert!(
+        parse(indoc! {"
+            f() is
+                return = 1
+        "})
+        .is_err()
+    );
 }

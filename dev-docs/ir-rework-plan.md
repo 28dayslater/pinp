@@ -154,12 +154,13 @@ ones marked **skeleton** change the IR's structure, so they are decided before t
 
 | Feature | Decision | IR impact |
 |---|---|---|
-| `return` / `break` / `continue` | planned | structured statements that leave an enclosing body; `flatten` makes them edges |
+| `return` | **done** ([0018](../specs/0018-return.md)) | a structured `Return` statement; `flatten` ends its block with the `Return` terminator |
+| `break` / `continue` | planned | structured statements that leave an enclosing body; `flatten` makes them edges |
 | recursion | planned | none in the IR; interprocedural summaries over strongly connected components |
 | closures | planned; **captures are immutable** | `MakeClosure { function, captures }`, an indirect call, function types |
 | algebraic data types + `match` | planned | see below — additive, but the largest item |
-| error handling | **no exceptions**; `Result` and `Option` (spelled `T?`, implicit wrap, `x or default`, `x or return …` / `x or fail "…"`, narrowing after `x != none` — done in sema); runtime errors stay aborts (as Rust's panics) | none beyond ADTs and early `return`; all the sugar desugars to an `If` on the tag |
-| generics | **open** — `Option`/`Result` need at least built-in generic ADTs | **skeleton**: monomorphisation (one `FunctionId` per instantiation) vs shared code |
+| error handling | **no exceptions**; Rust-style `Result` (`Ok`/`Error`), no `Option`/`None`; syntax deliberately less verbose than Rust's, designed in its own iteration; runtime errors stay aborts (as Rust's panics) | none beyond ADTs and early `return`; any sugar desugars to an `If` on the tag |
+| generics | **open** — `Result` needs at least a built-in generic ADT | **skeleton**: monomorphisation (one `FunctionId` per instantiation) vs shared code |
 | generators / coroutines | **planned** | **skeleton**: a function becomes a state machine |
 
 **ADTs in the IR.** Sum types are tagged unions: operations to construct a variant, read its tag,
@@ -393,9 +394,10 @@ Deferred to the future language iterations that introduce them — not decided h
 must stay able to accommodate any of the listed answers:
 
 7. **Generics** — monomorphised (one `FunctionId` per instantiation) or shared code?
-   `Option`/`Result` need at least built-in generic ADTs.
-9. **Result error propagation** — bare `x or return` propagating the same error, plus an `err`
-   keyword naming it on the right of `or`?
+   `Result` needs at least a built-in generic ADT.
+9. **Result error propagation** — ~~bare `x or return` propagating the same error, plus an `err`
+   keyword naming it on the right of `or`?~~ Dropped with all the `or` sugar
+   ([0018](../specs/0018-return.md)). How an error is passed up belongs to the `Result` iteration.
 10. **Shared mutable state for closures** — nothing (one-element array), a `cell` type, or a
     declaration-site marker on the variable?
 11. **Array parameters** — mutable by reference, copied, or read-only unless declared mutable?

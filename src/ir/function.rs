@@ -73,6 +73,9 @@ pub enum Terminator {
     Return(Option<NodeId>),
     /// Stops the program with this message.
     RuntimeError(ConstantId),
+    /// Ends a block control never reaches: the end of a function every path of which returns
+    /// earlier.
+    Unreachable,
 }
 
 const _: () = assert!(size_of::<Terminator>() == 16);
@@ -84,7 +87,7 @@ impl Terminator {
             Terminator::Branch { cond, .. } => Some(cond),
             Terminator::Switch { tag, .. } => Some(tag),
             Terminator::Return(value) => value,
-            Terminator::Goto(_) | Terminator::RuntimeError(_) => None,
+            Terminator::Goto(_) | Terminator::RuntimeError(_) | Terminator::Unreachable => None,
         }
     }
 }
@@ -128,7 +131,7 @@ impl Flat {
                     .for_each(|&target| visit(target));
                 visit(default);
             }
-            Terminator::Return(_) | Terminator::RuntimeError(_) => {}
+            Terminator::Return(_) | Terminator::RuntimeError(_) | Terminator::Unreachable => {}
         }
     }
 }

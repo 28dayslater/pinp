@@ -2674,3 +2674,275 @@ fn a_loop_body_ending_in_an_if_keeps_the_if() {
         );
     }
 }
+
+// ---------------------------------------------------------------------------
+// Return (0018)
+// ---------------------------------------------------------------------------
+
+/// The printed function `index` of `src`.
+fn function_text(src: &str, index: usize) -> String {
+    let printed = desugared(src);
+    printed
+        .split("function f")
+        .nth(index + 1)
+        .map(|text| format!("function f{}\n", text.trim_end()))
+        .expect("the function exists")
+}
+
+/// How many `str_free` statements end the run of lines just above line `index`.
+fn frees_just_before(lines: &[&str], index: usize) -> usize {
+    let mut count = 0;
+    let mut line = index;
+    while line >= 3
+        && lines[line - 1].trim_start().starts_with("read_")
+        && lines[line - 2].trim() == "runtime_call str_free"
+        && lines[line - 3].trim() == "evaluate"
+    {
+        count += 1;
+        line -= 3;
+    }
+    count
+}
+
+#[test]
+fn a_return_becomes_a_structured_return_statement() {
+    let src = indoc! {"
+        f(n: int): int is
+            if n > 0
+                return n
+            0
+        f(1)
+    "};
+    assert_eq!(
+        function_text(src, 0),
+        indoc! {"
+            function f0 f (1 parameter), structured
+            locals
+              l0 n: int
+            body
+              if
+                greater: bool
+                  read_local l0 n: int
+                  constant 0: int
+                then
+                  return
+                    read_local l0 n: int
+            result
+              constant 0: int
+        "}
+    );
+}
+
+#[test]
+fn a_bare_return_has_no_value() {
+    let src = indoc! {"
+        g = 0
+        f(n: int) is
+            if n > 0
+                return
+            ::g = n
+        f(1)
+    "};
+    assert_eq!(
+        function_text(src, 0),
+        indoc! {"
+            function f0 f (1 parameter), structured
+            locals
+              l0 n: int
+            body
+              if
+                greater: bool
+                  read_local l0 n: int
+                  constant 0: int
+                then
+                  return
+              write_global g0 g
+                read_local l0 n: int
+        "}
+    );
+}
+
+#[test]
+fn a_returned_int_is_converted_to_a_float_result() {
+    let src = indoc! {"
+        f(n: int): float is
+            return n
+        f(1)
+    "};
+    assert_eq!(
+        function_text(src, 0),
+        indoc! {"
+            function f0 f (1 parameter), structured
+            locals
+              l0 n: int
+            body
+              return
+                convert: float
+                  read_local l0 n: int
+        "}
+    );
+}
+
+#[test]
+fn a_body_that_always_returns_has_no_result_and_no_exit_code() {
+    let text = function_text(
+        indoc! {"
+            abs(n: int): int is
+                if n < 0
+                    return -n
+                else
+                    return n
+            abs(1)
+        "},
+        0,
+    );
+    assert!(!text.contains("result"), "{text}");
+    let strings = function_text(
+        indoc! {"
+            f(n: int): str is
+                s = str(n)
+                t = s + 'x'
+                if t.len > 3
+                    return t
+                else
+                    return s
+            f(12)
+        "},
+        0,
+    );
+    assert!(!strings.contains("result"), "{strings}");
+    let last = strings
+        .lines()
+        .rfind(|line| line.starts_with("  ") && !line.starts_with("   "));
+    assert_eq!(
+        last,
+        Some("  if"),
+        "no frees after the diverging if:\n{strings}"
+    );
+}
+
+#[test]
+fn a_return_frees_every_string_slot_first_as_the_end_of_the_function_does() {
+    let text = function_text(
+        indoc! {"
+            f(n: int): str is
+                s = str(n)
+                t = s + 'x'
+                if t.len > 3
+                    return t
+                u = t + 'y'
+                u
+            f(12)
+        "},
+        0,
+    );
+    let lines: Vec<&str> = text.lines().collect();
+    let at_return = lines
+        .iter()
+        .position(|line| line.trim() == "return")
+        .expect("a return");
+    let at_result = lines
+        .iter()
+        .position(|line| *line == "result")
+        .expect("a result");
+    let freed_at_return = frees_just_before(&lines, at_return);
+    assert!(freed_at_return >= 3, "s, t and u are freed:\n{text}");
+    assert_eq!(
+        freed_at_return,
+        frees_just_before(&lines, at_result),
+        "{text}"
+    );
+    // The value outlives the frees: it is moved out of a temporary, not read from a freed slot.
+    let returned = lines[at_return + 1].trim();
+    assert!(
+        returned.starts_with("read_local l")
+            && returned.ends_with(": str")
+            && !returned.contains(" t:"),
+        "returned through a temporary: {returned}\n{text}"
+    );
+}
+
+#[test]
+fn a_returned_literal_needs_no_copy() {
+    let text = function_text(
+        indoc! {"
+            f(n: int): str is
+                if n > 0
+                    return 'yes'
+                'no'
+            f(1)
+        "},
+        0,
+    );
+    assert_eq!(text.matches("str_copy").count(), 0, "{text}");
+}
+
+#[test]
+fn a_returned_variable_is_copied_or_moved_before_the_frees() {
+    let text = function_text(
+        indoc! {"
+            f(n: int): str is
+                s = str(n)
+                return s
+            f(1)
+        "},
+        0,
+    );
+    let copy = text.find("str_copy").expect("a borrowed string is copied");
+    let free = text
+        .rfind("str_free")
+        .expect("the slot is freed on the way out");
+    assert!(copy < free, "{text}");
+}
+
+#[test]
+fn every_return_shape_leaves_the_program_verifiable() {
+    for src in [
+        indoc! {"
+            f(n: int): int is
+                while n > 0
+                    return n
+                0
+            f(1)
+        "},
+        indoc! {"
+            f(n: int): int is
+                loop
+                    return n
+                until n > 0
+                0
+            f(1)
+        "},
+        indoc! {"
+            f(n: int): int is
+                for i in 1..n
+                    return i
+                0
+            f(1)
+        "},
+        indoc! {"
+            f(n: int): int is
+                for i, v in [1, 2]
+                    return v
+                0
+            f(1)
+        "},
+        indoc! {"
+            f(n: int): int is
+                return n
+                n + 1
+            f(1)
+        "},
+        indoc! {"
+            f(n: int): str is
+                s = str(n)
+                for i in 1..3
+                    t = s + 'x'
+                    return t
+                s
+            f(1)
+        "},
+    ] {
+        desugared(src);
+    }
+}

@@ -3090,3 +3090,98 @@ fn every_runtime_function_has_a_printed_name() {
         ]
     );
 }
+
+// ---------------------------------------------------------------------------
+// Return and unreachable (0018)
+// ---------------------------------------------------------------------------
+
+#[test]
+fn a_structured_return_is_a_statement_with_an_optional_value() {
+    let mut builder = Builder::new();
+    let [value] = builder.leaves();
+    let with_value = builder.statement(Operation::Return(Some(value)));
+    let bare = builder.statement(Operation::Return(None));
+    assert!(Operation::Return(None).is_statement());
+    assert_eq!(
+        verify(&builder.structured(&[with_value, bare], None)),
+        Ok(())
+    );
+}
+
+#[test]
+fn a_return_as_a_value_is_rejected() {
+    let mut builder = Builder::new();
+    let [value] = builder.leaves();
+    let ret = builder.statement(Operation::Return(Some(value)));
+    assert_eq!(
+        verify(&builder.structured(&[], Some(ret))),
+        Err(VerifyError::WrongPosition(ret))
+    );
+}
+
+#[test]
+fn a_statement_as_a_return_value_is_rejected() {
+    let mut builder = Builder::new();
+    let local_id = builder.local(PinpType::Int);
+    let [value] = builder.leaves();
+    let write = builder.write(local_id, value);
+    let ret = builder.statement(Operation::Return(Some(write)));
+    assert_eq!(
+        verify(&builder.structured(&[ret], None)),
+        Err(VerifyError::WrongPosition(write))
+    );
+}
+
+#[test]
+fn a_return_statement_in_a_flat_block_is_rejected() {
+    // The flat level returns through the terminator only.
+    let mut builder = Builder::new();
+    let ret = builder.statement(Operation::Return(None));
+    let function = builder.flat(vec![(vec![ret], Terminator::Return(None))]);
+    assert_eq!(
+        verify(&function),
+        Err(VerifyError::WrongLevel(ret, Level::Flat))
+    );
+}
+
+#[test]
+fn a_returns_value_is_one_of_its_children() {
+    let mut builder = Builder::new();
+    let [value] = builder.leaves();
+    let ret = builder.statement(Operation::Return(Some(value)));
+    let mut children = Vec::new();
+    builder
+        .arena
+        .for_each_child_at(ret, |child, position| children.push((child, position)));
+    assert_eq!(children, [(value, Position::Value)]);
+    let bare = builder.statement(Operation::Return(None));
+    builder
+        .arena
+        .for_each_child(bare, |_| panic!("A bare return has no children."));
+}
+
+#[test]
+fn an_unreachable_terminator_has_no_successors_and_no_operand() {
+    let function = Builder::new().flat(vec![(vec![], Terminator::Unreachable)]);
+    assert_eq!(verify(&function), Ok(()));
+    assert!(function.successors(block(0)).is_empty());
+    assert_eq!(Terminator::Unreachable.operand(), None);
+}
+
+#[test]
+fn return_and_unreachable_print_by_name() {
+    let mut builder = Builder::new();
+    let [value] = builder.leaves();
+    let ret = builder.statement(Operation::Return(Some(value)));
+    assert_eq!(first_line(&print_tree(&builder, &[], ret)), "return");
+    let (tables, function) =
+        Builder::new().flat_with_tables(vec![(vec![], Terminator::Unreachable)]);
+    assert_eq!(
+        Printer::new(&tables, &[], &[]).function(&function),
+        indoc! {"
+            function f0 (0 parameters), flat
+            block0 (entry)
+              unreachable
+        "}
+    );
+}
