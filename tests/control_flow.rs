@@ -142,3 +142,81 @@ fn if_value_bound_then_used() {
     "};
     assert_eq!(eval_int(src), 101);
 }
+
+#[test]
+fn a_loop_body_ending_in_an_if_runs_the_if() {
+    assert_eq!(
+        eval_int(indoc! {"
+            g = 0
+            n = 0
+            while n < 3
+                n += 1
+                if n == 2
+                    ::g = 5
+            g
+        "}),
+        5
+    );
+    assert_eq!(
+        eval_int(indoc! {"
+            g = 0
+            n = 0
+            loop
+                n += 1
+                if n == 2
+                    ::g = 5
+            until n > 3
+            g
+        "}),
+        5
+    );
+    assert_eq!(
+        eval_int(indoc! {"
+            g = 0
+            n = 0
+            while n < 4
+                n += 1
+                if n == 2
+                    ::g += 10
+                else
+                    ::g += 1
+            g
+        "}),
+        13
+    );
+}
+
+#[test]
+fn consecutive_ifs_each_run() {
+    assert_eq!(
+        eval_int(indoc! {"
+            a = 5
+            b = 0
+            if a > 0
+                b += 1
+            if a > 1
+                b += 10
+            if a > 9
+                b += 100
+            b
+        "}),
+        11
+    );
+}
+
+#[test]
+fn consecutive_ifs_in_a_function_each_run() {
+    assert_eq!(
+        eval_int(indoc! {"
+            classify(n: int): int is
+                m = 0
+                if n < 0
+                    m = 1
+                if n == 0
+                    m = 2
+                m
+            classify(-3) * 10 + classify(0)
+        "}),
+        12
+    );
+}
