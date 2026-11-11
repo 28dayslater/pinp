@@ -2643,3 +2643,34 @@ fn every_string_operation_leaves_the_program_verifiable() {
         desugared(src);
     }
 }
+
+#[test]
+fn a_loop_body_ending_in_an_if_keeps_the_if() {
+    for src in [
+        indoc! {"
+            g = 0
+            n = 0
+            while n < 3
+                n += 1
+                if n == 2
+                    ::g = 5
+            g
+        "},
+        indoc! {"
+            g = 0
+            n = 0
+            loop
+                n += 1
+                if n == 2
+                    ::g = 5
+            until n > 3
+            g
+        "},
+    ] {
+        let printed = desugared(src);
+        assert!(
+            printed.contains("constant 5: int"),
+            "the trailing if is desugared:\n{printed}"
+        );
+    }
+}

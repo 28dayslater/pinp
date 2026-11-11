@@ -32,7 +32,7 @@ impl Desugarer<'_> {
                 let cond_node = self.expr(*cond, &mut header);
                 let body = self.scoped(|desugarer| {
                     let mut statements = Vec::new();
-                    desugarer.statements(&body.stmts, &mut statements);
+                    desugarer.body_into(body, Sink::Effect, &mut statements);
                     statements
                 });
                 let operation = Operation::While {
@@ -45,7 +45,7 @@ impl Desugarer<'_> {
             Stmt::Loop { body, cond, until } => {
                 let mut statements = self.scoped(|desugarer| {
                     let mut statements = Vec::new();
-                    desugarer.statements(&body.stmts, &mut statements);
+                    desugarer.body_into(body, Sink::Effect, &mut statements);
                     statements
                 });
                 // The condition is tested after each pass, so what computing it needs runs at the

@@ -1995,3 +1995,112 @@ fn a_comprehension_records_its_variable_span_without_the_annotation() {
         assert_eq!(var_span.text(src), expected, "in {src}");
     }
 }
+
+// --- a block construct ends its statement ------------------------------------------------
+
+#[test]
+fn consecutive_block_ifs_are_separate_statements() {
+    for (src, statements) in [
+        (
+            indoc! {"
+                if a > 0
+                    b = 1
+                if a > 1
+                    b = 2
+            "},
+            2,
+        ),
+        (
+            indoc! {"
+                if a > 0
+                    b = 1
+                elif a < 0
+                    b = 3
+                if a > 1
+                    b = 2
+                else
+                    b = 4
+            "},
+            2,
+        ),
+        (
+            indoc! {"
+                if a > 0
+                    b = 1
+                if a > 1
+                    b = 2
+                if a > 2
+                    b = 3
+            "},
+            3,
+        ),
+    ] {
+        let ast = parse_ok(src);
+        assert_eq!(ast.top_level.len(), statements, "in:\n{src}");
+        for item in &ast.top_level {
+            let TopLevel::Stmt(Stmt::Expr(if_id)) = item else {
+                panic!("Expected an if statement, got {item:?}.");
+            };
+            let Node::If { arms, .. } = ast.node(*if_id) else {
+                panic!("Expected an if.");
+            };
+            assert_eq!(
+                arms[0].body.stmts.len(),
+                1,
+                "a block if, not a ternary, in:\n{src}"
+            );
+        }
+    }
+}
+
+#[test]
+fn consecutive_block_ifs_in_a_function_body_are_separate_statements() {
+    let ast = parse_ok(indoc! {"
+        f(n: int): int is
+            m = 0
+            if n < 0
+                m = 1
+            if n == 0
+                m = 2
+            m
+    "});
+    let body = &func(&ast, 0).body;
+    assert_eq!(body.stmts.len(), 3);
+    assert!(body.result.is_some());
+}
+
+#[test]
+fn a_line_after_a_block_if_starts_a_new_statement() {
+    // Neither a leading `-` nor a leading `[` continues the `if` above as an operator.
+    for src in [
+        indoc! {"
+            if a > 0
+                b = 1
+            -1
+        "},
+        indoc! {"
+            if a > 0
+                b = 1
+            [1, 2]
+        "},
+        indoc! {"
+            if a > 0
+                b = 1
+            else
+                b = 2
+            -1
+        "},
+    ] {
+        let ast = parse_ok(src);
+        assert_eq!(ast.top_level.len(), 2, "in:\n{src}");
+    }
+}
+
+#[test]
+fn a_wrapped_ternary_still_continues_onto_its_else_line() {
+    let ast = parse_ok(indoc! {"
+        fu = 42 + 142 if a > 42
+             else 42
+    "});
+    assert_eq!(ast.top_level.len(), 1);
+}

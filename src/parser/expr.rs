@@ -300,6 +300,14 @@ impl<'src> Parser<'src> {
         let start_col = self.peek().col;
         let mut lhs = self.parse_prefix()?;
         loop {
+            // A block construct (a multi-line `if`) ends at its own newline or dedent; whatever
+            // follows begins the next statement, so it continues nothing — not even an `if`.
+            if matches!(
+                self.tokens[self.pos - 1].kind,
+                TokenKind::Newline | TokenKind::Indent | TokenKind::Dedent
+            ) {
+                break;
+            }
             // The one-line conditional `lhs if c else e` is the loosest operator and chains right;
             // like the comparison band it sits outside the `infix` table.
             if self.peek().kind == TokenKind::KwIf && CONDITIONAL_BP >= min_bp {
