@@ -22,6 +22,8 @@ pub enum VerifyError {
     DanglingLocal(NodeId),
     Untyped(NodeId),
     Unspanned(NodeId),
+    /// A `Break`/`Continue` whose depth reaches past every loop around it.
+    NoEnclosingLoop(NodeId),
 }
 
 /// Checks that `function` is well formed: every block it refers to exists; every node is reached
@@ -32,11 +34,12 @@ pub fn verify<S: Shape>(function: &Function<S>) -> Result<(), VerifyError> {
     function.shape.verify_blocks(arena)?;
     let mut seen: SideTable<NodeId, bool> = SideTable::default();
     let mut pending = Vec::new();
+    // Each pending node carries how many loops it sits in, for `Break` and `Continue` to check.
     function
         .shape
-        .for_each_root(arena, |root, position| pending.push((root, position)));
+        .for_each_root(arena, |root, position| pending.push((root, position, 0)));
     pending.reverse();
-    while let Some((node_id, position)) = pending.pop() {
+    while let Some((node_id, position, loops)) = pending.pop() {
         let Some(&operation) = arena.operations.get(node_id) else {
             return Err(VerifyError::DanglingNode(node_id));
         };
@@ -67,9 +70,29 @@ pub fn verify<S: Shape>(function: &Function<S>) -> Result<(), VerifyError> {
         if local_id.is_some_and(|local_id| arena.locals.get(local_id).is_none()) {
             return Err(VerifyError::DanglingLocal(node_id));
         }
+        if let Operation::Break(depth) | Operation::Continue(depth) = operation
+            && depth >= loops
+        {
+            return Err(VerifyError::NoEnclosingLoop(node_id));
+        }
         let first_child = pending.len();
-        arena.for_each_child_at(node_id, |child, position| pending.push((child, position)));
-        pending[first_child..].reverse();
+        arena.for_each_child_at(node_id, |child, position| {
+            pending.push((child, position, loops))
+        });
+        // Only a loop's body is inside it — not a `While`'s header and condition, nor a range.
+        let children = &mut pending[first_child..];
+        let inside = match operation {
+            Operation::While { body, .. } | Operation::CountedLoop { body, .. } => {
+                let count = arena.items(body).len();
+                children.len() - count..children.len()
+            }
+            Operation::DoWhile { body, .. } => 0..arena.items(body).len(),
+            _ => 0..0,
+        };
+        for child in &mut children[inside] {
+            child.2 += 1;
+        }
+        children.reverse();
     }
     Ok(())
 }

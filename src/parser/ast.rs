@@ -300,6 +300,7 @@ pub enum Stmt {
     While {
         cond: ExprId,
         body: Block,
+        label: Option<Label>,
     },
     /// Post-test (do–while) loop: run `body`, then repeat while `cond` holds (`until` ⇒ repeat
     /// while `cond` is *false*).
@@ -307,6 +308,7 @@ pub enum Stmt {
         body: Block,
         cond: ExprId,
         until: bool,
+        label: Option<Label>,
     },
     /// `for var in source <body>` — single-binder iteration. Source may be a range (`Int`
     /// loop variable), a 1D array (value only), or a 2D matrix (value only, row-major).
@@ -316,6 +318,7 @@ pub enum Stmt {
         var_span: Span,
         source: ExprId,
         body: Block,
+        label: Option<Label>,
     },
     /// `for binders… in source <body>` — multi-binder array/matrix iteration.
     /// 2 binders + 1D array → (index, value); 3 binders + 2D matrix → (row, col, value).
@@ -325,6 +328,7 @@ pub enum Stmt {
         binder_spans: Vec<Span>,
         source: ExprId,
         body: Block,
+        label: Option<Label>,
     },
     /// `arr[index] = value` or `arr[index] <op>= rhs` — write one element of a 1D array.
     /// For compound assignment `<op>=`, `compound_op` is `Some(op)` and `value` is the RHS;
@@ -345,6 +349,18 @@ pub enum Stmt {
         /// Covers `return` and its value: a statement has no node of its own to hang one on.
         span: Span,
     },
+    /// `break [@label]` — leaves the innermost loop, or the one labelled.
+    Break {
+        label: Option<Label>,
+        /// Covers `break` and its label.
+        span: Span,
+    },
+    /// `continue [@label]` — ends the current pass of the innermost loop, or the one labelled.
+    Continue {
+        label: Option<Label>,
+        /// Covers `continue` and its label.
+        span: Span,
+    },
     /// `mat[row, col] = value` or `mat[row, col] <op>= rhs` — write one element of a 2D matrix.
     IndexedAssign2D {
         target: Place,
@@ -355,6 +371,13 @@ pub enum Stmt {
         value: ExprId,
         compound_op: Option<BinOp>,
     },
+}
+
+/// A loop label, `@name`: the name interned without the `@`, the span covering it.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct Label {
+    pub name: SymId,
+    pub span: Span,
 }
 
 /// A function parameter: its interned name and resolved type.

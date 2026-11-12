@@ -3,13 +3,16 @@
 //! Flattening: a structured function rewritten as its control-flow graph — the flat level.
 //!
 //! Nested control flow (`If`, `While`, `DoWhile`, `CountedLoop`) becomes basic blocks joined by
-//! branches and gotos, and a `Return` the terminator of its block; every other statement moves
+//! branches and gotos, a `Return` the terminator of its block, and a `Break` or `Continue` a goto to
+//! its loop's exit or next pass; every other statement moves
 //! into a block unchanged. The function keeps its arena, so every node keeps its id, type, and
 //! span, and the side tables indexed by them stay valid. Runtime checks stay inside their
 //! expressions: the backend splits blocks at them.
 //!
 //! Blocks are numbered as they are met: an `If` creates its then, else, and join blocks, and a
-//! loop its header, body, and exit blocks, before what is inside them is flattened.
+//! loop its header, body, and exit blocks, before what is inside them is flattened. A `DoWhile`'s
+//! condition and a `CountedLoop`'s step get a block of their own only when a `Continue` jumps to
+//! them, created at the first one.
 
 use crate::ir::{
     Arena, BasicBlock, BlockId, Constant, Flat, Function, IdVec, List, Local, LocalId, NodeId,
@@ -55,6 +58,7 @@ pub fn flatten(function: Function<Structured>, tables: &mut ProgramTables) -> Fu
         current: BlockId::from_index(0),
         reachable: true,
         counted_loop_ranges: SideTable::default(),
+        loops: Vec::new(),
     };
     let entry = flattener.new_block();
     flattener.current = entry;
@@ -114,6 +118,28 @@ struct Flattener<'tables> {
     /// is evaluated. Code the compiler generates is not placed where it cannot run.
     reachable: bool,
     counted_loop_ranges: SideTable<BlockId, Option<NodeId>>,
+    /// The loops around the current block, innermost last: where `Break` and `Continue` jump.
+    loops: Vec<LoopTarget>,
+}
+
+/// Where a loop is left and resumed, and whether a reachable `Break`/`Continue` went there.
+struct LoopTarget {
+    exit: BlockId,
+    /// A `While`'s header; for the other loops, made by the first `Continue`.
+    next: Option<BlockId>,
+    broken: bool,
+    continued: bool,
+}
+
+impl LoopTarget {
+    fn new(exit: BlockId, next: Option<BlockId>) -> LoopTarget {
+        LoopTarget {
+            exit,
+            next,
+            broken: false,
+            continued: false,
+        }
+    }
 }
 
 impl Flattener<'_> {
@@ -141,11 +167,24 @@ impl Flattener<'_> {
     fn statement(&mut self, statement: NodeId) {
         let reachable = self.reachable;
         match self.arena.operations[statement] {
-            Operation::Return(value) => {
-                self.terminate(Terminator::Return(value));
-                // What follows lands in a block nothing enters.
-                self.current = self.new_block();
-                self.reachable = false;
+            Operation::Return(value) => self.leave(Terminator::Return(value)),
+            Operation::Break(depth) => {
+                let position = self.loops.len() - 1 - depth as usize;
+                let target = &mut self.loops[position];
+                target.broken |= reachable;
+                let exit = target.exit;
+                self.leave(Terminator::Goto(exit));
+            }
+            Operation::Continue(depth) => {
+                let position = self.loops.len() - 1 - depth as usize;
+                let next = match self.loops[position].next {
+                    Some(next) => next,
+                    None => self.new_block(),
+                };
+                let target = &mut self.loops[position];
+                target.next = Some(next);
+                target.continued |= reachable;
+                self.leave(Terminator::Goto(next));
             }
             Operation::If {
                 cond,
@@ -186,7 +225,7 @@ impl Flattener<'_> {
                     else_block: exit,
                 });
                 self.current = body_block;
-                self.statements_of(body);
+                self.loop_body(body, LoopTarget::new(exit, Some(header_block)));
                 self.terminate(Terminator::Goto(header_block));
                 self.current = exit;
                 self.reachable = reachable;
@@ -195,7 +234,8 @@ impl Flattener<'_> {
                 let (body_block, exit) = (self.new_block(), self.new_block());
                 self.terminate(Terminator::Goto(body_block));
                 self.current = body_block;
-                self.statements_of(body);
+                let target = self.loop_body(body, LoopTarget::new(exit, None));
+                self.resume_at_next_pass(&target);
                 let (then_block, else_block) = match until {
                     true => (exit, body_block),
                     false => (body_block, exit),
@@ -205,8 +245,9 @@ impl Flattener<'_> {
                     then_block,
                     else_block,
                 });
-                // The exit is reached only from the end of the body, so it inherits its flag.
+                // The exit is reached only through the condition or a `Break`.
                 self.current = exit;
+                self.reachable |= target.broken;
             }
             Operation::CountedLoop { index, range, body } => {
                 self.counted_loop(statement, index, range, body)
@@ -248,8 +289,9 @@ impl Flattener<'_> {
         });
         let reachable = self.reachable;
         self.current = body_block;
-        self.statements_of(body);
-        // A body that always returns never gets to its step.
+        let target = self.loop_body(body, LoopTarget::new(exit, None));
+        self.resume_at_next_pass(&target);
+        // A body that always leaves the loop never gets to its step.
         if self.reachable {
             let current = self.read_local(index, span);
             let step = self.field(saved_range, RangeFieldKind::Step, span);
@@ -267,6 +309,33 @@ impl Flattener<'_> {
         self.terminate(Terminator::Goto(header));
         self.current = exit;
         self.reachable = reachable;
+    }
+
+    /// Ends the current block with `terminator`, which leaves it for good; what follows lands in a
+    /// block nothing enters.
+    fn leave(&mut self, terminator: Terminator) {
+        self.terminate(terminator);
+        self.current = self.new_block();
+        self.reachable = false;
+    }
+
+    /// Flattens a loop's body with `target` on the loop stack; returns the target, for what
+    /// reached its exit and next pass.
+    fn loop_body(&mut self, body: List<NodeId>, target: LoopTarget) -> LoopTarget {
+        self.loops.push(target);
+        self.statements_of(body);
+        self.loops.pop().expect("the loop pushed above")
+    }
+
+    /// After the body of a `DoWhile` or `CountedLoop`: when a `Continue` made a block for the next
+    /// pass, the body's end jumps into it and flattening goes on there, where the condition or the
+    /// step goes.
+    fn resume_at_next_pass(&mut self, target: &LoopTarget) {
+        if let Some(next) = target.next {
+            self.terminate(Terminator::Goto(next));
+            self.current = next;
+            self.reachable |= target.continued;
+        }
     }
 
     /// What the range's own node says: a range written in place has a known kind, and a known

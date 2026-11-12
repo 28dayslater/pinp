@@ -47,6 +47,18 @@ pub enum DiagnosticCode {
     MissingReturnValue,
     /// A value that can never exist — an `if` every branch of which returns — used as one.
     NeverValue,
+    /// `break` where an expression belongs.
+    BreakAsValue,
+    /// `continue` where an expression belongs.
+    ContinueAsValue,
+    /// `break` outside any loop.
+    BreakOutsideLoop,
+    /// `continue` outside any loop.
+    ContinueOutsideLoop,
+    /// A `break @label` or `continue @label` naming no loop around it.
+    UnknownLabel,
+    /// A loop labelled like a loop it is inside.
+    ShadowedLabel,
 }
 
 /// Everything a rule is, in one row.
@@ -64,7 +76,7 @@ pub struct RuleInfo {
 impl DiagnosticCode {
     /// Every code, so the SARIF emitter can list the rules it might report and a test can hold the
     /// numbering to account.
-    pub const ALL: [DiagnosticCode; 10] = [
+    pub const ALL: [DiagnosticCode; 16] = [
         DiagnosticCode::UnreachableCode,
         DiagnosticCode::DeadStore,
         DiagnosticCode::UnusedVariable,
@@ -75,6 +87,12 @@ impl DiagnosticCode {
         DiagnosticCode::VoidFunctionReturnsValue,
         DiagnosticCode::MissingReturnValue,
         DiagnosticCode::NeverValue,
+        DiagnosticCode::BreakAsValue,
+        DiagnosticCode::ContinueAsValue,
+        DiagnosticCode::BreakOutsideLoop,
+        DiagnosticCode::ContinueOutsideLoop,
+        DiagnosticCode::UnknownLabel,
+        DiagnosticCode::ShadowedLabel,
     ];
 
     /// The rule's row. The accessors below read from here, so a variant is edited in one place.
@@ -138,6 +156,42 @@ impl DiagnosticCode {
                 code: "PINP3006",
                 name: "never-value",
                 description: "Expressions that never produce a value, used as one.",
+                severity: Severity::Error,
+            },
+            DiagnosticCode::BreakAsValue => RuleInfo {
+                code: "PINP2002",
+                name: "break-as-value",
+                description: "`break` used where a value is expected.",
+                severity: Severity::Error,
+            },
+            DiagnosticCode::ContinueAsValue => RuleInfo {
+                code: "PINP2003",
+                name: "continue-as-value",
+                description: "`continue` used where a value is expected.",
+                severity: Severity::Error,
+            },
+            DiagnosticCode::BreakOutsideLoop => RuleInfo {
+                code: "PINP3007",
+                name: "break-outside-loop",
+                description: "`break` outside a loop.",
+                severity: Severity::Error,
+            },
+            DiagnosticCode::ContinueOutsideLoop => RuleInfo {
+                code: "PINP3008",
+                name: "continue-outside-loop",
+                description: "`continue` outside a loop.",
+                severity: Severity::Error,
+            },
+            DiagnosticCode::UnknownLabel => RuleInfo {
+                code: "PINP3009",
+                name: "unknown-label",
+                description: "Loop labels that name no loop around the statement.",
+                severity: Severity::Error,
+            },
+            DiagnosticCode::ShadowedLabel => RuleInfo {
+                code: "PINP3010",
+                name: "shadowed-label",
+                description: "Loop labels already naming an enclosing loop.",
                 severity: Severity::Error,
             },
         }
@@ -280,6 +334,24 @@ mod tests {
         assert_eq!(DiagnosticCode::VoidFunctionReturnsValue.code(), "PINP3004");
         assert_eq!(DiagnosticCode::MissingReturnValue.code(), "PINP3005");
         assert_eq!(DiagnosticCode::NeverValue.code(), "PINP3006");
+        assert_eq!(DiagnosticCode::BreakAsValue.code(), "PINP2002");
+        assert_eq!(DiagnosticCode::ContinueAsValue.code(), "PINP2003");
+        assert_eq!(DiagnosticCode::BreakOutsideLoop.code(), "PINP3007");
+        assert_eq!(DiagnosticCode::ContinueOutsideLoop.code(), "PINP3008");
+        assert_eq!(DiagnosticCode::UnknownLabel.code(), "PINP3009");
+        assert_eq!(DiagnosticCode::ShadowedLabel.code(), "PINP3010");
+        assert_eq!(DiagnosticCode::BreakAsValue.name(), "break-as-value");
+        assert_eq!(DiagnosticCode::ContinueAsValue.name(), "continue-as-value");
+        assert_eq!(
+            DiagnosticCode::BreakOutsideLoop.name(),
+            "break-outside-loop"
+        );
+        assert_eq!(
+            DiagnosticCode::ContinueOutsideLoop.name(),
+            "continue-outside-loop"
+        );
+        assert_eq!(DiagnosticCode::UnknownLabel.name(), "unknown-label");
+        assert_eq!(DiagnosticCode::ShadowedLabel.name(), "shadowed-label");
 
         let codes: FxHashSet<&str> = DiagnosticCode::ALL.iter().map(|code| code.code()).collect();
         assert_eq!(
@@ -309,11 +381,17 @@ mod tests {
                 | DiagnosticCode::ReturnTypeMismatch
                 | DiagnosticCode::VoidFunctionReturnsValue
                 | DiagnosticCode::MissingReturnValue
-                | DiagnosticCode::NeverValue => true,
+                | DiagnosticCode::NeverValue
+                | DiagnosticCode::BreakAsValue
+                | DiagnosticCode::ContinueAsValue
+                | DiagnosticCode::BreakOutsideLoop
+                | DiagnosticCode::ContinueOutsideLoop
+                | DiagnosticCode::UnknownLabel
+                | DiagnosticCode::ShadowedLabel => true,
             };
             assert!(listed);
         }
-        assert_eq!(DiagnosticCode::ALL.len(), 10);
+        assert_eq!(DiagnosticCode::ALL.len(), 16);
     }
 
     #[test]

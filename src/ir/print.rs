@@ -295,6 +295,8 @@ impl<'a> Writer<'a> {
             },
             CountedLoop { index, .. } => format!("counted_loop {}", self.local(index)),
             Return(_) => "return".to_string(),
+            Break(depth) => format!("break {depth}"),
+            Continue(depth) => format!("continue {depth}"),
         }
     }
 

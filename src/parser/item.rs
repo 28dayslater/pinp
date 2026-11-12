@@ -321,17 +321,20 @@ impl<'src> Parser<'src> {
         Ok(Block { stmts, result })
     }
 
-    // `while <cond> <block>` — a pre-tested loop.
+    // `while <cond> [@label] <block>` — a pre-tested loop.
     fn parse_while(&mut self) -> Result<Stmt, ParseErrorKind> {
         self.advance(); // 'while'
         let cond = self.parse_expr(0)?;
+        let label = self.label();
         let body = self.parse_block()?;
-        Ok(Stmt::While { cond, body })
+        Ok(Stmt::While { cond, body, label })
     }
 
-    // `loop <block> (while | until) <cond>` — a post-tested loop (`until` flips the sense).
+    // `loop [@label] <block> (while | until) <cond>` — a post-tested loop (`until` flips the
+    // sense).
     fn parse_loop(&mut self) -> Result<Stmt, ParseErrorKind> {
         self.advance(); // 'loop'
+        let label = self.label();
         let body = self.parse_block()?;
         let until = match self.peek().kind {
             TokenKind::KwWhile => false,
@@ -344,7 +347,40 @@ impl<'src> Parser<'src> {
         };
         self.advance(); // 'while' / 'until'
         let cond = self.parse_expr(0)?;
-        Ok(Stmt::Loop { body, cond, until })
+        Ok(Stmt::Loop {
+            body,
+            cond,
+            until,
+            label,
+        })
+    }
+
+    // The `@label` ending a loop header or a `break`/`continue`, when there is one. No expression
+    // contains a `Label` token, so one token's look is enough.
+    fn label(&mut self) -> Option<Label> {
+        if self.peek().kind != TokenKind::Label {
+            return None;
+        }
+        let token = self.advance();
+        Some(Label {
+            name: self.ast.intern(&token.text[1..]),
+            span: token.span(),
+        })
+    }
+
+    // `break [@label]` / `continue [@label]`.
+    fn parse_loop_exit(&mut self) -> Result<Stmt, ParseErrorKind> {
+        let keyword = self.advance();
+        let label = self.label();
+        let end = label.map_or(keyword.span().end, |label| label.span.end);
+        let span = Span {
+            start: keyword.span().start,
+            end,
+        };
+        Ok(match keyword.kind {
+            TokenKind::KwBreak => Stmt::Break { label, span },
+            _ => Stmt::Continue { label, span },
+        })
     }
 
     // `return [<expr>]`: bare when the statement ends right after the keyword.
@@ -365,7 +401,7 @@ impl<'src> Parser<'src> {
         Ok(Stmt::Return { value, span })
     }
 
-    // `for <binder>[, <binder>…] in <source> <block>`.
+    // `for <binder>[, <binder>…] in <source> [@label] <block>`.
     // 1 binder → `Stmt::For`; 2–3 binders → `Stmt::ForArray`; 4+ → `ParseError`.
     fn parse_for(&mut self) -> Result<Stmt, ParseErrorKind> {
         self.advance(); // 'for'
@@ -386,22 +422,26 @@ impl<'src> Parser<'src> {
             }
             self.expect(TokenKind::KwIn)?;
             let source = self.parse_expr(0)?;
+            let label = self.label();
             let body = self.parse_block()?;
             return Ok(Stmt::ForArray {
                 binders,
                 binder_spans,
                 source,
                 body,
+                label,
             });
         }
         self.expect(TokenKind::KwIn)?;
         let source = self.parse_expr(0)?;
+        let label = self.label();
         let body = self.parse_block()?;
         Ok(Stmt::For {
             var: first_sym,
             var_span: first_span,
             source,
             body,
+            label,
         })
     }
 
@@ -471,6 +511,7 @@ impl<'src> Parser<'src> {
             TokenKind::KwLoop => return self.parse_loop(),
             TokenKind::KwFor => return self.parse_for(),
             TokenKind::KwReturn => return self.parse_return(),
+            TokenKind::KwBreak | TokenKind::KwContinue => return self.parse_loop_exit(),
             _ => {}
         }
         // Otherwise parse as Python does: one or more comma-separated lists joined by `=`. A single

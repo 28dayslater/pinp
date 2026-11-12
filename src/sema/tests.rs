@@ -3495,3 +3495,567 @@ fn a_function_after_one_with_returns_is_checked_against_its_own_type() {
         DiagnosticCode::ReturnTypeMismatch
     );
 }
+
+// --- break, continue, and loop labels (0019) -----------------------------------------------
+
+fn break_outside() -> SemaErrorKind {
+    coded(DiagnosticCode::BreakOutsideLoop, "Break outside a loop.")
+}
+
+fn continue_outside() -> SemaErrorKind {
+    coded(
+        DiagnosticCode::ContinueOutsideLoop,
+        "Continue outside a loop.",
+    )
+}
+
+fn unknown_label(name: &str) -> SemaErrorKind {
+    coded(
+        DiagnosticCode::UnknownLabel,
+        &format!("No loop labelled `@{name}` around this statement."),
+    )
+}
+
+fn shadowed_label(name: &str) -> SemaErrorKind {
+    coded(
+        DiagnosticCode::ShadowedLabel,
+        &format!("Loop label `@{name}` already names an enclosing loop."),
+    )
+}
+
+#[test]
+fn break_and_continue_are_accepted_in_every_loop_kind() {
+    for keyword in ["break", "continue"] {
+        for template in [
+            indoc! {"
+                i = 0
+                while i < 3
+                    i += 1
+                    KEYWORD
+            "},
+            indoc! {"
+                i = 0
+                loop
+                    i += 1
+                    KEYWORD
+                until i > 3
+            "},
+            indoc! {"
+                i = 0
+                loop
+                    i += 1
+                    KEYWORD
+                while i < 3
+            "},
+            indoc! {"
+                for i in 1..3
+                    KEYWORD
+            "},
+            indoc! {"
+                for v in [1, 2]
+                    KEYWORD
+            "},
+            indoc! {"
+                for i, v in [1, 2]
+                    KEYWORD
+            "},
+            indoc! {"
+                for v in [1, 2; 3, 4]
+                    KEYWORD
+            "},
+            indoc! {"
+                for r, c, v in [1, 2; 3, 4]
+                    KEYWORD
+            "},
+        ] {
+            accepted(&template.replace("KEYWORD", keyword));
+        }
+    }
+}
+
+#[test]
+fn break_and_continue_are_accepted_at_any_depth_inside_a_loop() {
+    accepted(indoc! {"
+        for i in 1..9
+            if i == 2
+                continue
+            elif i == 3
+                if i > 0
+                    break
+            else
+                while true
+                    break
+                continue
+    "});
+    accepted(indoc! {"
+        f(n: int): int is
+            t = 0
+            for i in 1..n
+                for j in 1..n
+                    if j > i
+                        break
+                    t += j
+                if t > 10
+                    break
+            t
+        f(4)
+    "});
+}
+
+#[test]
+fn break_and_continue_outside_a_loop_are_rejected() {
+    for (keyword, expected) in [("break", break_outside()), ("continue", continue_outside())] {
+        for template in [
+            "KEYWORD",
+            indoc! {"
+                if true
+                    KEYWORD
+            "},
+            indoc! {"
+                f() is
+                    KEYWORD
+                f()
+            "},
+            indoc! {"
+                f(n: int) is
+                    if n > 0
+                        KEYWORD
+                f(1)
+            "},
+            indoc! {"
+                f(n: int): int is
+                    if n > 0
+                        KEYWORD
+                    n
+                f(1)
+            "},
+            // After the loop has ended, in the same body.
+            indoc! {"
+                for i in 1..3
+                    i
+                KEYWORD
+            "},
+            // In a function called from a loop: that loop is the caller's.
+            indoc! {"
+                f(n: int) is
+                    if n > 0
+                        n
+                    else
+                        KEYWORD
+                for i in 1..3
+                    f(i)
+            "},
+        ] {
+            let src = template.replace("KEYWORD", keyword);
+            assert_eq!(sema_error(&src), expected, "in:\n{src}");
+        }
+    }
+}
+
+#[test]
+fn break_and_continue_outside_a_loop_carry_their_codes() {
+    assert_eq!(sema_code("break"), DiagnosticCode::BreakOutsideLoop);
+    assert_eq!(sema_code("continue"), DiagnosticCode::ContinueOutsideLoop);
+}
+
+#[test]
+fn a_loop_in_the_caller_does_not_reach_into_the_called_function() {
+    assert_eq!(
+        sema_error(indoc! {"
+            f() is
+                break
+            while true
+                f()
+        "}),
+        break_outside()
+    );
+    assert_eq!(
+        sema_error(indoc! {"
+            f() is
+                continue @outer
+            while true @outer
+                f()
+        "}),
+        unknown_label("outer")
+    );
+}
+
+#[test]
+fn a_function_with_its_own_loop_accepts_break_and_continue() {
+    accepted(indoc! {"
+        f(n: int): int is
+            t = 0
+            for i in 1..n @numbers
+                if i == 2
+                    continue @numbers
+                if i == 5
+                    break @numbers
+                t += i
+            t
+        f(9)
+    "});
+}
+
+#[test]
+fn a_labelled_break_or_continue_reaches_any_enclosing_loop() {
+    for exit in [
+        "break @outer",
+        "continue @outer",
+        "break @inner",
+        "continue @inner",
+    ] {
+        let src = indoc! {"
+            for i in 1..3 @outer
+                for j in 1..3 @inner
+                    if i == j
+                        EXIT
+        "}
+        .replace("EXIT", exit);
+        accepted(&src);
+    }
+    accepted(indoc! {"
+        i = 0
+        while i < 9 @a
+            i += 1
+            loop @b
+                for v in [1, 2; 3, 4] @c
+                    if v == 2
+                        continue @a
+                    if v == 3
+                        break @b
+                    if v == 4
+                        continue @c
+                break
+            until true
+    "});
+}
+
+#[test]
+fn an_unlabelled_break_inside_a_labelled_inner_loop_needs_no_label() {
+    accepted(indoc! {"
+        for i in 1..3 @outer
+            for j in 1..3 @inner
+                break
+            continue
+    "});
+}
+
+#[test]
+fn a_label_that_names_no_enclosing_loop_is_rejected() {
+    for (src, name) in [
+        // Never declared.
+        (
+            indoc! {"
+                for i in 1..3
+                    break @rows
+            "},
+            "rows",
+        ),
+        // A sibling loop's label.
+        (
+            indoc! {"
+                for i in 1..3 @first
+                    i
+                for j in 1..3
+                    break @first
+            "},
+            "first",
+        ),
+        // A loop nested inside: its label is out of reach from the outer body.
+        (
+            indoc! {"
+                for i in 1..3
+                    for j in 1..3 @inner
+                        j
+                    continue @inner
+            "},
+            "inner",
+        ),
+        // The loop has ended.
+        (
+            indoc! {"
+                for i in 1..3 @rows
+                    i
+                if true
+                    break @rows
+            "},
+            "rows",
+        ),
+        // Outside any loop at all.
+        ("break @rows", "rows"),
+        // Labels are not variables.
+        (
+            indoc! {"
+                rows = 1
+                for i in 1..3
+                    break @rows
+            "},
+            "rows",
+        ),
+        // Nor binders.
+        (
+            indoc! {"
+                for i in 1..3
+                    continue @i
+            "},
+            "i",
+        ),
+    ] {
+        assert_eq!(sema_error(src), unknown_label(name), "in:\n{src}");
+    }
+    assert_eq!(
+        sema_code(indoc! {"
+            for i in 1..3
+                break @rows
+        "}),
+        DiagnosticCode::UnknownLabel
+    );
+}
+
+#[test]
+fn a_loop_may_not_reuse_the_label_of_a_loop_around_it() {
+    for (src, name) in [
+        (
+            indoc! {"
+                for i in 1..3 @rows
+                    for j in 1..3 @rows
+                        j
+            "},
+            "rows",
+        ),
+        (
+            indoc! {"
+                for i in 1..3 @rows
+                    while true @cols
+                        loop @rows
+                            break
+                        until true
+                        break
+            "},
+            "rows",
+        ),
+        (
+            indoc! {"
+                f() is
+                    while true @spin
+                        if true
+                            for i in 1..3 @spin
+                                break
+                        break
+                f()
+            "},
+            "spin",
+        ),
+    ] {
+        assert_eq!(sema_error(src), shadowed_label(name), "in:\n{src}");
+    }
+    assert_eq!(
+        sema_code(indoc! {"
+            for i in 1..3 @rows
+                for j in 1..3 @rows
+                    j
+        "}),
+        DiagnosticCode::ShadowedLabel
+    );
+}
+
+#[test]
+fn sibling_loops_and_loops_in_different_functions_may_share_a_label() {
+    accepted(indoc! {"
+        for i in 1..3 @rows
+            break @rows
+        for j in 1..3 @rows
+            continue @rows
+    "});
+    accepted(indoc! {"
+        f() is
+            for i in 1..3 @rows
+                break @rows
+        g() is
+            for i in 1..3 @rows
+                break @rows
+        for i in 1..3 @rows
+            f()
+            g()
+    "});
+    accepted(indoc! {"
+        for i in 1..3 @outer
+            for j in 1..3 @rows
+                break @rows
+            for k in 1..3 @rows
+                break @outer
+    "});
+}
+
+#[test]
+fn a_label_may_share_its_name_with_a_variable_or_a_binder() {
+    accepted(indoc! {"
+        rows = 3
+        for row in 1..rows @rows
+            break @rows
+        rows
+    "});
+    accepted(indoc! {"
+        for i in 1..3 @i
+            continue @i
+    "});
+}
+
+#[test]
+fn an_unused_label_is_accepted() {
+    accepted(indoc! {"
+        for i in 1..3 @rows
+            i
+    "});
+}
+
+#[test]
+fn a_branch_ending_in_break_or_continue_does_not_affect_the_if_type() {
+    for keyword in ["break", "continue"] {
+        let src = indoc! {"
+            f(n: int): float is
+                t = 0.0
+                for i in 1..n
+                    t = if i > 2
+                        2.5
+                    else
+                        KEYWORD
+                t
+            f(3)
+        "}
+        .replace("KEYWORD", keyword);
+        assert_eq!(first_if_type(&src), PinpType::Float, "in:\n{src}");
+    }
+}
+
+#[test]
+fn an_if_whose_every_branch_leaves_the_loop_is_never() {
+    for exits in [
+        ("break", "continue"),
+        ("continue", "break"),
+        ("break", "return 1"),
+        ("break @outer", "continue"),
+    ] {
+        let src = indoc! {"
+            f(n: int): int is
+                for i in 1..n @outer
+                    if i > 2
+                        FIRST
+                    else
+                        SECOND
+                0
+            f(3)
+        "}
+        .replace("FIRST", exits.0)
+        .replace("SECOND", exits.1);
+        assert_eq!(first_if_type(&src), PinpType::Never, "in:\n{src}");
+    }
+}
+
+#[test]
+fn an_if_that_only_leaves_the_loop_cannot_be_assigned() {
+    for exits in [
+        ("break", "continue"),
+        ("break", "break"),
+        ("continue", "return 1"),
+    ] {
+        let src = indoc! {"
+            f(n: int): int is
+                for i in 1..n
+                    t = if i > 2
+                        FIRST
+                    else
+                        SECOND
+                0
+            f(3)
+        "}
+        .replace("FIRST", exits.0)
+        .replace("SECOND", exits.1);
+        assert_eq!(
+            sema_error(&src),
+            coded(
+                DiagnosticCode::NeverValue,
+                "Expression never produces a value."
+            ),
+            "in:\n{src}"
+        );
+    }
+}
+
+#[test]
+fn leaving_a_loop_never_makes_the_function_body_diverge() {
+    // The loop is `Void` whatever its body does, so the function still falls off its end.
+    for src in [
+        indoc! {"
+            f(n: int): int is
+                while true
+                    if n > 0
+                        return n
+                    break
+            f(1)
+        "},
+        indoc! {"
+            f(n: int): int is
+                for i in 1..n
+                    if i > 2
+                        return i
+                    else
+                        continue
+            f(1)
+        "},
+        indoc! {"
+            f(n: int): int is
+                loop
+                    return n
+                until true
+            f(1)
+        "},
+    ] {
+        assert_eq!(
+            sema_error(src),
+            coded(
+                DiagnosticCode::MissingReturn,
+                "Not all paths return a value in function `f()`."
+            ),
+            "in:\n{src}"
+        );
+    }
+    accepted(indoc! {"
+        f(n: int): int is
+            while true
+                if n > 0
+                    return n
+                break
+            0
+        f(1)
+    "});
+}
+
+#[test]
+fn a_void_function_may_end_in_a_loop_that_breaks() {
+    accepted(indoc! {"
+        g = 0
+        f(n: int) is
+            for i in 1..n
+                if i > 2
+                    break
+                ::g += i
+        f(5)
+    "});
+}
+
+#[test]
+fn a_break_in_one_function_does_not_hide_a_missing_label_in_the_next() {
+    // The loop stack is per function: `f`'s loop is gone by the time `g` is analysed.
+    assert_eq!(
+        sema_error(indoc! {"
+            f() is
+                for i in 1..3 @rows
+                    break @rows
+            g() is
+                break @rows
+            f()
+        "}),
+        unknown_label("rows")
+    );
+}

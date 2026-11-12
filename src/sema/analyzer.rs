@@ -2,8 +2,8 @@
 
 use super::*;
 use crate::parser::{
-    ArrayElementType, BinOp, Block, BuiltinMember, ExprId, FStrSegment, FuncDef, Place, RangeKind,
-    Stmt, UnOp,
+    ArrayElementType, BinOp, Block, BuiltinMember, ExprId, FStrSegment, FuncDef, Label, Place,
+    RangeKind, Stmt, UnOp,
 };
 
 /// Types a binary operator where at least one operand is `Str`. Only concatenation (`+`) and the six
@@ -139,7 +139,7 @@ impl Analyzer<'_, '_> {
     }
 
     /// Checks one statement, returning whether it *diverges* — control never continues past it:
-    /// a `return`, or an `if` every branch of which returns.
+    /// a `return`, `break`, or `continue`, or an `if` every branch of which does one.
     pub(super) fn analyze_stmt(&mut self, stmt: &Stmt) -> Result<bool, SemaErrorKind> {
         match stmt {
             Stmt::Expr(expr_id) => Ok(self.analyze_expr(*expr_id)? == PinpType::Never),
@@ -180,18 +180,33 @@ impl Analyzer<'_, '_> {
                 Ok(false)
             }
             // A loop never diverges, even when its body does: the body may not run at all.
-            Stmt::While { cond, body } => {
+            Stmt::While { cond, body, label } => {
                 self.check_condition(*cond)?;
-                self.analyze_block(body)?;
+                self.analyze_loop_body(*label, body)?;
                 Ok(false)
             }
-            Stmt::Loop { body, cond, .. } => {
-                self.analyze_block(body)?;
+            Stmt::Loop {
+                body, cond, label, ..
+            } => {
+                self.analyze_loop_body(*label, body)?;
                 self.check_condition(*cond)?;
                 Ok(false)
+            }
+            Stmt::Break { label, span } => {
+                self.analyze_loop_exit(*label, *span, "Break", DiagnosticCode::BreakOutsideLoop)?;
+                Ok(true)
+            }
+            Stmt::Continue { label, span } => {
+                let code = DiagnosticCode::ContinueOutsideLoop;
+                self.analyze_loop_exit(*label, *span, "Continue", code)?;
+                Ok(true)
             }
             Stmt::For {
-                var, source, body, ..
+                var,
+                source,
+                body,
+                label,
+                ..
             } => {
                 let source_type = self.analyze_expr(*source)?;
                 // Range → Int counter; Array/Matrix → element type; anything else → error.
@@ -210,7 +225,7 @@ impl Analyzer<'_, '_> {
                 self.scopes.push(FxHashMap::default());
                 self.scopes.last_mut().unwrap().insert(*var, var_type);
                 self.loop_vars.push(*var);
-                self.analyze_block(body)?;
+                self.analyze_loop_body(*label, body)?;
                 self.loop_vars.pop();
                 self.scopes.pop();
                 Ok(false)
@@ -219,6 +234,7 @@ impl Analyzer<'_, '_> {
                 binders,
                 source,
                 body,
+                label,
                 ..
             } => {
                 let source_type = self.analyze_expr(*source)?;
@@ -254,7 +270,7 @@ impl Analyzer<'_, '_> {
                 for binder in binders.iter() {
                     self.loop_vars.push(*binder);
                 }
-                self.analyze_block(body)?;
+                self.analyze_loop_body(*label, body)?;
                 for _ in binders.iter() {
                     self.loop_vars.pop();
                 }
@@ -290,6 +306,60 @@ impl Analyzer<'_, '_> {
                 Ok(false)
             }
         }
+    }
+
+    /// A loop's body, with the loop on the stack `break` and `continue` resolve against. A label
+    /// already naming a loop around this one is rejected: `break @label` would be ambiguous.
+    fn analyze_loop_body(
+        &mut self,
+        label: Option<Label>,
+        body: &Block,
+    ) -> Result<(), SemaErrorKind> {
+        if let Some(label) = label
+            && self.labelled(label.name)
+        {
+            let kind = SemaErrorKind::Coded(
+                DiagnosticCode::ShadowedLabel,
+                format!(
+                    "Loop label `@{}` already names an enclosing loop.",
+                    self.name(label.name)
+                ),
+            );
+            return Err(self.error_at(label.span, kind));
+        }
+        self.loops.push(label.map(|label| label.name));
+        self.analyze_block(body)?;
+        self.loops.pop();
+        Ok(())
+    }
+
+    /// Checks that a `break`/`continue` has a loop to act on: the one its label names, or any.
+    fn analyze_loop_exit(
+        &mut self,
+        label: Option<Label>,
+        span: Span,
+        keyword: &str,
+        outside_code: DiagnosticCode,
+    ) -> Result<(), SemaErrorKind> {
+        let kind = match label {
+            Some(label) if !self.labelled(label.name) => SemaErrorKind::Coded(
+                DiagnosticCode::UnknownLabel,
+                format!(
+                    "No loop labelled `@{}` around this statement.",
+                    self.name(label.name)
+                ),
+            ),
+            None if self.loops.is_empty() => {
+                SemaErrorKind::Coded(outside_code, format!("{keyword} outside a loop."))
+            }
+            _ => return Ok(()),
+        };
+        Err(self.error_at(span, kind))
+    }
+
+    /// Whether a loop around the statement being analysed carries the label `name`.
+    fn labelled(&self, name: SymId) -> bool {
+        self.loops.contains(&Some(name))
     }
 
     /// Checks a `return` against the enclosing function: it must be in one, and carry a value

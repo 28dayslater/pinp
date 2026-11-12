@@ -548,4 +548,130 @@ mod tests {
         "};
         assert_eq!(diagnostics(src)[0], "n > 0");
     }
+
+    // --- break and continue (0019) ---------------------------------------------------------
+
+    #[test]
+    fn code_after_break_or_continue_is_reported_once_at_its_first_statement() {
+        for keyword in ["break", "continue"] {
+            let src = indoc! {"
+                f(n: int): int is
+                    t = 0
+                    for i in 1..n
+                        KEYWORD
+                        t += i
+                        t += 2
+                    t
+                f(1)
+            "}
+            .replace("KEYWORD", keyword);
+            assert_eq!(diagnostics(&src), vec!["t"], "in:\n{src}");
+        }
+    }
+
+    #[test]
+    fn code_after_an_if_else_that_leaves_the_loop_on_both_arms_is_reported() {
+        let src = indoc! {"
+            for i in 1..3
+                if i > 1
+                    break
+                else
+                    continue
+                i * 2
+        "};
+        assert_eq!(diagnostics(src), vec!["i * 2"]);
+    }
+
+    #[test]
+    fn code_after_a_loop_left_only_by_break_is_reachable() {
+        // Only the `until` condition, which the break skips, is reported.
+        for src in [
+            indoc! {"
+                g = 0
+                f() is
+                    loop
+                        ::g += 1
+                        break
+                    until true
+                    ::g += 2
+                f()
+            "},
+            indoc! {"
+                g = 0
+                f() is
+                    for i in 1..3 @outer
+                        loop
+                            break @outer
+                        until true
+                    ::g += 2
+                f()
+            "},
+        ] {
+            assert_eq!(diagnostics(src), vec!["true"], "in:\n{src}");
+        }
+    }
+
+    #[test]
+    fn the_condition_of_a_loop_until_whose_body_always_breaks_is_reported() {
+        let src = indoc! {"
+            g = 0
+            f() is
+                loop
+                    ::g += 1
+                    break
+                until ::g > 3
+            f()
+        "};
+        assert_eq!(diagnostics(src), vec!["::g > 3"]);
+    }
+
+    #[test]
+    fn the_condition_of_a_loop_until_reached_by_continue_is_not_reported() {
+        let src = indoc! {"
+            g = 0
+            f() is
+                loop
+                    ::g += 1
+                    continue
+                until ::g > 3
+            f()
+        "};
+        assert!(diagnostics(src).is_empty());
+    }
+
+    #[test]
+    fn break_or_continue_ending_a_loop_body_reports_nothing() {
+        // The counted loop's step after a `break` is not generated; after a `continue` it is
+        // reached by the jump.
+        for src in [
+            indoc! {"
+                for i in 1..3
+                    break
+            "},
+            indoc! {"
+                for i in 1..3
+                    continue
+            "},
+            indoc! {"
+                for i in 1..3
+                    if i == 2
+                        continue
+                    else
+                        break
+            "},
+            indoc! {"
+                for v in [1, 2; 3, 4]
+                    if v == 2
+                        break
+                    continue
+            "},
+            indoc! {"
+                for i in 1..3 @outer
+                    for j in 1..3
+                        continue @outer
+            "},
+        ] {
+            assert!(diagnostics(src).is_empty(), "in:\n{src}");
+        }
+    }
 }

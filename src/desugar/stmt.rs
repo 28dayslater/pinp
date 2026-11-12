@@ -4,7 +4,7 @@
 
 use super::*;
 use crate::ir::List;
-use crate::parser::{Block, ExprId, IfArm, Node};
+use crate::parser::{Block, ExprId, IfArm, Label, Node};
 
 /// What a body does with its trailing result expression.
 #[derive(Clone, Copy)]
@@ -21,6 +21,14 @@ impl Desugarer<'_> {
         match stmt {
             Stmt::Expr(expr_id) => self.effect(*expr_id, out),
             Stmt::Return { value, span } => self.return_statement(*value, *span, out),
+            Stmt::Break { label, span } => {
+                let depth = self.loop_exit_depth(*label, true);
+                out.push(self.statement_node(Operation::Break(depth), *span));
+            }
+            Stmt::Continue { label, span } => {
+                let depth = self.loop_exit_depth(*label, false);
+                out.push(self.statement_node(Operation::Continue(depth), *span));
+            }
             Stmt::Assign {
                 target_lists,
                 target_spans,
@@ -28,13 +36,15 @@ impl Desugarer<'_> {
             } => {
                 self.assignment(target_lists, target_spans, values, false, out);
             }
-            Stmt::While { cond, body } => {
+            Stmt::While { cond, body, label } => {
                 let mut header = Vec::new();
                 let cond_node = self.expr(*cond, &mut header);
-                let body = self.scoped(|desugarer| {
-                    let mut statements = Vec::new();
-                    desugarer.body_into(body, Sink::Effect, &mut statements);
-                    statements
+                let body = self.in_loop(*label, 1, |desugarer| {
+                    desugarer.scoped(|desugarer| {
+                        let mut statements = Vec::new();
+                        desugarer.body_into(body, Sink::Effect, &mut statements);
+                        statements
+                    })
                 });
                 let operation = Operation::While {
                     header: self.function.arena.list(&header),
@@ -43,11 +53,18 @@ impl Desugarer<'_> {
                 };
                 out.push(self.statement_node(operation, self.ast.span_of(*cond)));
             }
-            Stmt::Loop { body, cond, until } => {
-                let mut statements = self.scoped(|desugarer| {
-                    let mut statements = Vec::new();
-                    desugarer.body_into(body, Sink::Effect, &mut statements);
-                    statements
+            Stmt::Loop {
+                body,
+                cond,
+                until,
+                label,
+            } => {
+                let mut statements = self.in_loop(*label, 1, |desugarer| {
+                    desugarer.scoped(|desugarer| {
+                        let mut statements = Vec::new();
+                        desugarer.body_into(body, Sink::Effect, &mut statements);
+                        statements
+                    })
                 });
                 // The condition is tested after each pass, so what computing it needs runs at the
                 // end of the body.
@@ -64,27 +81,32 @@ impl Desugarer<'_> {
                 var_span,
                 source,
                 body,
+                label,
             } => match self.ast.type_of(*source) {
                 PinpType::Range => {
                     // The range is evaluated before the loop's scope opens.
                     let range = self.expr(*source, out);
                     let index = self.local(Some(*var), PinpType::Int);
-                    let body = self.scoped(|desugarer| {
-                        let frame = desugarer.function.scopes.last_mut().expect("a scope frame");
-                        frame.insert(*var, Binding::Local(index));
-                        desugarer.body(body, Sink::Effect)
+                    let body = self.in_loop(*label, 1, |desugarer| {
+                        desugarer.scoped(|desugarer| {
+                            let frame =
+                                desugarer.function.scopes.last_mut().expect("a scope frame");
+                            frame.insert(*var, Binding::Local(index));
+                            desugarer.body(body, Sink::Effect)
+                        })
                     });
                     let operation = Operation::CountedLoop { index, range, body };
                     out.push(self.statement_node(operation, self.ast.span_of(*source)));
                 }
-                _ => self.for_over_array(&[*var], &[*var_span], *source, body, out),
+                _ => self.for_over_array(&[*var], &[*var_span], *source, body, *label, out),
             },
             Stmt::ForArray {
                 binders,
                 binder_spans,
                 source,
                 body,
-            } => self.for_over_array(binders, binder_spans, *source, body, out),
+                label,
+            } => self.for_over_array(binders, binder_spans, *source, body, *label, out),
             Stmt::IndexedAssign {
                 target,
                 target_span,
@@ -106,6 +128,48 @@ impl Desugarer<'_> {
                 let indices = [*row, *col];
                 self.element_assignment(*target, *target_span, &indices, *value, *compound_op, out)
             }
+        }
+    }
+
+    /// Runs `inside` — a loop body — with the user's loop on the stack `break` and `continue`
+    /// resolve against. `ir_loops` is how many structured loops it becomes: two for a matrix.
+    pub(super) fn in_loop<T>(
+        &mut self,
+        label: Option<Label>,
+        ir_loops: u32,
+        inside: impl FnOnce(&mut Self) -> T,
+    ) -> T {
+        self.function.loops.push(UserLoop {
+            label: label.map(|label| label.name),
+            ir_loops,
+        });
+        let result = inside(self);
+        self.function.loops.pop();
+        result
+    }
+
+    /// The depth a `break` (or, with `leaves` false, a `continue`) acts at: the structured loops
+    /// opened by the user loops inside its target, then — to leave it — every loop the target
+    /// opened but its outermost; to continue it, none, so its innermost loop steps.
+    fn loop_exit_depth(&self, label: Option<Label>, leaves: bool) -> u32 {
+        let loops = &self.function.loops;
+        let target = match label {
+            Some(label) => loops
+                .iter()
+                .rposition(|user_loop| user_loop.label == Some(label.name))
+                .expect("sema resolves every label"),
+            None => loops
+                .len()
+                .checked_sub(1)
+                .expect("sema rejects an exit outside a loop"),
+        };
+        let inside: u32 = loops[target + 1..]
+            .iter()
+            .map(|user_loop| user_loop.ir_loops)
+            .sum();
+        match leaves {
+            true => inside + loops[target].ir_loops - 1,
+            false => inside,
         }
     }
 

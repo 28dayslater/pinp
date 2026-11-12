@@ -157,6 +157,7 @@ impl Arena {
                     visit(value, Value);
                 }
             }
+            Break(_) | Continue(_) => {}
         }
     }
 

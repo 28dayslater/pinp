@@ -501,3 +501,100 @@ fn return_as_a_value_points_at_the_return() {
             .starts_with("2:9: error[PINP2001]: Return cannot be used as a value.")
     );
 }
+
+// --- break, continue, and loop labels (0019) -----------------------------------------------
+
+#[test]
+fn break_or_continue_as_a_value_points_at_the_keyword() {
+    for (keyword, code, message) in [
+        ("break", "PINP2002", "Break cannot be used as a value."),
+        (
+            "continue",
+            "PINP2003",
+            "Continue cannot be used as a value.",
+        ),
+    ] {
+        let src = indoc! {"
+            while true
+                x = KEYWORD
+        "}
+        .replace("KEYWORD", keyword);
+        assert_eq!(parse_failure(&src), (2, 9, keyword.to_string()));
+        assert!(
+            parse_error(&src)
+                .render(&LineIndex::new(&src))
+                .starts_with(&format!("2:9: error[{code}]: {message}")),
+            "in:\n{src}"
+        );
+    }
+}
+
+#[test]
+fn a_misplaced_break_or_continue_points_at_the_whole_statement() {
+    for (src, place, rendered) in [
+        (
+            indoc! {"
+                x = 1
+                break
+            "},
+            (2, 1, "break"),
+            "2:1: error[PINP3007]: Break outside a loop.",
+        ),
+        (
+            indoc! {"
+                f() is
+                    continue
+                f()
+            "},
+            (2, 5, "continue"),
+            "2:5: error[PINP3008]: Continue outside a loop.",
+        ),
+        (
+            indoc! {"
+                for i in 1..3
+                    break @rows
+            "},
+            (2, 5, "break @rows"),
+            "2:5: error[PINP3009]: No loop labelled `@rows` around this statement.",
+        ),
+        (
+            indoc! {"
+                for i in 1..3
+                    continue @rows
+            "},
+            (2, 5, "continue @rows"),
+            "2:5: error[PINP3009]: No loop labelled `@rows` around this statement.",
+        ),
+    ] {
+        assert_eq!(
+            sema_failure(src),
+            (place.0, place.1, place.2.to_string()),
+            "in:\n{src}"
+        );
+        assert_eq!(sema_rendered(src), rendered, "in:\n{src}");
+    }
+}
+
+#[test]
+fn a_shadowing_label_points_at_the_inner_label() {
+    let src = indoc! {"
+        for i in 1..3 @rows
+            for j in 1..3 @rows
+                j
+    "};
+    assert_eq!(sema_failure(src), (2, 19, "@rows".to_string()));
+    assert_eq!(
+        sema_rendered(src),
+        "2:19: error[PINP3010]: Loop label `@rows` already names an enclosing loop."
+    );
+}
+
+#[test]
+fn a_stray_at_sign_points_at_itself() {
+    let src = indoc! {"
+        for i in 1..3 @
+            i
+    "};
+    assert_eq!(lex_failure(src).0, 1);
+    assert_eq!(lex_failure(src).1, 15);
+}

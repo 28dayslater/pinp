@@ -25,6 +25,9 @@ use pinp::codegen::{PinpJit, PinpValue};
 /// A literal comfortably past the 15-byte inline maximum, so it must be heap-allocated.
 const LONG: &str = "a string that is certainly longer than fifteen bytes";
 
+// TODO(KI-0008): arrays are never freed yet, so no test here may use one; add the array leak
+// tests once array ownership lands.
+
 /// Compiles and runs `src`, asserting that it used the heap and gave every byte back, and returns
 /// its value.
 ///
@@ -645,4 +648,44 @@ fn a_return_frees_a_string_assigned_later_in_the_loop_on_an_earlier_pass() {
         LONG
     ));
     assert_eq!(value, PinpValue::Int(2));
+}
+
+// --- break and continue (0019) -----------------------------------------------------------------
+
+#[test]
+fn strings_assigned_in_a_loop_left_by_break_or_continue_balance() {
+    for exit in ["break", "continue", "break @rows", "continue @rows"] {
+        let src = format!(
+            indoc! {"
+                build(n: int): str is
+                    kept = '{0}'
+                    for i in 1..n @rows
+                        for j in 1..2
+                            piece = kept + str(i)
+                            if i == 2
+                                {1}
+                            kept = piece
+                    kept
+                build(4)
+            "},
+            LONG, exit
+        );
+        run_balanced(&src);
+    }
+}
+
+#[test]
+fn a_string_overwritten_on_the_pass_after_a_continue_is_freed() {
+    let value = run_balanced(&format!(
+        indoc! {"
+            last = ''
+            for i in 1..4
+                last = '{0}' + str(i)
+                if i < 4
+                    continue
+            last
+        "},
+        LONG
+    ));
+    assert_eq!(as_str(value), format!("{LONG}4"));
 }

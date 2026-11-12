@@ -2410,3 +2410,419 @@ fn return_is_not_an_assignment_target() {
         .is_err()
     );
 }
+
+// --- break, continue, and loop labels (0019) -----------------------------------------------
+
+/// The loop statement `stmt`'s label, by name and source text.
+fn label_of<'src>(
+    ast: &ProgramAst<'src>,
+    src: &'src str,
+    stmt: &Stmt,
+) -> Option<(&'src str, &'src str)> {
+    let label = match stmt {
+        Stmt::While { label, .. }
+        | Stmt::Loop { label, .. }
+        | Stmt::For { label, .. }
+        | Stmt::ForArray { label, .. } => label,
+        other => panic!("Not a loop: {other:?}."),
+    };
+    label.map(|label| (ast.names[label.name.value()], label.span.text(src)))
+}
+
+/// Every `break`/`continue` in `block`, at any depth, as `(keyword, label name, statement text)`.
+fn loop_exits_in<'src>(
+    ast: &ProgramAst<'src>,
+    src: &'src str,
+    block: &Block,
+) -> Vec<(&'static str, Option<&'src str>, &'src str)> {
+    let mut found = Vec::new();
+    let in_expr = |found: &mut Vec<_>, expr_id: ExprId| {
+        if let Node::If { arms, else_block } = ast.node(expr_id) {
+            for arm in arms {
+                found.extend(loop_exits_in(ast, src, &arm.body));
+            }
+            if let Some(else_block) = else_block {
+                found.extend(loop_exits_in(ast, src, else_block));
+            }
+        }
+    };
+    for stmt in &block.stmts {
+        match stmt {
+            Stmt::Break { label, span } | Stmt::Continue { label, span } => {
+                let keyword = match stmt {
+                    Stmt::Break { .. } => "break",
+                    _ => "continue",
+                };
+                let name = label.map(|label| ast.names[label.name.value()]);
+                found.push((keyword, name, span.text(src)));
+            }
+            Stmt::While { body, .. }
+            | Stmt::Loop { body, .. }
+            | Stmt::For { body, .. }
+            | Stmt::ForArray { body, .. } => found.extend(loop_exits_in(ast, src, body)),
+            Stmt::Expr(expr_id) => in_expr(&mut found, *expr_id),
+            _ => {}
+        }
+    }
+    if let Some(result) = block.result {
+        in_expr(&mut found, result);
+    }
+    found
+}
+
+/// The top-level statements of `ast`, in order.
+fn top_statements<'ast>(ast: &'ast ProgramAst) -> Vec<&'ast Stmt> {
+    ast.top_level
+        .iter()
+        .filter_map(|element| match element {
+            TopLevel::Stmt(stmt) => Some(stmt),
+            TopLevel::Func(_) => None,
+        })
+        .collect()
+}
+
+#[test]
+fn every_loop_kind_takes_a_trailing_label() {
+    for (src, name) in [
+        (
+            indoc! {"
+                while true @spin
+                    break
+            "},
+            "spin",
+        ),
+        (
+            indoc! {"
+                loop @retry
+                    break
+                until true
+            "},
+            "retry",
+        ),
+        (
+            indoc! {"
+                loop @again
+                    break
+                while false
+            "},
+            "again",
+        ),
+        (
+            indoc! {"
+                for i in 1..3 @rows
+                    break
+            "},
+            "rows",
+        ),
+        (
+            indoc! {"
+                for i, v in [1, 2] @items
+                    break
+            "},
+            "items",
+        ),
+        (
+            indoc! {"
+                for r, c, v in [1, 2; 3, 4] @cells
+                    break
+            "},
+            "cells",
+        ),
+    ] {
+        let ast = parse_ok(src);
+        let label = label_of(&ast, src, top_statements(&ast)[0]);
+        assert_eq!(label, Some((name, &*format!("@{name}"))), "in:\n{src}");
+    }
+}
+
+#[test]
+fn an_unlabelled_loop_has_no_label() {
+    let src = indoc! {"
+        for i in 1..3
+            i
+    "};
+    let ast = parse_ok(src);
+    assert_eq!(label_of(&ast, src, top_statements(&ast)[0]), None);
+}
+
+#[test]
+fn a_label_ends_the_header_expression() {
+    // `n @rows` — a label is no operand, so the range stops at `n`.
+    let src = indoc! {"
+        n = 3
+        for i in 1..n @rows
+            i
+    "};
+    let ast = parse_ok(src);
+    let Stmt::For { source, .. } = top_statements(&ast)[1] else {
+        panic!("Expected a for.");
+    };
+    assert_eq!(ast.span_of(*source).text(src), "1..n");
+    for src in [
+        indoc! {"
+            for i in 1..<10:2 @rows
+                i
+        "},
+        indoc! {"
+            c = true
+            while c and not c @spin
+                c = false
+        "},
+        indoc! {"
+            for v in [1, 2][0..1] @items
+                v
+        "},
+        indoc! {"
+            c = true
+            for v in [1] if c else [2] @items
+                v
+        "},
+    ] {
+        let ast = parse_ok(src);
+        let loop_stmt = *top_statements(&ast).last().unwrap();
+        assert!(label_of(&ast, src, loop_stmt).is_some(), "in:\n{src}");
+    }
+}
+
+#[test]
+fn break_and_continue_parse_with_and_without_a_label_in_every_loop_kind() {
+    let src = indoc! {"
+        for i in 1..3 @outer
+            while true
+                break
+            loop
+                continue
+            until true
+            for j in 1..3
+                if j == 2
+                    break @outer
+                else
+                    continue @outer
+            for k, v in [1]
+                continue
+    "};
+    let ast = parse_ok(src);
+    let Stmt::For { body, .. } = top_statements(&ast)[0] else {
+        panic!("Expected a for.");
+    };
+    assert_eq!(
+        loop_exits_in(&ast, src, body),
+        [
+            ("break", None, "break"),
+            ("continue", None, "continue"),
+            ("break", Some("outer"), "break @outer"),
+            ("continue", Some("outer"), "continue @outer"),
+            ("continue", None, "continue"),
+        ]
+    );
+}
+
+#[test]
+fn break_and_continue_end_at_a_line_end_a_dedent_a_comment_or_the_end_of_input() {
+    let at_end_of_input = indoc! {"
+        while true
+            break
+    "}
+    .trim_end();
+    for src in [
+        at_end_of_input,
+        indoc! {"
+            while true
+                break # done
+        "},
+        indoc! {"
+            while true
+                if true
+                    continue
+                break
+        "},
+    ] {
+        let ast = parse_ok(src);
+        let Stmt::While { body, .. } = top_statements(&ast)[0] else {
+            panic!("Expected a while.");
+        };
+        assert!(!loop_exits_in(&ast, src, body).is_empty(), "in {src:?}");
+    }
+}
+
+#[test]
+fn statements_after_break_or_continue_still_parse() {
+    let src = indoc! {"
+        while true
+            break
+            x = 1
+            continue
+            y = 2
+    "};
+    let ast = parse_ok(src);
+    let Stmt::While { body, .. } = top_statements(&ast)[0] else {
+        panic!("Expected a while.");
+    };
+    assert_eq!(body.stmts.len(), 4);
+}
+
+#[test]
+fn break_and_continue_outside_a_loop_parse_and_are_left_to_sema() {
+    for src in [
+        "break",
+        "continue @rows",
+        indoc! {"
+            f() is
+                break
+        "},
+    ] {
+        assert!(parse(src).is_ok(), "in {src:?}");
+    }
+}
+
+#[test]
+fn break_and_continue_cannot_be_used_as_values() {
+    for (keyword, code, message) in [
+        (
+            "break",
+            DiagnosticCode::BreakAsValue,
+            "Break cannot be used as a value.",
+        ),
+        (
+            "continue",
+            DiagnosticCode::ContinueAsValue,
+            "Continue cannot be used as a value.",
+        ),
+    ] {
+        for template in [
+            "f(): int is KEYWORD",
+            indoc! {"
+                while true
+                    x = KEYWORD
+            "},
+            indoc! {"
+                while true
+                    1 + KEYWORD
+            "},
+            indoc! {"
+                while true
+                    x = 1 if true else KEYWORD
+            "},
+            indoc! {"
+                g(n: int): int is n
+                while true
+                    g(KEYWORD)
+            "},
+            indoc! {"
+                while true
+                    [KEYWORD]
+            "},
+            indoc! {"
+                while true
+                    (KEYWORD @rows)
+            "},
+            indoc! {"
+                f(): int is
+                    while true
+                        return KEYWORD
+                    0
+            "},
+            indoc! {"
+                while true
+                    x = -KEYWORD
+            "},
+        ] {
+            let src = template.replace("KEYWORD", keyword);
+            let kind = parse_error(&src);
+            assert_eq!(
+                kind,
+                ParseErrorKind::Coded(code, message.into()),
+                "in:\n{src}"
+            );
+            assert_eq!(kind.code(), Some(code));
+        }
+    }
+}
+
+#[test]
+fn break_and_continue_take_no_value_and_only_an_at_label() {
+    for src in [
+        indoc! {"
+            while true
+                break 1
+        "},
+        indoc! {"
+            while true
+                continue rows
+        "},
+        indoc! {"
+            while true @rows
+                break @rows @rows
+        "},
+        indoc! {"
+            while true @rows
+                break @rows + 1
+        "},
+    ] {
+        assert!(parse(src).is_err(), "in:\n{src}");
+    }
+}
+
+#[test]
+fn a_label_stands_only_after_a_loop_header_or_break_or_continue() {
+    for src in [
+        // On an `if`.
+        indoc! {"
+            if true @branch
+                1
+        "},
+        // After the `until` condition rather than on the `loop` line.
+        indoc! {"
+            loop
+                break
+            until true @retry
+        "},
+        // At the start of a statement.
+        indoc! {"
+            @rows
+            for i in 1..3
+                i
+        "},
+        // In an expression.
+        "x = @rows",
+        "x = 1 + @rows",
+        // Two labels on one header.
+        indoc! {"
+            for i in 1..3 @rows @cols
+                i
+        "},
+        // A plain name is not a label.
+        indoc! {"
+            for i in 1..3 rows
+                i
+        "},
+        // On the line below the header.
+        indoc! {"
+            for i in 1..3
+                @rows
+        "},
+        // On a function header.
+        indoc! {"
+            f() is @body
+                1
+        "},
+    ] {
+        assert!(parse(src).is_err(), "in:\n{src}");
+    }
+}
+
+#[test]
+fn break_and_continue_are_not_assignment_targets() {
+    for src in [
+        indoc! {"
+            while true
+                break = 1
+        "},
+        indoc! {"
+            while true
+                continue += 1
+        "},
+    ] {
+        assert!(parse(src).is_err(), "in:\n{src}");
+    }
+}

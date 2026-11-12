@@ -155,7 +155,7 @@ ones marked **skeleton** change the IR's structure, so they are decided before t
 | Feature | Decision | IR impact |
 |---|---|---|
 | `return` | **done** ([0018](../specs/0018-return.md)) | a structured `Return` statement; `flatten` ends its block with the `Return` terminator |
-| `break` / `continue` | planned | structured statements that leave an enclosing body; `flatten` makes them edges |
+| `break` / `continue` | **done** ([0019](../specs/0019-loops.md)), with trailing `@label`s | structured `Break`/`Continue` carrying a loop depth; `flatten` makes them gotos |
 | recursion | planned | none in the IR; interprocedural summaries over strongly connected components |
 | closures | planned; **captures are immutable** | `MakeClosure { function, captures }`, an indirect call, function types |
 | algebraic data types + `match` | planned | see below — additive, but the largest item |

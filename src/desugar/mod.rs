@@ -94,6 +94,14 @@ struct FunctionState {
     return_type: Option<PinpType>,
     /// Whether a `return` was desugared, so [`Desugarer::finish`] has frees to place before it.
     has_returns: bool,
+    /// The user's loops around the statement being desugared, innermost last.
+    loops: Vec<UserLoop>,
+}
+
+/// A loop as the user wrote it: what `break @label` names, and how many structured loops it became.
+struct UserLoop {
+    label: Option<SymId>,
+    ir_loops: u32,
 }
 
 struct Desugarer<'ast> {

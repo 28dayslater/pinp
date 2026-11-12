@@ -497,6 +497,14 @@ impl<'src> Parser<'src> {
                 DiagnosticCode::ReturnAsValue,
                 "Return cannot be used as a value.".into(),
             )),
+            TokenKind::KwBreak => Err(ParseErrorKind::Coded(
+                DiagnosticCode::BreakAsValue,
+                "Break cannot be used as a value.".into(),
+            )),
+            TokenKind::KwContinue => Err(ParseErrorKind::Coded(
+                DiagnosticCode::ContinueAsValue,
+                "Continue cannot be used as a value.".into(),
+            )),
             TokenKind::Int => {
                 let token = self.advance();
                 let value = parse_int(token.text)?;

@@ -74,6 +74,10 @@ enum Lexeme {
     // Logos longest-match ensures `_foo` → `Identifier`, bare `_` → `Underscore`.
     #[token("_")]
     Underscore,
+    // A loop label: `@` glued to a name. One token, so `@` alone stays an error and no
+    // expression can swallow it.
+    #[regex(r"@_*[a-zA-Z][a-zA-Z0-9_]*")]
+    Label,
 
     // Compound-assignment operators. Each is a single contiguous token (longest-match
     // beats the bare operator). `div=`/`mod=` likewise beat the identifiers `div`/`mod`,
@@ -213,9 +217,13 @@ pub enum TokenKind {
     KwLoop,
     KwFor,
     KwReturn,
+    KwBreak,
+    KwContinue,
     KwIn,
     /// The bare `_` character: the don't-care binder in `for` loops.
     Underscore,
+    /// `@name`, a loop label; its text keeps the `@`.
+    Label,
     Newline,
     Indent,
     Dedent,
@@ -390,10 +398,13 @@ pub fn lex(src: &str) -> Result<Vec<Token<'_>>, LexError> {
                 "loop" => TokenKind::KwLoop,
                 "for" => TokenKind::KwFor,
                 "return" => TokenKind::KwReturn,
+                "break" => TokenKind::KwBreak,
+                "continue" => TokenKind::KwContinue,
                 "in" => TokenKind::KwIn,
                 _ => TokenKind::Identifier,
             },
             Lexeme::Underscore => TokenKind::Underscore,
+            Lexeme::Label => TokenKind::Label,
             Lexeme::PlusEq => TokenKind::PlusEq,
             Lexeme::MinusEq => TokenKind::MinusEq,
             Lexeme::StarEq => TokenKind::StarEq,
@@ -602,6 +613,50 @@ mod tests {
                 KwReturn, Identifier, Identifier, Identifier, Identifier, Eof
             ]
         );
+    }
+
+    #[test]
+    fn break_and_continue_are_keywords_only_as_whole_words() {
+        use TokenKind::*;
+        assert_eq!(
+            kinds("break continue breaks continue_at _break Continue"),
+            vec![
+                KwBreak, KwContinue, Identifier, Identifier, Identifier, Identifier, Eof
+            ]
+        );
+    }
+
+    #[test]
+    fn an_at_sign_glued_to_a_name_is_one_label_token() {
+        use TokenKind::*;
+        let tokens = lex("for i in 1..3 @rows").unwrap();
+        let label = &tokens[6];
+        assert_eq!(label.kind, Label);
+        assert_eq!(label.text, "@rows");
+        assert_eq!(
+            kinds("@a1 @_x @rows_2 @break"),
+            vec![Label, Label, Label, Label, Eof]
+        );
+    }
+
+    #[test]
+    fn a_label_ends_where_a_name_would() {
+        use TokenKind::*;
+        assert_eq!(kinds("@rows+1"), vec![Label, Plus, Int, Eof]);
+        assert_eq!(kinds("break @rows # done"), vec![KwBreak, Label, Eof]);
+    }
+
+    #[test]
+    fn an_at_sign_without_a_name_glued_to_it_is_an_error() {
+        for src in ["@", "@ rows", "@1", "@_", "x @", "@@rows", "@'s'"] {
+            let error = lex(src).unwrap_err();
+            // logos may take the `_` of `@_` into the failed lexeme; the `@` starts it either way.
+            assert!(
+                error.message.starts_with("Unexpected character `@"),
+                "in {src:?}: {}",
+                error.message
+            );
+        }
     }
 
     #[test]

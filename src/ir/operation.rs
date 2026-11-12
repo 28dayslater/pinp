@@ -212,6 +212,12 @@ pub enum Operation {
     /// Leaves the function with `value` (none for `void`). At the flat level the block's
     /// terminator returns instead.
     Return(Option<NodeId>),
+    /// Leaves a loop: the innermost one at depth 0, the one around it at 1, and so on. At the flat
+    /// level it is a jump to that loop's exit.
+    Break(u32),
+    /// Ends the current pass of a loop, counted as for [`Break`](Operation::Break): it goes on to
+    /// that loop's test, condition, or step.
+    Continue(u32),
 }
 
 const _: () = assert!(size_of::<Operation>() == 16);
@@ -222,9 +228,13 @@ impl Operation {
         use Operation::*;
         match self {
             Binary { op, .. } => !matches!(op, BinOp::And | BinOp::Or | BinOp::IntDiv | BinOp::Mod),
-            If { .. } | While { .. } | DoWhile { .. } | CountedLoop { .. } | Return(_) => {
-                level == Level::Structured
-            }
+            If { .. }
+            | While { .. }
+            | DoWhile { .. }
+            | CountedLoop { .. }
+            | Return(_)
+            | Break(_)
+            | Continue(_) => level == Level::Structured,
             _ => true,
         }
     }
@@ -244,6 +254,8 @@ impl Operation {
                 | DoWhile { .. }
                 | CountedLoop { .. }
                 | Return(_)
+                | Break(_)
+                | Continue(_)
         )
     }
 

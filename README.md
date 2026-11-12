@@ -93,13 +93,78 @@ sign(n: int): int is
     1
 ```
 
-Ranges and `for … in`:
+#### Loops
+
+`while` tests before each pass; `loop … until` (or `loop … while`) runs the body first and tests
+after it:
+
+```
+i = 1
+while i < 100
+    i *= 2
+i  # 128
+
+n = 0
+loop
+    n += 1
+until n * n > 50
+n  # 8
+```
+
+`for … in` walks a range. `..` includes the end, `..<` stops before it, `..>` counts down to just
+above it, and `:step` sets the step:
+
+```
+for i in 1..5       # 1, 2, 3, 4, 5
+for i in 0..<5      # 0, 1, 2, 3, 4
+for i in 10..>0:-3  # 10, 7, 4, 1
+for i in 1..10:4    # 1, 5, 9
+for i in 5..1       # 5, 4, 3, 2, 1
+```
+
+It walks arrays too — the values alone, or each index with its value — and matrices, row by row,
+with the row and column if asked for:
 
 ```
 total = 0
-for idx in 1..13:2  # for idx in 1,3,5,7,9,11,13
-    total += idx
-total  # total: 49
+for v in [3, 1, 4]
+    total += v               # 8
+
+for i, v in [3, 1, 4]
+    total += i * v           # 0*3 + 1*1 + 2*4
+
+for r, c, v in [1, 2; 3, 4]
+    if r == c
+        total += v           # the diagonal: 1 + 4
+```
+
+The same `for` builds an array in one line:
+
+```
+squares = [i * i for i in 1..5]  # [1, 4, 9, 16, 25]
+```
+
+`continue` skips to the next pass and `break` leaves the loop:
+
+```
+odd = 0
+for i in 1..10
+    if i mod 2 == 0
+        continue
+    odd += i
+odd  # 25
+```
+
+A trailing `@label` names a loop, so `break` and `continue` can reach it from inside another:
+
+```
+found = 0
+for i in 1..9 @rows
+    for j in 1..9
+        if i * j == 42
+            found = i * 10 + j
+            break @rows
+found  # 67
 ```
 
 There is no language manual yet. For the time being, the specs and tests give an idea of the

@@ -666,4 +666,131 @@ mod tests {
         "};
         assert!(diagnostics_in(src, 0).is_empty());
     }
+
+    // --- break and continue (0019) ---------------------------------------------------------
+
+    #[test]
+    fn a_write_before_break_read_after_the_loop_is_clean() {
+        for src in [
+            indoc! {"
+                f(n: int): int is
+                    t = 0
+                    for i in 1..n
+                        if i == 3
+                            t = i * 2
+                            break
+                    t
+                f(1)
+            "},
+            indoc! {"
+                f(n: int): int is
+                    t = 0
+                    for i in 1..n @outer
+                        while true
+                            t = i
+                            break @outer
+                    t
+                f(1)
+            "},
+        ] {
+            assert!(diagnostics_in(src, 0).is_empty(), "in:\n{src}");
+        }
+    }
+
+    #[test]
+    fn a_write_before_continue_read_by_the_condition_or_the_next_pass_is_clean() {
+        for src in [
+            indoc! {"
+                f(n: int): int is
+                    i = 0
+                    loop
+                        i += 1
+                        if i < 3
+                            continue
+                        i += 1
+                    until i > n
+                    i
+                f(1)
+            "},
+            indoc! {"
+                f(n: int): int is
+                    t = 0
+                    last = 0
+                    for i in 1..n
+                        t += last
+                        last = i
+                        if i == 2
+                            continue
+                        last = 0
+                    t
+                f(1)
+            "},
+        ] {
+            assert!(diagnostics_in(src, 0).is_empty(), "in:\n{src}");
+        }
+    }
+
+    #[test]
+    fn a_write_read_only_by_the_part_of_the_pass_a_continue_skips_is_a_dead_store() {
+        let src = indoc! {"
+            f(n: int): int is
+                t = 0
+                for i in 1..n
+                    u = i * 2
+                    if i == 2
+                        u = 5
+                        continue
+                    t += u
+                t
+            f(1)
+        "};
+        assert_eq!(diagnostics_in(src, 0), found(&[("dead-store", "u")]));
+    }
+
+    #[test]
+    fn a_write_followed_only_by_break_past_every_read_is_a_dead_store() {
+        let src = indoc! {"
+            f(n: int): int is
+                t = 0
+                for i in 1..n
+                    if i == 2
+                        t = 9
+                        break
+                    t += i
+                0
+            f(1)
+        "};
+        // `t` is read in the loop, so `t = 0` and `t += i` are fine; `t = 9` is never read.
+        assert_eq!(diagnostics_in(src, 0), found(&[("dead-store", "t")]));
+    }
+
+    #[test]
+    fn a_continue_keeps_the_counted_index_live_for_the_step() {
+        let src = indoc! {"
+            f(n: int): int is
+                t = 0
+                for i in 1..n
+                    if i == 2
+                        continue
+                    t += i
+                t
+            f(1)
+        "};
+        assert!(diagnostics_in(src, 0).is_empty());
+    }
+
+    #[test]
+    fn break_and_continue_at_the_top_level_keep_globals_live() {
+        let src = indoc! {"
+            found = 0
+            for i in 1..9
+                if i mod 2 == 0
+                    continue
+                if i > 4
+                    found = i
+                    break
+            found
+        "};
+        assert!(diagnostics(src).is_empty());
+    }
 }

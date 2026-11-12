@@ -904,3 +904,303 @@ fn a_return_inside_a_while_leaves_the_loop_exit_reachable() {
         "{text}"
     );
 }
+
+// --- break and continue (0019) -----------------------------------------------------------
+
+#[test]
+fn a_break_jumps_to_the_loop_exit_and_code_after_it_lands_in_a_block_nothing_enters() {
+    assert_eq!(
+        flattened(indoc! {"
+            i = 0
+            while i < 9
+                if i == 3
+                    break
+                i += 1
+            i
+        "}),
+        indoc! {"
+            function f0 (0 parameters), flat
+            block0 (entry)
+              write_global g0 i
+                constant 0: int
+              goto block1
+            block1
+              branch block2 block3
+                less: bool
+                  read_global g0 i: int
+                  constant 9: int
+            block2
+              branch block4 block5
+                equal: bool
+                  read_global g0 i: int
+                  constant 3: int
+            block3
+              return
+                read_global g0 i: int
+            block4
+              goto block3
+            block5
+              write_global g0 i
+                add: int
+                  read_global g0 i: int
+                  constant 1: int
+              goto block1
+            block6
+              goto block5
+        "}
+    );
+}
+
+#[test]
+fn a_continue_in_a_while_jumps_back_to_the_test() {
+    let text = flat_function(
+        indoc! {"
+            f(n: int): int is
+                i = 0
+                while i < n
+                    i += 1
+                    if i == 2
+                        continue
+                    i += 1
+                i
+            f(5)
+        "},
+        0,
+    );
+    // Header block1; the `if`'s then-block is block4.
+    assert_eq!(block_lines(&text, "block4"), ["  goto block1"], "{text}");
+}
+
+#[test]
+fn a_continue_in_a_loop_until_jumps_to_a_block_of_its_own_that_tests_the_condition() {
+    assert_eq!(
+        flat_function(
+            indoc! {"
+                f(): int is
+                    i = 0
+                    loop
+                        i += 1
+                        if i == 2
+                            continue
+                        i += 10
+                    until i > 30
+                    i
+                f()
+            "},
+            0
+        ),
+        indoc! {"
+            function f0 f (0 parameters), flat
+            locals
+              l0 i: int
+            block0 (entry)
+              write_local l0 i
+                constant 0: int
+              goto block1
+            block1
+              write_local l0 i
+                add: int
+                  read_local l0 i: int
+                  constant 1: int
+              branch block3 block4
+                equal: bool
+                  read_local l0 i: int
+                  constant 2: int
+            block2
+              return
+                read_local l0 i: int
+            block3
+              goto block5
+            block4
+              write_local l0 i
+                add: int
+                  read_local l0 i: int
+                  constant 10: int
+              goto block5
+            block5
+              branch block2 block1
+                greater: bool
+                  read_local l0 i: int
+                  constant 30: int
+            block6
+              goto block4
+        "}
+    );
+}
+
+#[test]
+fn a_loop_without_continue_keeps_its_condition_in_the_body_block() {
+    // The condition block exists only for a `continue` to jump to.
+    let text = flat_function(
+        indoc! {"
+            f(): int is
+                i = 0
+                loop
+                    i += 1
+                    if i == 2
+                        break
+                until i > 30
+                i
+            f()
+        "},
+        0,
+    );
+    assert_eq!(
+        terminators(&text),
+        [
+            "goto block1",
+            "branch block3 block4",
+            "return",
+            "goto block2",
+            "branch block2 block1",
+            "goto block4",
+        ],
+        "{text}"
+    );
+}
+
+#[test]
+fn a_counted_loop_whose_body_ends_in_continue_still_steps() {
+    let text = flat_function(
+        indoc! {"
+            f(n: int): int is
+                for i in 1..n
+                    continue
+                n
+            f(3)
+        "},
+        0,
+    );
+    assert_eq!(count_lines(&text, "write_local l1 i"), 2, "{text}");
+}
+
+#[test]
+fn a_counted_loop_whose_body_ends_in_break_does_not_step() {
+    let text = flat_function(
+        indoc! {"
+            f(n: int): int is
+                for i in 1..n
+                    break
+                n
+            f(3)
+        "},
+        0,
+    );
+    assert_eq!(count_lines(&text, "write_local l1 i"), 1, "{text}");
+}
+
+#[test]
+fn a_step_reached_by_both_the_body_end_and_a_continue_is_generated_once() {
+    let text = flat_function(
+        indoc! {"
+            f(n: int): int is
+                t = 0
+                for i in 1..n
+                    if i == 2
+                        continue
+                    t += i
+                t
+            f(3)
+        "},
+        0,
+    );
+    assert_eq!(count_lines(&text, "write_local l2 i"), 2, "{text}");
+}
+
+#[test]
+fn a_labelled_break_jumps_past_every_inner_loop() {
+    let text = flat_function(
+        indoc! {"
+            f(): int is
+                for i in 1..3 @outer
+                    while true
+                        break @outer
+                0
+            f()
+        "},
+        0,
+    );
+    // The counted loop's exit is block3; the `while` body is block5.
+    assert_eq!(block_lines(&text, "block5"), ["  goto block3"], "{text}");
+    // The inner loop's exit is reachable through its own test, so the outer still steps.
+    assert_eq!(count_lines(&text, "write_local l0 i"), 2, "{text}");
+}
+
+#[test]
+fn a_labelled_continue_steps_the_outer_loop_once() {
+    let text = flat_function(
+        indoc! {"
+            f(n: int): int is
+                for i in 1..n @outer
+                    for j in 1..n
+                        continue @outer
+                n
+            f(3)
+        "},
+        0,
+    );
+    assert_eq!(count_lines(&text, "write_local l1 i"), 2, "{text}");
+    // The inner body ends in the jump; it never steps `j`.
+    assert_eq!(count_lines(&text, "write_local l2 j"), 1, "{text}");
+}
+
+#[test]
+fn a_loop_until_whose_body_always_breaks_is_left_through_the_break() {
+    // Nothing reaches the condition, but the break reaches the exit: the function still returns.
+    let text = flat_function(
+        indoc! {"
+            g = 0
+            f() is
+                loop
+                    ::g = 1
+                    break
+                until true
+            f()
+        "},
+        0,
+    );
+    // The exit is block2; the condition, in the block after the break, is never reached.
+    assert_eq!(block_lines(&text, "block2"), ["  return"], "{text}");
+    assert!(!text.contains("unreachable"), "{text}");
+}
+
+#[test]
+fn an_outer_loop_until_reached_only_by_an_inner_continue_is_still_tested() {
+    let text = flat_function(
+        indoc! {"
+            g = 0
+            f() is
+                loop @outer
+                    for i in 1..3
+                        continue @outer
+                    return
+                until ::g > 0
+            f()
+        "},
+        0,
+    );
+    assert!(!text.contains("unreachable"), "{text}");
+}
+
+#[test]
+fn a_matrix_for_is_left_by_one_break_and_stepped_by_one_continue() {
+    let text = flat_function(
+        indoc! {"
+            f(): int is
+                t = 0
+                for v in [1, 2; 3, 4]
+                    if v == 2
+                        continue
+                    if v == 3
+                        break
+                    t += v
+                t
+            f()
+        "},
+        0,
+    );
+    // Both indices are stepped: the column by the body end and the continue, the row after the
+    // column loop ends.
+    assert_eq!(count_lines(&text, "write_local l2"), 2, "{text}");
+    assert_eq!(count_lines(&text, "write_local l3"), 2, "{text}");
+}

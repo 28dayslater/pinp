@@ -162,6 +162,7 @@ pub fn analyze(ast: &mut ProgramAst) -> Result<(), SemaError> {
         current_span: Span::UNKNOWN,
         loop_vars: Vec::new(),
         current_function: None,
+        loops: Vec::new(),
     };
     for item in top_level.iter() {
         let result = match item {
@@ -203,4 +204,8 @@ struct Analyzer<'ast, 'src> {
     /// The function being analysed, by name and return type; `None` at the top level, where
     /// `return` is an error.
     current_function: Option<(SymId, PinpType)>,
+    /// The loops around the statement being analysed, innermost last, by label. Functions are
+    /// defined only at the top level, so a function's body starts with this empty: `break` never
+    /// reaches a caller's loop.
+    loops: Vec<Option<SymId>>,
 }

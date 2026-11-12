@@ -12,7 +12,7 @@
 use super::stmt::Sink;
 use super::*;
 use crate::ir::RuntimeFunction;
-use crate::parser::{BinOp, Block, BuiltinMember, ExprId, Node, RangeKind, UnOp};
+use crate::parser::{BinOp, Block, BuiltinMember, ExprId, Label, Node, RangeKind, UnOp};
 
 impl Desugarer<'_> {
     /// `[e0, e1, …]`, or `[r0e0, …; r1e0, …]` given its elements row by row.
@@ -407,6 +407,7 @@ impl Desugarer<'_> {
         binder_spans: &[Span],
         source: ExprId,
         block: &Block,
+        label: Option<Label>,
         out: &mut Vec<NodeId>,
     ) {
         let span = self.ast.span_of(source);
@@ -447,7 +448,10 @@ impl Desugarer<'_> {
             let element = desugarer.push(get, element_type(array_type), span);
             let value_span = *binder_spans.last().expect("a for has a value binder");
             body.push(desugarer.write_local(value, element, value_span));
-            desugarer.scoped(|desugarer| desugarer.body_into(block, Sink::Effect, &mut body));
+            let ir_loops = dimensions.len() as u32;
+            desugarer.in_loop(label, ir_loops, |desugarer| {
+                desugarer.scoped(|desugarer| desugarer.body_into(block, Sink::Effect, &mut body))
+            });
         });
         let mut body = self.function.arena.list(&body);
         for (position, (&index, &dimension)) in indices.iter().zip(&dimensions).enumerate().rev() {

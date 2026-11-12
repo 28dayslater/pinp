@@ -2946,3 +2946,227 @@ fn every_return_shape_leaves_the_program_verifiable() {
         desugared(src);
     }
 }
+
+// ---------------------------------------------------------------------------
+// Break and continue (0019)
+// ---------------------------------------------------------------------------
+
+/// Every `break`/`continue` line of the printed IR, trimmed, in order.
+fn loop_exits(printed: &str) -> Vec<&str> {
+    printed
+        .lines()
+        .map(str::trim)
+        .filter(|line| line.starts_with("break ") || line.starts_with("continue "))
+        .collect()
+}
+
+#[test]
+fn a_break_in_a_while_becomes_a_structured_break_statement() {
+    assert_eq!(
+        desugared(indoc! {"
+            i = 0
+            while i < 9
+                if i == 3
+                    break
+                i += 1
+            i
+        "}),
+        indoc! {"
+            function f0 (0 parameters), structured
+            body
+              write_global g0 i
+                constant 0: int
+              while
+                less: bool
+                  read_global g0 i: int
+                  constant 9: int
+                body
+                  if
+                    equal: bool
+                      read_global g0 i: int
+                      constant 3: int
+                    then
+                      break 0
+                  write_global g0 i
+                    add: int
+                      read_global g0 i: int
+                      constant 1: int
+            result
+              read_global g0 i: int
+        "}
+    );
+}
+
+#[test]
+fn each_single_loop_kind_breaks_and_continues_at_depth_zero() {
+    for (src, expected) in [
+        (
+            indoc! {"
+                i = 0
+                while i < 9
+                    i += 1
+                    if i == 2
+                        continue
+                    break
+            "},
+            vec!["continue 0", "break 0"],
+        ),
+        (
+            indoc! {"
+                i = 0
+                loop
+                    i += 1
+                    if i == 2
+                        continue
+                    break
+                until i > 9
+            "},
+            vec!["continue 0", "break 0"],
+        ),
+        (
+            indoc! {"
+                for i in 1..9
+                    if i == 2
+                        continue
+                    break
+            "},
+            vec!["continue 0", "break 0"],
+        ),
+        (
+            indoc! {"
+                for i, v in [1, 2, 3]
+                    if v == 2
+                        continue
+                    break
+            "},
+            vec!["continue 0", "break 0"],
+        ),
+    ] {
+        assert_eq!(loop_exits(&desugared(src)), expected, "in:\n{src}");
+    }
+}
+
+#[test]
+fn a_break_leaves_both_loops_of_a_matrix_for_and_a_continue_steps_the_inner_one() {
+    for binders in ["v", "r, c, v"] {
+        let src = indoc! {"
+            t = 0
+            for BINDERS in [1, 2; 3, 4]
+                if v == 2
+                    continue
+                if v == 4
+                    break
+                t += v
+            t
+        "}
+        .replace("BINDERS", binders);
+        assert_eq!(
+            loop_exits(&desugared(&src)),
+            ["continue 0", "break 1"],
+            "in:\n{src}"
+        );
+    }
+}
+
+#[test]
+fn a_labelled_exit_counts_every_ir_loop_between_it_and_its_target() {
+    for (src, expected) in [
+        // Two plain loops: out of the inner one, then the outer.
+        (
+            indoc! {"
+                for i in 1..3 @outer
+                    for j in 1..3
+                        if j == 2
+                            break @outer
+                        continue @outer
+            "},
+            vec!["break 1", "continue 1"],
+        ),
+        // A label naming the innermost loop is the same as no label.
+        (
+            indoc! {"
+                for i in 1..3 @rows
+                    if i == 2
+                        continue @rows
+                    break @rows
+            "},
+            vec!["continue 0", "break 0"],
+        ),
+        // A matrix `for` outside a plain loop: leaving it crosses the plain loop and its two.
+        (
+            indoc! {"
+                for v in [1, 2; 3, 4] @cells
+                    while true
+                        if v == 2
+                            continue @cells
+                        break @cells
+            "},
+            vec!["continue 1", "break 2"],
+        ),
+        // A plain loop outside a matrix `for`: the matrix opens two loops to step out of.
+        (
+            indoc! {"
+                for i in 1..3 @outer
+                    for v in [1, 2; 3, 4]
+                        if v == 2
+                            continue @outer
+                        break @outer
+            "},
+            vec!["continue 2", "break 2"],
+        ),
+        // An unlabelled exit in a matrix `for` nested in another one.
+        (
+            indoc! {"
+                for v in [1, 2; 3, 4] @outer
+                    for w in [5, 6; 7, 8]
+                        if w == 6
+                            continue
+                        if w == 7
+                            break
+                        break @outer
+            "},
+            vec!["continue 0", "break 1", "break 3"],
+        ),
+    ] {
+        assert_eq!(loop_exits(&desugared(src)), expected, "in:\n{src}");
+    }
+}
+
+#[test]
+fn leaving_a_loop_frees_nothing() {
+    // String slots live for the whole function; only its exits free them.
+    let printed = desugared(indoc! {"
+        f(n: int): int is
+            for i in 1..n
+                s = str(i)
+                if i == 2
+                    continue
+                if i == 3
+                    break
+            n
+        f(4)
+    "});
+    let lines: Vec<&str> = printed.lines().collect();
+    for (index, line) in lines.iter().enumerate() {
+        let trimmed = line.trim();
+        if trimmed.starts_with("break ") || trimmed.starts_with("continue ") {
+            assert_eq!(frees_just_before(&lines, index), 0, "{printed}");
+        }
+    }
+}
+
+#[test]
+fn an_if_that_only_leaves_the_loop_is_a_statement() {
+    let printed = desugared(indoc! {"
+        for i in 1..9
+            if i > 2
+                break
+            else
+                continue
+    "});
+    assert!(
+        !printed.contains("locals\n  l1"),
+        "no result temporary:\n{printed}"
+    );
+    assert_eq!(loop_exits(&printed), ["break 0", "continue 0"]);
+}

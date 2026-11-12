@@ -3185,3 +3185,197 @@ fn return_and_unreachable_print_by_name() {
         "}
     );
 }
+
+// ---------------------------------------------------------------------------
+// Break and continue (0019)
+// ---------------------------------------------------------------------------
+
+impl Builder {
+    /// `while true` around `body`.
+    fn while_true(&mut self, body: &[NodeId]) -> NodeId {
+        let header = self.list(&[]);
+        let cond = self.boolean(true);
+        let body = self.list(body);
+        self.statement(Operation::While { header, cond, body })
+    }
+
+    /// `loop … until true` around `body`.
+    fn do_until_true(&mut self, body: &[NodeId]) -> NodeId {
+        let cond = self.boolean(true);
+        let body = self.list(body);
+        self.statement(Operation::DoWhile {
+            body,
+            cond,
+            until: true,
+        })
+    }
+
+    /// A counted loop over `1..2` around `body`.
+    fn counted(&mut self, body: &[NodeId]) -> NodeId {
+        let index = self.local(PinpType::Int);
+        let [start, stop] = self.leaves();
+        let range = self.node(
+            Operation::Range {
+                kind: RangeKind::Inclusive,
+                start,
+                stop,
+                step: None,
+            },
+            PinpType::Range,
+        );
+        let body = self.list(body);
+        self.statement(Operation::CountedLoop { index, range, body })
+    }
+}
+
+#[test]
+fn break_and_continue_are_childless_statements() {
+    let mut builder = Builder::new();
+    for operation in [Operation::Break(0), Operation::Continue(2)] {
+        assert!(operation.is_statement());
+        let node_id = builder.statement(operation);
+        builder
+            .arena
+            .for_each_child(node_id, |_| panic!("{operation:?} has no children."));
+    }
+}
+
+#[test]
+fn break_and_continue_inside_every_loop_kind_verify() {
+    for depth_zero in [Operation::Break(0), Operation::Continue(0)] {
+        let mut builder = Builder::new();
+        let in_while = builder.statement(depth_zero);
+        let while_node = builder.while_true(&[in_while]);
+        let in_do_while = builder.statement(depth_zero);
+        let do_while = builder.do_until_true(&[in_do_while]);
+        let in_counted = builder.statement(depth_zero);
+        let counted = builder.counted(&[in_counted]);
+        assert_eq!(
+            verify(&builder.structured(&[while_node, do_while, counted], None)),
+            Ok(()),
+            "{depth_zero:?}"
+        );
+    }
+}
+
+#[test]
+fn a_depth_may_reach_every_loop_around_the_statement_and_no_further() {
+    for (exit, expected_ok) in [
+        (Operation::Break(2), true),
+        (Operation::Continue(2), true),
+        (Operation::Break(3), false),
+        (Operation::Continue(3), false),
+    ] {
+        let mut builder = Builder::new();
+        let exit_node = builder.statement(exit);
+        let inner = builder.counted(&[exit_node]);
+        let middle = builder.do_until_true(&[inner]);
+        let outer = builder.while_true(&[middle]);
+        let result = verify(&builder.structured(&[outer], None));
+        match expected_ok {
+            true => assert_eq!(result, Ok(()), "{exit:?}"),
+            false => assert_eq!(
+                result,
+                Err(VerifyError::NoEnclosingLoop(exit_node)),
+                "{exit:?}"
+            ),
+        }
+    }
+}
+
+#[test]
+fn an_if_does_not_count_as_a_loop() {
+    let mut builder = Builder::new();
+    let exit = builder.statement(Operation::Break(1));
+    let cond = builder.boolean(true);
+    let then_body = builder.list(&[exit]);
+    let else_body = builder.list(&[]);
+    let if_node = builder.statement(Operation::If {
+        cond,
+        then_body,
+        else_body,
+    });
+    let while_node = builder.while_true(&[if_node]);
+    assert_eq!(
+        verify(&builder.structured(&[while_node], None)),
+        Err(VerifyError::NoEnclosingLoop(exit))
+    );
+}
+
+#[test]
+fn break_and_continue_outside_any_loop_are_rejected() {
+    for exit in [Operation::Break(0), Operation::Continue(0)] {
+        let mut builder = Builder::new();
+        let exit_node = builder.statement(exit);
+        assert_eq!(
+            verify(&builder.structured(&[exit_node], None)),
+            Err(VerifyError::NoEnclosingLoop(exit_node))
+        );
+    }
+}
+
+#[test]
+fn a_loops_header_and_condition_are_outside_it() {
+    // What computes a `while`'s condition runs before the body: a `Break` there has no loop.
+    let mut builder = Builder::new();
+    let exit = builder.statement(Operation::Break(0));
+    let header = builder.list(&[exit]);
+    let cond = builder.boolean(true);
+    let body = builder.list(&[]);
+    let while_node = builder.statement(Operation::While { header, cond, body });
+    assert_eq!(
+        verify(&builder.structured(&[while_node], None)),
+        Err(VerifyError::NoEnclosingLoop(exit))
+    );
+}
+
+#[test]
+fn a_loop_after_the_one_a_break_sits_in_does_not_count() {
+    let mut builder = Builder::new();
+    let exit = builder.statement(Operation::Break(1));
+    let first = builder.while_true(&[exit]);
+    let second = builder.while_true(&[]);
+    assert_eq!(
+        verify(&builder.structured(&[first, second], None)),
+        Err(VerifyError::NoEnclosingLoop(exit))
+    );
+}
+
+#[test]
+fn break_and_continue_as_values_are_rejected() {
+    for exit in [Operation::Break(0), Operation::Continue(0)] {
+        let mut builder = Builder::new();
+        let exit_node = builder.statement(exit);
+        let local_id = builder.local(PinpType::Int);
+        let write = builder.write(local_id, exit_node);
+        let while_node = builder.while_true(&[write]);
+        assert_eq!(
+            verify(&builder.structured(&[while_node], None)),
+            Err(VerifyError::WrongPosition(exit_node)),
+            "{exit:?}"
+        );
+    }
+}
+
+#[test]
+fn break_and_continue_in_a_flat_block_are_rejected() {
+    // The flat level jumps through terminators only.
+    for exit in [Operation::Break(0), Operation::Continue(0)] {
+        let mut builder = Builder::new();
+        let exit_node = builder.statement(exit);
+        let function = builder.flat(vec![(vec![exit_node], Terminator::Return(None))]);
+        assert_eq!(
+            verify(&function),
+            Err(VerifyError::WrongLevel(exit_node, Level::Flat))
+        );
+    }
+}
+
+#[test]
+fn break_and_continue_print_with_their_depth() {
+    let mut builder = Builder::new();
+    let exit = builder.statement(Operation::Break(1));
+    assert_eq!(first_line(&print_tree(&builder, &[], exit)), "break 1");
+    let exit = builder.statement(Operation::Continue(0));
+    assert_eq!(first_line(&print_tree(&builder, &[], exit)), "continue 0");
+}
